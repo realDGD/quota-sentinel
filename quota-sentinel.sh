@@ -730,11 +730,11 @@ quota_bar() {
 
 quota_failure_message() {
   printf '%s\n' \
+    "来源：不可用" \
     "5 小时：□□□□□□□□□□ 获取失败" \
     "重置：未知" \
     "周额度：□□□□□□□□□□ 获取失败" \
-    "重置：未知" \
-    "来源：不可用"
+    "重置：未知"
 }
 
 format_quota_message() {
@@ -750,11 +750,11 @@ format_quota_message() {
   weekly_duration="$(format_duration $(( weekly_reset - now )))"
 
   printf '%s\n' \
+    "来源：$source" \
     "5 小时：$(quota_bar "$five_remaining") 剩余 ${five_remaining}%" \
     "重置：$(format_reset_time "$five_reset")（剩余 $five_duration）" \
     "周额度：$(quota_bar "$weekly_remaining") 剩余 ${weekly_remaining}%" \
-    "重置：$(format_reset_time "$weekly_reset")（剩余 $weekly_duration）" \
-    "来源：$source"
+    "重置：$(format_reset_time "$weekly_reset")（剩余 $weekly_duration）"
 }
 
 normalize_pi_codex_quota() {
@@ -1272,15 +1272,42 @@ antigravity_quota_message() {
 
 format_provider_card_section() {
   local title="$1" result="$2" quota_message="$3"
-  [[ "$result" == "发送成功" ]] &&
-    result="🟢 **发送成功**" || result="🔴 **发送失败**"
+  local formatted_result=""
+  if [[ -n "$result" ]]; then
+    if [[ "$result" == "发送成功" ]]; then
+      formatted_result="🟢 **发送成功**"
+    else
+      formatted_result="🔴 **发送失败**"
+    fi
+  fi
 
   quota_message="${quota_message//5 小时：/**5 小时**　}"
   quota_message="${quota_message//周额度：/**周额度**　}"
   quota_message="${quota_message//重置：/↳ 重置　}"
   quota_message="${quota_message//来源：/↳ 来源　}"
 
-  printf '%s\n%s\n%s' "$title" "$result" "$quota_message"
+  local lines=("${(@f)quota_message}")
+  local out_lines=("$title")
+  local quota_body=()
+  local src=""
+
+  for line in "${lines[@]}"; do
+    if [[ "$line" == "↳ 来源"* ]]; then
+      src="$line"
+    else
+      quota_body+=("$line")
+    fi
+  done
+
+  if [[ -n "$src" ]]; then
+    out_lines+=("$src")
+  fi
+  if [[ -n "$formatted_result" ]]; then
+    out_lines+=("$formatted_result")
+  fi
+  out_lines+=("${quota_body[@]}")
+
+  printf '%s\n' "${out_lines[@]}"
 }
 
 notification_message() {
@@ -1336,25 +1363,18 @@ usage_notification_message() {
   local timestamp
   timestamp="$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d %H:%M:%S %Z')"
 
-  codex_quota="${codex_quota//5 小时：/**5 小时**　}"
-  codex_quota="${codex_quota//周额度：/**周额度**　}"
-  codex_quota="${codex_quota//重置：/↳ 重置　}"
-  codex_quota="${codex_quota//来源：/↳ 来源　}"
-  antigravity_quota="${antigravity_quota//5 小时：/**5 小时**　}"
-  antigravity_quota="${antigravity_quota//周额度：/**周额度**　}"
-  antigravity_quota="${antigravity_quota//重置：/↳ 重置　}"
-  antigravity_quota="${antigravity_quota//来源：/↳ 来源　}"
+  local sec1 sec2
+  sec1="$(format_provider_card_section "**GPT-5.6 Luna**" "" "$codex_quota")"
+  sec2="$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "" "$antigravity_quota")"
 
   printf '%s\n' \
     "**即时配额查询**　未执行模型任务" \
     "" \
-    "**GPT-5.6 Luna**" \
-    "$codex_quota" \
+    "$sec1" \
     "" \
     "────────────" \
     "" \
-    "**Gemini 3.7 Flash · Low**" \
-    "$antigravity_quota" \
+    "$sec2" \
     "" \
     "**图例**　■ 剩余　□ 已用" \
     "🕒 $timestamp"
