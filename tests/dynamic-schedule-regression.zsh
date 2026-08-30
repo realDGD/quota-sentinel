@@ -325,14 +325,28 @@ print -r -- "Case 13 (Legacy state migration preserved seamlessly): passed"
 # -------------------------------------------------------------
 # Case 14: 4-tier Fallback Hierarchy & Cache saving
 # -------------------------------------------------------------
+fixture_live="$TEST_TEMP_DIR/codex-live-test.json"
 fixture_out="$TEST_TEMP_DIR/codex-cached-test.json"
-print -r -- '{"provider":"codex","source":"CodexBar · codex-cli","fresh":true,"capturedAt":1788000000,"fiveHour":{"remainingPercent":70,"resetAt":1788050000},"weekly":{"remainingPercent":80,"resetAt":1788650000}}' >"$CODEXBAR_CODEX_CACHE_FILE"
+print -r -- '{"provider":"codex","source":"CodexBar · cli","fresh":true,"capturedAt":1788000000,"fiveHour":{"remainingPercent":70,"resetAt":1788050000},"weekly":{"remainingPercent":80,"resetAt":1788650000}}' >"$fixture_live"
 
+# Save to cache file on disk
+save_codexbar_cache "$fixture_live" "$CODEXBAR_CODEX_CACHE_FILE"
+
+# 1. Verify directly from disk file that it is marked stale/cached
+[[ "$(jq -r '.source' "$CODEXBAR_CODEX_CACHE_FILE")" == "CodexBar · cached（可能不是最新）" ]]
+[[ "$(jq -r '.originalSource' "$CODEXBAR_CODEX_CACHE_FILE")" == "CodexBar · cli" ]]
+[[ "$(jq -r '.fresh' "$CODEXBAR_CODEX_CACHE_FILE")" == "false" ]]
+[[ "$(jq -r '.cached' "$CODEXBAR_CODEX_CACHE_FILE")" == "true" ]]
+[[ "$(jq -r '.capturedAt' "$CODEXBAR_CODEX_CACHE_FILE")" == "1788000000" ]]
+
+# 2. Verify loader keeps metadata and preserved capturedAt
 use_codexbar_cached_codex "$fixture_out"
 [[ "$(jq -r '.source' "$fixture_out")" == "CodexBar · cached（可能不是最新）" ]]
 [[ "$(jq -r '.fresh' "$fixture_out")" == "false" ]]
+[[ "$(jq -r '.cached' "$fixture_out")" == "true" ]]
+[[ "$(jq -r '.capturedAt' "$fixture_out")" == "1788000000" ]]
 [[ "$(jq -r '.fiveHour.remainingPercent' "$fixture_out")" == "70" ]]
-print -r -- "Case 14 (CodexBar cache tier properly tagged and stale): passed"
+print -r -- "Case 14 (CodexBar cache tier on-disk metadata properly hardened and stale): passed"
 
 # -------------------------------------------------------------
 # Case 15: CodexBar cache never calibrates scheduler deadline

@@ -774,6 +774,7 @@ normalize_pi_codex_quota() {
     {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
+      cached: true,
       capturedAt: (.capturedAt // (now | floor)),
       fiveHour: {remainingPercent: (100 - $primary_used), resetAt: $primary_reset},
       weekly: {remainingPercent: (100 - $secondary_used), resetAt: $secondary_reset}
@@ -794,6 +795,7 @@ normalize_pi_antigravity_quota() {
     {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
+      cached: true,
       capturedAt: (.capturedAt // (now | floor)),
       fiveHour: {remainingPercent: $five_remaining, resetAt: $five_reset},
       weekly: {remainingPercent: $weekly_remaining, resetAt: $weekly_reset}
@@ -931,7 +933,38 @@ fetch_native_antigravity_quota() {
   local output="$1"
   require_executable "$PYTHON3_BIN"
   "$PYTHON3_BIN" -c '
-import json, subprocess, time, ssl, urllib.request, datetime, os, sys
+import json, subprocess, time, ssl, urllib.request, urllib.parse, datetime, os, sys
+
+ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "*", "0.0.0.0", "::"}
+
+def validate_port(val):
+    try:
+        p = int(val)
+        if 1 <= p <= 65535:
+            return p
+    except (ValueError, TypeError):
+        pass
+    return None
+
+def extract_safe_port_from_listen_addr(addr_str):
+    addr_str = str(addr_str).strip()
+    if ":" not in addr_str:
+        return None
+    host_part = addr_str.rsplit(":", 1)[0].strip("[]")
+    port_part = addr_str.rsplit(":", 1)[1]
+    if host_part not in ALLOWED_LOCAL_HOSTS:
+        return None
+    return validate_port(port_part)
+
+def build_loopback_endpoint(port):
+    p = validate_port(port)
+    if not p:
+        return None
+    url = f"https://127.0.0.1:{p}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname != "127.0.0.1" or parts.port != p:
+        raise ValueError(f"Endpoint invariant violated: {url}")
+    return url
 
 def get_antigravity_native():
     ports = []
@@ -941,13 +974,14 @@ def get_antigravity_native():
             with open(agy_session_file, "r") as f:
                 sess = json.load(f)
                 pid = sess[0].get("pid")
-                if pid:
+                if pid and isinstance(pid, int) and pid > 0:
                     res = subprocess.run(["lsof", "-Pan", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True)
                     for line in res.stdout.splitlines():
-                        if "LISTEN" in line and ":" in line:
-                            p_str = line.split()[-2].split(":")[-1]
-                            if p_str.isdigit():
-                                ports.append(int(p_str))
+                        if "LISTEN" in line:
+                            for part in line.split():
+                                p = extract_safe_port_from_listen_addr(part)
+                                if p:
+                                    ports.append(p)
         except Exception:
             pass
 
@@ -956,10 +990,9 @@ def get_antigravity_native():
         for line in res.stdout.splitlines():
             if "agy" in line or "language_server" in line:
                 for part in line.split():
-                    if ":" in part:
-                        p = part.split(":")[-1]
-                        if p.isdigit():
-                            ports.append(int(p))
+                    p = extract_safe_port_from_listen_addr(part)
+                    if p:
+                        ports.append(p)
 
     ports = list(dict.fromkeys(ports))
     ctx = ssl.create_default_context()
@@ -968,14 +1001,16 @@ def get_antigravity_native():
 
     data = None
     for port in ports:
-        url = f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-        req = urllib.request.Request(
-            url,
-            data=b"{}",
-            headers={"Content-Type": "application/json", "Connect-Protocol-Version": "1"},
-            method="POST"
-        )
         try:
+            url = build_loopback_endpoint(port)
+            if not url:
+                continue
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Connect-Protocol-Version": "1"},
+                method="POST"
+            )
             with urllib.request.urlopen(req, context=ctx, timeout=1.5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 break
@@ -993,6 +1028,9 @@ def get_antigravity_native():
     if not gemini_group and data.get("response", {}).get("groups"):
         gemini_group = data["response"]["groups"][0]
 
+    if not gemini_group:
+        return None
+
     five_h_bucket = None
     weekly_bucket = None
     for b in gemini_group.get("buckets", []):
@@ -1000,6 +1038,9 @@ def get_antigravity_native():
             five_h_bucket = b
         elif b.get("window") == "weekly" or "weekly" in b.get("displayName", "").lower() or "weekly" in b.get("bucketId", "").lower():
             weekly_bucket = b
+
+    if not five_h_bucket or not weekly_bucket:
+        return None
 
     def iso_to_epoch(iso_str):
         if not iso_str: return None
@@ -1010,17 +1051,22 @@ def get_antigravity_native():
     five_h_rem = round(five_h_bucket.get("remainingFraction", 0) * 100)
     weekly_rem = round(weekly_bucket.get("remainingFraction", 0) * 100)
 
+    five_reset = iso_to_epoch(five_h_bucket.get("resetTime"))
+    weekly_reset = iso_to_epoch(weekly_bucket.get("resetTime"))
+    if not five_reset or not weekly_reset:
+        return None
+
     return {
         "source": "Native · agy local service",
         "fresh": True,
         "capturedAt": now,
         "fiveHour": {
             "remainingPercent": five_h_rem,
-            "resetAt": iso_to_epoch(five_h_bucket.get("resetTime"))
+            "resetAt": five_reset
         },
         "weekly": {
             "remainingPercent": weekly_rem,
-            "resetAt": iso_to_epoch(weekly_bucket.get("resetTime"))
+            "resetAt": weekly_reset
         }
     }
 
@@ -1033,23 +1079,41 @@ sys.exit(1)
   [[ -s "$output" ]] || return 1
 }
 
+save_codexbar_cache() {
+  local live_normalized="$1" cache_file="$2"
+  local temp_cache="${cache_file}.tmp.$$"
+  [[ -s "$live_normalized" ]] || return 1
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  "$JQ_BIN" -e '
+    . as $orig |
+    {
+      source: "CodexBar · cached（可能不是最新）",
+      originalSource: ($orig.source // "CodexBar · cli"),
+      fresh: false,
+      cached: true,
+      capturedAt: ($orig.capturedAt // (now | floor)),
+      fiveHour: $orig.fiveHour,
+      weekly: $orig.weekly
+    }
+  ' "$live_normalized" >"$temp_cache" 2>/dev/null || { rm -f "$temp_cache"; return 1; }
+  chmod 600 "$temp_cache"
+  mv -f "$temp_cache" "$cache_file"
+}
+
 fetch_codexbar_codex_quota() {
   local output="$1"
   [[ -x "$CODEXBAR_BIN" ]] || return 1
   if "$CODEXBAR_BIN" usage --provider codex --source cli --format json --json-only --no-color \
     >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
     normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    atomic_copy "$output" "$CODEXBAR_CODEX_CACHE_FILE"
+    save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
     return 0
   fi
   if "$CODEXBAR_BIN" usage --provider codex --source oauth --format json --json-only --no-color \
     >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
     normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    atomic_copy "$output" "$CODEXBAR_CODEX_CACHE_FILE"
+    save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
     return 0
   fi
   return 1
@@ -1061,9 +1125,7 @@ fetch_codexbar_antigravity_quota() {
   if "$CODEXBAR_BIN" usage --provider antigravity --source cli --format json --json-only --no-color \
     >"$CODEXBAR_ANTIGRAVITY_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-antigravity.stderr" &&
     normalize_codexbar_antigravity_quota "$CODEXBAR_ANTIGRAVITY_RAW_FILE" "$output"; then
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    atomic_copy "$output" "$CODEXBAR_ANTIGRAVITY_CACHE_FILE"
+    save_codexbar_cache "$output" "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" || true
     return 0
   fi
   return 1
@@ -1073,9 +1135,11 @@ use_codexbar_cached_codex() {
   local output="$1"
   [[ -s "$CODEXBAR_CODEX_CACHE_FILE" ]] || return 1
   "$JQ_BIN" -e '
+    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
-      fresh: false
+      fresh: false,
+      cached: true
     }
   ' "$CODEXBAR_CODEX_CACHE_FILE" >"$output" 2>/dev/null || return 1
   [[ -s "$output" ]] || return 1
@@ -1085,9 +1149,11 @@ use_codexbar_cached_antigravity() {
   local output="$1"
   [[ -s "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" ]] || return 1
   "$JQ_BIN" -e '
+    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
-      fresh: false
+      fresh: false,
+      cached: true
     }
   ' "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" >"$output" 2>/dev/null || return 1
   [[ -s "$output" ]] || return 1
