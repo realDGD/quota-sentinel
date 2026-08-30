@@ -1,0 +1,10 @@
+{
+  "headers": {
+    "x-codex-primary-reset-at": "1788012274",
+    "x-codex-primary-used-percent": "52",
+    "x-codex-primary-window-minutes": "300",
+    "x-codex-secondary-reset-at": "1788480117",
+    "x-codex-secondary-used-percent": "35",
+    "x-codex-secondary-window-minutes": "10080"
+  }
+}
