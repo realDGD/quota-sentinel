@@ -575,6 +575,11 @@ build_linear_progress_chart() {
     val="1.0"
   fi
 
+  # Verified against the real Feishu client: only the top-level VChart
+  # `cornerRadius` drives the rounded ends of both the progress bar and the
+  # track. `roundCap` is a polar (arc-mark) option and per-mark
+  # progress.style.cornerRadius / track.style.cornerRadius are ignored by
+  # linearProgress rendering.
   "$JQ_BIN" -n \
     --argjson val "$val" \
     --arg color "$color_hex" \
@@ -597,17 +602,11 @@ build_linear_progress_chart() {
         xField: "value",
         yField: "type",
         seriesField: "type",
-        roundCap: true,
+        cornerRadius: 5,
         color: [$color],
         progress: {
           style: {
-            fill: $color,
-            cornerRadius: 5
-          }
-        },
-        track: {
-          style: {
-            cornerRadius: 5
+            fill: $color
           }
         },
         bandWidth: 10,
@@ -617,8 +616,57 @@ build_linear_progress_chart() {
         ],
         legends: { visible: false },
         tooltip: { visible: false },
-        padding: { top: 0, bottom: 0, left: 2, right: 2 }
+        padding: { top: 0, bottom: 0, left: 0, right: 0 }
       }
+    }'
+}
+
+# Visual regression card: renders the production linear progress spec at
+# 0% / 1% / 50% / 77% / 99% / 100% so endpoint rendering can be compared on a
+# real client (all non-zero bars must show rounded ends on both sides).
+build_progress_test_card_payload() {
+  local user_id="$1"
+  local request_uuid="$2"
+
+  local elements
+  elements="$(print -r -- '[]' | "$JQ_BIN" \
+    --arg intro1 "每列从上到下依次为 0% / 1% / 50% / 77% / 99% / 100%。" \
+    --arg intro2 "验收目标：所有非 0% 进度条两端圆角一致，track 同样两端圆角。" \
+    '. + [{ tag: "markdown", content: $intro1 }, { tag: "markdown", content: $intro2 }]')" || return 1
+  local percent chart
+  for percent in 0 1 50 77 99 100; do
+    chart="$(build_linear_progress_chart "$percent" "#57D0FB")" || return 1
+    elements="$(print -r -- "$elements" | "$JQ_BIN" \
+      --arg caption "${percent}%" \
+      --argjson chart "$chart" \
+      '. + [{ tag: "markdown", content: $caption }, $chart]')" || return 1
+  done
+
+  "$JQ_BIN" -n \
+    --arg receive_id "$user_id" \
+    --arg uuid "$request_uuid" \
+    --argjson elements "$elements" \
+    '{
+      receive_id: $receive_id,
+      msg_type: "interactive",
+      content: ({
+        schema: "2.0",
+        config: {
+          width_mode: "default"
+        },
+        header: {
+          template: "blue",
+          title: {
+            tag: "plain_text",
+            content: "Linear Progress 圆角验收"
+          }
+        },
+        body: {
+          direction: "vertical",
+          elements: $elements
+        }
+      } | tostring),
+      uuid: $uuid
     }'
 }
 
@@ -734,7 +782,8 @@ build_provider_v2_elements() {
                 {
                   tag: "markdown",
                   content: ("距离重置　" + $f_dur + "\n重置时间　" + $f_res)
-                }
+                },
+                { tag: "hr" }
               ]
             },
             {
@@ -748,7 +797,8 @@ build_provider_v2_elements() {
                 {
                   tag: "markdown",
                   content: ("距离重置　" + $w_dur + "\n重置时间　" + $w_res)
-                }
+                },
+                { tag: "hr" }
               ]
             }
           ]
@@ -847,7 +897,6 @@ build_feishu_v2_task_payload() {
     body_elements_json="$("$JQ_BIN" -n \
       --argjson elems "$provider_elements" \
       '$elems + [
-        { tag: "hr" },
         { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
       ]')"
   elif (( ${#attempted[@]} >= 2 )); then
@@ -2080,6 +2129,9 @@ send_test_card() {
       ;;
     antigravity)
       payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" antigravity)"
+      ;;
+    progress)
+      payload="$(build_progress_test_card_payload "$(feishu_user_id)" "test-progress-$(/bin/date +%s)")"
       ;;
     both|all|auto|*)
       payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-both-$(/bin/date +%s)" codex antigravity)"

@@ -21,6 +21,12 @@ class TestFeishuCardV2RefinedLayout(unittest.TestCase):
 
     # -------------------------------------------------------------
     # Case 1 & 2: Progress Roundness & Value Mapping (0%, 1%, 50%, 77%, 99%, 100%)
+    #
+    # Verified against the real Feishu client: only the top-level VChart
+    # `cornerRadius` produces rounded ends on both the progress bar and the
+    # track. `roundCap` is a polar (arc-mark) option and is ignored by
+    # linearProgress; per-mark style.cornerRadius never rendered round
+    # corners (Variant A reproduced the old one-side-square bug).
     # -------------------------------------------------------------
     def test_case_1_and_2_progress_roundness_and_values(self):
         for pct, expected_val in [(0, 0), (1, 0.01), (50, 0.5), (77, 0.77), (99, 0.99), (100, 1)]:
@@ -30,9 +36,15 @@ class TestFeishuCardV2RefinedLayout(unittest.TestCase):
             self.assertEqual(c["height"], "24px")
             spec = c["chart_spec"]
             self.assertEqual(spec["type"], "linearProgress")
-            self.assertTrue(spec.get("roundCap"))
-            self.assertEqual(spec["progress"]["style"]["cornerRadius"], 5)
-            self.assertEqual(spec["track"]["style"]["cornerRadius"], 5)
+            # The one attribute the real client honours: top-level cornerRadius.
+            self.assertEqual(spec.get("cornerRadius"), 5)
+            # roundCap is not a linearProgress option and must not come back.
+            self.assertNotIn("roundCap", spec)
+            # Per-mark cornerRadius was proven ineffective; it must stay out.
+            self.assertNotIn("cornerRadius", spec["progress"]["style"])
+            self.assertNotIn("track", spec)
+            self.assertEqual(spec["bandWidth"], 10)
+            self.assertEqual(spec["padding"], {"top": 0, "bottom": 0, "left": 0, "right": 0})
             self.assertEqual(spec["data"]["values"][0]["value"], expected_val)
             self.assertEqual(spec["color"], ["#57D0FB"])
             self.assertEqual(spec["progress"]["style"]["fill"], "#57D0FB")
@@ -93,17 +105,22 @@ class TestFeishuCardV2RefinedLayout(unittest.TestCase):
         # Element 2: Quota Column Set (5h and Weekly side-by-side)
         quota_col_set = elems[2]
         self.assertEqual(quota_col_set["tag"], "column_set")
+        self.assertEqual(quota_col_set["flex_mode"], "stretch")
         self.assertEqual(len(quota_col_set["columns"]), 2)
-        # Left column: 5h
+        # Left column: 5h, with a column-end hr (mobile stack separator)
         left_col = quota_col_set["columns"][0]["elements"]
+        self.assertEqual(len(left_col), 4)
         self.assertIn("5 小时", left_col[0]["content"])
         self.assertEqual(left_col[1]["chart_spec"]["color"], ["#57D0FB"])
         self.assertIn("距离重置　", left_col[2]["content"])
-        # Right column: Weekly
+        self.assertEqual(left_col[3]["tag"], "hr")
+        # Right column: Weekly, with a column-end hr
         right_col = quota_col_set["columns"][1]["elements"]
+        self.assertEqual(len(right_col), 4)
         self.assertIn("周额度", right_col[0]["content"])
         self.assertEqual(right_col[1]["chart_spec"]["color"], ["#54A6FD"])
         self.assertIn("重置时间　", right_col[2]["content"])
+        self.assertEqual(right_col[3]["tag"], "hr")
 
     # -------------------------------------------------------------
     # Case 6: Dual Provider Structure & Provider-End Divider
@@ -137,6 +154,84 @@ class TestFeishuCardV2RefinedLayout(unittest.TestCase):
         card = json.loads(payload["content"])
         self.assertEqual(card["schema"], "2.0")
         self.assertEqual(card["config"]["width_mode"], "default")
+
+    # -------------------------------------------------------------
+    # Case 7b: No two consecutive hr dividers anywhere in the card tree
+    # (e.g. weekly column-end hr directly followed by a footer hr)
+    # -------------------------------------------------------------
+    def test_case_7b_no_consecutive_hr(self):
+        def flatten_tags(obj):
+            tags = []
+            if isinstance(obj, dict):
+                if "tag" in obj:
+                    tags.append(obj["tag"])
+                for v in obj.values():
+                    tags.extend(flatten_tags(v))
+            elif isinstance(obj, list):
+                for item in obj:
+                    tags.extend(flatten_tags(item))
+            return tags
+
+        for preview_args in ("both", "usage"):
+            out = self.run_zsh_fn(f'card_preview {preview_args}')
+            card = json.loads(json.loads(out)["content"])
+            tags = flatten_tags(card["body"]["elements"])
+            for i in range(len(tags) - 1):
+                self.assertFalse(
+                    tags[i] == "hr" and tags[i + 1] == "hr",
+                    f"Consecutive hr dividers found in card_preview {preview_args}",
+                )
+
+    # -------------------------------------------------------------
+    # Case 7c: Single provider full payload — quota columns end with hr and
+    # no extra footer hr is added after the quota column_set
+    # -------------------------------------------------------------
+    def test_case_7c_single_provider_payload_no_duplicate_footer_hr(self):
+        fixture_file = os.path.join(self.test_dir.name, "codex-payload.json")
+        with open(fixture_file, "w") as f:
+            json.dump({
+                "source": "Native · codex app-server",
+                "fresh": True,
+                "capturedAt": 1788000000,
+                "fiveHour": {"remainingPercent": 100, "resetAt": 1788018000},
+                "weekly": {"remainingPercent": 84, "resetAt": 1788600000}
+            }, f)
+
+        out = self.run_zsh_fn(
+            f'CODEX_QUOTA_NORMALIZED_FILE="{fixture_file}" '
+            f'ANTIGRAVITY_QUOTA_NORMALIZED_FILE="{fixture_file}" '
+            f'CODEX_RUN_RESULT="发送成功" '
+            f'build_feishu_v2_task_payload "user1" "uuid1" codex'
+        )
+        card = json.loads(json.loads(out)["content"])
+        elems = card["body"]["elements"]
+        # [header column_set, source, quota column_set, footer markdown]
+        self.assertEqual(len(elems), 4)
+        quota_col_set = elems[2]
+        self.assertEqual(quota_col_set["tag"], "column_set")
+        self.assertEqual(len(quota_col_set["columns"]), 2)
+        for col in quota_col_set["columns"]:
+            self.assertEqual(col["elements"][-1]["tag"], "hr")
+        # The footer markdown follows directly: the weekly column-end hr is
+        # the only boundary, no second hr was appended before the footer.
+        self.assertEqual(elems[3]["tag"], "markdown")
+        self.assertIn("Pi 自动任务", elems[3]["content"])
+
+    # -------------------------------------------------------------
+    # Case 7d: progress test card shows 0/1/50/77/99/100 on one card
+    # -------------------------------------------------------------
+    def test_case_7d_progress_test_card_percentages(self):
+        out = self.run_zsh_fn('FEISHU_USER_ID="mock-user" build_progress_test_card_payload "mock-user" "uuid1"')
+        card = json.loads(json.loads(out)["content"])
+        self.assertEqual(card["config"]["width_mode"], "default")
+        values = [el["chart_spec"]["data"]["values"][0]["value"]
+                  for el in card["body"]["elements"] if el.get("tag") == "chart"]
+        self.assertEqual(values, [0, 0.01, 0.5, 0.77, 0.99, 1])
+        for el in card["body"]["elements"]:
+            if el.get("tag") == "chart":
+                spec = el["chart_spec"]
+                self.assertEqual(spec.get("cornerRadius"), 5)
+                self.assertNotIn("roundCap", spec)
 
     # -------------------------------------------------------------
     # Case 8: Absence of '↳' and '来源' in user-visible text

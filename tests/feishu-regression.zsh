@@ -103,7 +103,10 @@ print -r -- "$chart_5h" | "$JQ_BIN" -e '
   .height == "24px" and
   .chart_spec.type == "linearProgress" and
   .chart_spec.color == ["#57D0FB"] and
-  .chart_spec.roundCap == true and
+  .chart_spec.cornerRadius == 5 and
+  (.chart_spec.roundCap == null) and
+  (.chart_spec.track == null) and
+  (.chart_spec.progress.style.cornerRadius == null) and
   .chart_spec.data.values[0].value == 0.77
 ' >/dev/null
 
@@ -111,7 +114,7 @@ chart_w="$(build_linear_progress_chart 86 "#54A6FD")"
 print -r -- "$chart_w" | "$JQ_BIN" -e '
   .chart_spec.type == "linearProgress" and
   .chart_spec.color == ["#54A6FD"] and
-  .chart_spec.roundCap == true and
+  .chart_spec.cornerRadius == 5 and
   .chart_spec.data.values[0].value == 0.86
 ' >/dev/null
 
