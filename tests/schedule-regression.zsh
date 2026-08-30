@@ -12,7 +12,8 @@ trap cleanup EXIT
 is_due 100
 write_next_due 200
 [[ "$(read_next_due)" == "200" ]]
-[[ "$(stat -f '%Lp' "$NEXT_DUE_FILE")" == "600" ]]
+[[ "$(stat -f '%Lp' "$(provider_next_due_file "codex")")" == "600" ]]
+[[ "$(stat -f '%Lp' "$(provider_next_due_file "antigravity")")" == "600" ]]
 
 if is_due 199; then
   print -u2 -r -- "schedule regression: future timestamp was treated as due"
@@ -37,14 +38,16 @@ release_run_lock
 [[ ! -e "$RUN_LOCK_FILE" ]]
 
 typeset -gi RUN_COUNT=0
-run_once() {
+run_selected_providers() {
   (( RUN_COUNT += 1 ))
   local now
   now="$(/bin/date '+%s')"
   RUN_STARTED_AT="$now"
-  write_last_task_at "$now"
-  schedule_next_after_run "$now"
-  write_last_triggered_window "$(( now + 17900 )):$(( now + 17900 ))"
+  for p in "$@"; do
+    write_provider_last_task "$p" "$now"
+    write_provider_last_window "$p" "$(( now + 17900 ))"
+    write_provider_next_due "$p" $(( now + RUN_INTERVAL_SECONDS ))
+  done
 }
 
 collect_effective_quotas() {
@@ -53,8 +56,8 @@ collect_effective_quotas() {
   ANTIGRAVITY_QUOTA_IS_FRESH=1
   local now
   now="$(/bin/date '+%s')"
-  print -r -- '{"fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"CodexBar · cli","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"CodexBar · cli","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
 }
 
 before_check="$(/bin/date '+%s')"

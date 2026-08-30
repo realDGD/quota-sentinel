@@ -21,9 +21,6 @@ readonly FEISHU_APP_ID_SERVICE="com.example.quota-sentinel.feishu-app-id"
 readonly FEISHU_APP_SECRET_SERVICE="com.example.quota-sentinel.feishu-app-secret"
 readonly FEISHU_USER_ID_SERVICE="com.example.quota-sentinel.feishu-user-id"
 readonly STATE_DIR="${QUOTA_SENTINEL_STATE_DIR:-/Users/__USER__/Library/Application Support/quota-sentinel}"
-readonly NEXT_DUE_FILE="$STATE_DIR/next-due-at"
-readonly LAST_TASK_FILE="$STATE_DIR/last-task-at"
-readonly LAST_TRIGGERED_WINDOW_FILE="$STATE_DIR/last-triggered-window"
 readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"
 readonly QUOTA_LOCK_FILE="$STATE_DIR/quota.lock"
 readonly PI_CODEX_SNAPSHOT_FILE="$STATE_DIR/pi-codex-quota.json"
@@ -48,12 +45,14 @@ typeset -g CODEX_QUOTA_NORMALIZED_FILE=""
 typeset -g ANTIGRAVITY_QUOTA_NORMALIZED_FILE=""
 typeset -g CODEX_QUOTA_IS_FRESH=0
 typeset -g ANTIGRAVITY_QUOTA_IS_FRESH=0
+typeset -g CODEX_RUN_RESULT=""
+typeset -g ANTIGRAVITY_RUN_RESULT=""
 typeset -g RUN_STARTED_AT=0
 typeset -gi RUN_LOCK_HELD=0
 typeset -gi QUOTA_LOCK_HELD=0
 
 usage() {
-  print -r -- "Usage: $SCRIPT_NAME [check|wait|run|usage|discover-feishu-user|status]"
+  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|all]|usage|discover-feishu-user|status]"
 }
 
 die() {
@@ -81,61 +80,181 @@ ensure_temp_dir() {
   ANTIGRAVITY_QUOTA_NORMALIZED_FILE="$LAST_TEMP_DIR/antigravity-effective-quota.json"
 }
 
-read_next_due() {
-  local value
-  [[ -r "$NEXT_DUE_FILE" ]] || return 1
-  value="$(<"$NEXT_DUE_FILE")"
+provider_next_due_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-next-due-at"
+}
+
+provider_last_task_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-last-task-at"
+}
+
+provider_last_window_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-last-triggered-window"
+}
+
+migrate_legacy_state() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+
+  # Migrate last-task-at
+  if [[ -r "$STATE_DIR/last-task-at" ]]; then
+    local legacy_task
+    legacy_task="$(<"$STATE_DIR/last-task-at")"
+    if [[ "$legacy_task" =~ ^[0-9]+$ ]]; then
+      if [[ ! -r "$STATE_DIR/codex-last-task-at" ]]; then
+        print -r -- "$legacy_task" >"$STATE_DIR/codex-last-task-at"
+        chmod 600 "$STATE_DIR/codex-last-task-at"
+      fi
+      if [[ ! -r "$STATE_DIR/antigravity-last-task-at" ]]; then
+        print -r -- "$legacy_task" >"$STATE_DIR/antigravity-last-task-at"
+        chmod 600 "$STATE_DIR/antigravity-last-task-at"
+      fi
+    fi
+  fi
+
+  # Migrate next-due-at
+  if [[ -r "$STATE_DIR/next-due-at" ]]; then
+    local legacy_due
+    legacy_due="$(<"$STATE_DIR/next-due-at")"
+    if [[ "$legacy_due" =~ ^[0-9]+$ ]]; then
+      if [[ ! -r "$STATE_DIR/codex-next-due-at" ]]; then
+        print -r -- "$legacy_due" >"$STATE_DIR/codex-next-due-at"
+        chmod 600 "$STATE_DIR/codex-next-due-at"
+      fi
+      if [[ ! -r "$STATE_DIR/antigravity-next-due-at" ]]; then
+        print -r -- "$legacy_due" >"$STATE_DIR/antigravity-next-due-at"
+        chmod 600 "$STATE_DIR/antigravity-next-due-at"
+      fi
+    fi
+  fi
+
+  # Migrate last-triggered-window
+  if [[ -r "$STATE_DIR/last-triggered-window" ]]; then
+    local legacy_window
+    legacy_window="$(<"$STATE_DIR/last-triggered-window")"
+    if [[ "$legacy_window" == *:* ]]; then
+      local c_win="${legacy_window%%:*}"
+      local a_win="${legacy_window##*:}"
+      if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-triggered-window" ]]; then
+        print -r -- "$c_win" >"$STATE_DIR/codex-last-triggered-window"
+        chmod 600 "$STATE_DIR/codex-last-triggered-window"
+      fi
+      if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-triggered-window" ]]; then
+        print -r -- "$a_win" >"$STATE_DIR/antigravity-last-triggered-window"
+        chmod 600 "$STATE_DIR/antigravity-last-triggered-window"
+      fi
+    fi
+  fi
+}
+
+read_provider_next_due() {
+  local provider="$1" file value
+  migrate_legacy_state
+  file="$(provider_next_due_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
   [[ "$value" =~ ^[0-9]+$ ]] || return 1
   print -r -- "$value"
 }
 
-write_next_due() {
-  local epoch="$1"
-  local temp_file="$NEXT_DUE_FILE.tmp.$$"
+write_provider_next_due() {
+  local provider="$1" epoch="$2" file temp_file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid next-run timestamp: $epoch"
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+  file="$(provider_next_due_file "$provider")"
+  temp_file="${file}.tmp.$$"
   print -r -- "$epoch" >"$temp_file"
   chmod 600 "$temp_file"
-  mv -f "$temp_file" "$NEXT_DUE_FILE"
+  mv -f "$temp_file" "$file"
 }
 
-read_last_task_at() {
-  local value
-  [[ -r "$LAST_TASK_FILE" ]] || return 1
-  value="$(<"$LAST_TASK_FILE")"
+read_provider_last_task() {
+  local provider="$1" file value
+  migrate_legacy_state
+  file="$(provider_last_task_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
   [[ "$value" =~ ^[0-9]+$ ]] || return 1
   print -r -- "$value"
 }
 
-write_last_task_at() {
-  local epoch="$1"
-  local temp_file="$LAST_TASK_FILE.tmp.$$"
+write_provider_last_task() {
+  local provider="$1" epoch="$2" file temp_file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-task timestamp: $epoch"
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+  file="$(provider_last_task_file "$provider")"
+  temp_file="${file}.tmp.$$"
   print -r -- "$epoch" >"$temp_file"
   chmod 600 "$temp_file"
-  mv -f "$temp_file" "$LAST_TASK_FILE"
+  mv -f "$temp_file" "$file"
 }
 
-read_last_triggered_window() {
-  local value
-  [[ -r "$LAST_TRIGGERED_WINDOW_FILE" ]] || return 1
-  value="$(<"$LAST_TRIGGERED_WINDOW_FILE")"
+read_provider_last_window() {
+  local provider="$1" file value
+  migrate_legacy_state
+  file="$(provider_last_window_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
   [[ -n "$value" ]] || return 1
   print -r -- "$value"
 }
 
-write_last_triggered_window() {
-  local window_id="$1"
-  local temp_file="$LAST_TRIGGERED_WINDOW_FILE.tmp.$$"
+write_provider_last_window() {
+  local provider="$1" window_id="$2" file temp_file
   [[ -n "$window_id" ]] || return 1
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+  file="$(provider_last_window_file "$provider")"
+  temp_file="${file}.tmp.$$"
   print -r -- "$window_id" >"$temp_file"
   chmod 600 "$temp_file"
-  mv -f "$temp_file" "$LAST_TRIGGERED_WINDOW_FILE"
+  mv -f "$temp_file" "$file"
+}
+
+read_next_due() {
+  local c_due a_due min_due=""
+  c_due="$(read_provider_next_due "codex" || true)"
+  a_due="$(read_provider_next_due "antigravity" || true)"
+
+  if [[ "$c_due" =~ ^[0-9]+$ ]] && [[ "$a_due" =~ ^[0-9]+$ ]]; then
+    min_due=$(( c_due < a_due ? c_due : a_due ))
+  elif [[ "$c_due" =~ ^[0-9]+$ ]]; then
+    min_due="$c_due"
+  elif [[ "$a_due" =~ ^[0-9]+$ ]]; then
+    min_due="$a_due"
+  else
+    return 1
+  fi
+  print -r -- "$min_due"
+}
+
+write_next_due() {
+  local epoch="$1"
+  write_provider_next_due "codex" "$epoch"
+  write_provider_next_due "antigravity" "$epoch"
+}
+
+read_last_task_at() {
+  read_provider_last_task "codex"
+}
+
+write_last_task_at() {
+  local epoch="$1"
+  write_provider_last_task "codex" "$epoch"
+}
+
+read_last_triggered_window() {
+  read_provider_last_window "codex"
+}
+
+write_last_triggered_window() {
+  local window_id="$1"
+  write_provider_last_window "codex" "$window_id"
 }
 
 reserve_next_run() {
@@ -410,27 +529,54 @@ dispatch_notification() {
     "$message" || die "Feishu push failed"
 }
 
-prepare_run() {
+prepare_provider_env() {
+  local provider="$1"
   ensure_temp_dir
-  CODEX_AGENT_DIR="$LAST_TEMP_DIR/codex-agent"
-  CODEX_STDOUT_FILE="$LAST_TEMP_DIR/codex-stdout"
-  CODEX_STDERR_FILE="$LAST_TEMP_DIR/codex-stderr"
-  CODEX_QUOTA_FILE="$LAST_TEMP_DIR/codex-quota.json"
-  ANTIGRAVITY_AGENT_DIR="$LAST_TEMP_DIR/antigravity-agent"
-  ANTIGRAVITY_STDOUT_FILE="$LAST_TEMP_DIR/antigravity-stdout"
-  ANTIGRAVITY_STDERR_FILE="$LAST_TEMP_DIR/antigravity-stderr"
-  ANTIGRAVITY_QUOTA_FILE="$LAST_TEMP_DIR/antigravity-quota.json"
+  case "$provider" in
+    codex)
+      CODEX_AGENT_DIR="$LAST_TEMP_DIR/codex-agent"
+      CODEX_STDOUT_FILE="$LAST_TEMP_DIR/codex-stdout"
+      CODEX_STDERR_FILE="$LAST_TEMP_DIR/codex-stderr"
+      CODEX_QUOTA_FILE="$LAST_TEMP_DIR/codex-quota.json"
+      mkdir -p "$CODEX_AGENT_DIR"
+      "$PI_BIN" auth print-bearer-token --provider openai-codex \
+        >/dev/null 2>"$CODEX_STDERR_FILE" || true
+      cp -p "$PI_AUTH_FILE" "$CODEX_AGENT_DIR/auth.json"
+      print -r -- '{"transport":"sse"}' >"$CODEX_AGENT_DIR/settings.json"
+      ;;
+    antigravity)
+      ANTIGRAVITY_AGENT_DIR="$LAST_TEMP_DIR/antigravity-agent"
+      ANTIGRAVITY_STDOUT_FILE="$LAST_TEMP_DIR/antigravity-stdout"
+      ANTIGRAVITY_STDERR_FILE="$LAST_TEMP_DIR/antigravity-stderr"
+      ANTIGRAVITY_QUOTA_FILE="$LAST_TEMP_DIR/antigravity-quota.json"
+      mkdir -p "$ANTIGRAVITY_AGENT_DIR"
+      cp -p "$PI_AUTH_FILE" "$ANTIGRAVITY_AGENT_DIR/auth.json"
+      print -r -- '{}' >"$ANTIGRAVITY_AGENT_DIR/settings.json"
+      ;;
+  esac
+}
 
-  mkdir -p "$CODEX_AGENT_DIR" "$ANTIGRAVITY_AGENT_DIR"
+prepare_run() {
+  prepare_provider_env codex
+  prepare_provider_env antigravity
+}
 
-  # Refresh Codex once, then give both providers isolated copies of the Pi
-  # credential store. Neither one writes to the user's real profile afterward.
-  "$PI_BIN" auth print-bearer-token --provider openai-codex \
-    >/dev/null 2>"$CODEX_STDERR_FILE" || true
-  cp -p "$PI_AUTH_FILE" "$CODEX_AGENT_DIR/auth.json"
-  cp -p "$PI_AUTH_FILE" "$ANTIGRAVITY_AGENT_DIR/auth.json"
-  print -r -- '{"transport":"sse"}' >"$CODEX_AGENT_DIR/settings.json"
-  print -r -- '{}' >"$ANTIGRAVITY_AGENT_DIR/settings.json"
+provider_normalized_quota_file() {
+  local provider="$1"
+  case "$provider" in
+    codex) print -r -- "$CODEX_QUOTA_NORMALIZED_FILE" ;;
+    antigravity) print -r -- "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" ;;
+    *) die "Unknown provider: $provider" ;;
+  esac
+}
+
+provider_quota_is_fresh() {
+  local provider="$1"
+  case "$provider" in
+    codex) (( CODEX_QUOTA_IS_FRESH == 1 )) ;;
+    antigravity) (( ANTIGRAVITY_QUOTA_IS_FRESH == 1 )) ;;
+    *) return 1 ;;
+  esac
 }
 
 prepare_quota_probe() {
@@ -769,39 +915,62 @@ antigravity_quota_message() {
   quota_message_from_file "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
 }
 
+format_provider_card_section() {
+  local title="$1" result="$2" quota_message="$3"
+  [[ "$result" == "发送成功" ]] &&
+    result="🟢 **发送成功**" || result="🔴 **发送失败**"
+
+  quota_message="${quota_message//5 小时：/**5 小时**　}"
+  quota_message="${quota_message//周额度：/**周额度**　}"
+  quota_message="${quota_message//重置：/↳ 重置　}"
+  quota_message="${quota_message//来源：/↳ 来源　}"
+
+  printf '%s\n%s\n%s' "$title" "$result" "$quota_message"
+}
+
 notification_message() {
-  local codex_result="$1"
-  local codex_quota="$2"
-  local antigravity_result="$3"
-  local antigravity_quota="$4"
+  if (( $# == 4 )); then
+    local codex_result="$1" codex_quota="$2" antigravity_result="$3" antigravity_quota="$4"
+    local timestamp
+    timestamp="$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    local sec1 sec2
+    sec1="$(format_provider_card_section "**GPT-5.6 Luna**" "$codex_result" "$codex_quota")"
+    sec2="$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "$antigravity_result" "$antigravity_quota")"
+    printf '%s\n\n────────────\n\n%s\n\n%s\n%s\n' \
+      "$sec1" "$sec2" "**图例**　■ 剩余　□ 已用" "🕒 $timestamp"
+    return 0
+  fi
+  task_notification_message "$@"
+}
+
+task_notification_message() {
+  local attempted=("$@")
+  local sections=()
   local timestamp
   timestamp="$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d %H:%M:%S %Z')"
 
-  [[ "$codex_result" == "发送成功" ]] &&
-    codex_result="🟢 **发送成功**" || codex_result="🔴 **发送失败**"
-  [[ "$antigravity_result" == "发送成功" ]] &&
-    antigravity_result="🟢 **发送成功**" || antigravity_result="🔴 **发送失败**"
+  for provider in "${attempted[@]}"; do
+    case "$provider" in
+      codex)
+        sections+=("$(format_provider_card_section "**GPT-5.6 Luna**" "${CODEX_RUN_RESULT:-发送成功}" "$(codex_quota_message)")")
+        ;;
+      antigravity)
+        sections+=("$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$(antigravity_quota_message)")")
+        ;;
+    esac
+  done
 
-  codex_quota="${codex_quota//5 小时：/**5 小时**　}"
-  codex_quota="${codex_quota//周额度：/**周额度**　}"
-  codex_quota="${codex_quota//重置：/↳ 重置　}"
-  codex_quota="${codex_quota//来源：/↳ 来源　}"
-  antigravity_quota="${antigravity_quota//5 小时：/**5 小时**　}"
-  antigravity_quota="${antigravity_quota//周额度：/**周额度**　}"
-  antigravity_quota="${antigravity_quota//重置：/↳ 重置　}"
-  antigravity_quota="${antigravity_quota//来源：/↳ 来源　}"
+  local joined="" i
+  for (( i = 1; i <= ${#sections[@]}; i++ )); do
+    if (( i > 1 )); then
+      joined+=$'\n\n────────────\n\n'
+    fi
+    joined+="${sections[$i]}"
+  done
 
-  printf '%s\n' \
-    "**GPT-5.6 Luna**" \
-    "$codex_result" \
-    "$codex_quota" \
-    "" \
-    "────────────" \
-    "" \
-    "**Gemini 3.7 Flash · Low**" \
-    "$antigravity_result" \
-    "$antigravity_quota" \
-    "" \
+  printf '%s\n\n%s\n%s\n' \
+    "$joined" \
     "**图例**　■ 剩余　□ 已用" \
     "🕒 $timestamp"
 }
@@ -891,51 +1060,146 @@ status() {
   else
     print -r -- "quota primary: unavailable; last Pi snapshots may be used"
   fi
-  local next_due
-  if next_due="$(read_next_due)"; then
-    print -r -- "next run: $(format_reset_time "$next_due")"
+  local codex_due antigravity_due
+  codex_due="$(read_provider_next_due "codex" || true)"
+  antigravity_due="$(read_provider_next_due "antigravity" || true)"
+
+  if [[ "$codex_due" =~ ^[0-9]+$ ]]; then
+    print -r -- "next codex run: $(format_reset_time "$codex_due")"
   else
-    print -r -- "next run: due now"
+    print -r -- "next codex run: due now"
+  fi
+  if [[ "$antigravity_due" =~ ^[0-9]+$ ]]; then
+    print -r -- "next antigravity run: $(format_reset_time "$antigravity_due")"
+  else
+    print -r -- "next antigravity run: due now"
   fi
 }
 
-run_once() {
-  local codex_result antigravity_result codex_quota antigravity_quota
-  local codex_pid antigravity_pid now codex_reset antigravity_reset
+five_hour_reset_at() {
+  "$JQ_BIN" -r '.fiveHour.resetAt // empty' "$1" 2>/dev/null
+}
+
+evaluate_provider() {
+  local provider="$1" now
+  local quota_file reset_at last_window last_task current_window
+  local can_run_interval=1 reset_candidate task_base min_candidate target_due
+  now="$(/bin/date '+%s')"
+  quota_file="$(provider_normalized_quota_file "$provider")"
+
+  if ! provider_quota_is_fresh "$provider"; then
+    if ! read_provider_next_due "$provider" >/dev/null 2>&1 || (( now >= $(read_provider_next_due "$provider") )); then
+      write_provider_next_due "$provider" $(( now + 900 ))
+    fi
+    return 1
+  fi
+
+  reset_at="$(five_hour_reset_at "$quota_file")"
+  if [[ ! "$reset_at" =~ ^[0-9]+$ ]] || (( reset_at <= now || reset_at > now + MAX_WINDOW_FUTURE_SECONDS )); then
+    if ! read_provider_next_due "$provider" >/dev/null 2>&1 || (( now >= $(read_provider_next_due "$provider") )); then
+      write_provider_next_due "$provider" $(( now + 900 ))
+    fi
+    return 1
+  fi
+
+  current_window="$reset_at"
+  last_window="$(read_provider_last_window "$provider" || true)"
+  last_task="$(read_provider_last_task "$provider" || true)"
+
+  if [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && (( now < last_task + RUN_INTERVAL_SECONDS )); then
+    can_run_interval=0
+  fi
+
+  if [[ -n "$last_window" && "$current_window" == "$last_window" ]]; then
+    task_base="$now"
+    [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && task_base="$last_task"
+    reset_candidate=$(( reset_at + RESET_BUFFER_SECONDS ))
+    min_candidate=$(( task_base + RUN_INTERVAL_SECONDS ))
+    target_due=$(( reset_candidate > min_candidate ? reset_candidate : min_candidate ))
+    write_provider_next_due "$provider" "$target_due"
+    return 1
+  fi
+
+  if (( can_run_interval == 1 )); then
+    return 0
+  else
+    target_due=$(( last_task + RUN_INTERVAL_SECONDS ))
+    write_provider_next_due "$provider" "$target_due"
+    return 1
+  fi
+}
+
+run_selected_providers() {
+  local attempted=("$@")
+  local provider pid codex_pid=0 antigravity_pid=0 now
+  (( ${#attempted[@]} > 0 )) || return 0
 
   status >/dev/null
-  prepare_run
-
+  ensure_temp_dir
   now="$(/bin/date '+%s')"
-  RUN_STARTED_AT="$now"
-  write_last_task_at "$now"
-  schedule_next_after_run "$now"
 
-  run_codex &
-  codex_pid=$!
-  run_antigravity &
-  antigravity_pid=$!
+  for provider in "${attempted[@]}"; do
+    prepare_provider_env "$provider"
+    write_provider_last_task "$provider" "$now"
+    write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+  done
 
-  if wait "$codex_pid"; then codex_result="发送成功"; else codex_result="发送失败"; fi
-  if wait "$antigravity_pid"; then antigravity_result="发送成功"; else antigravity_result="发送失败"; fi
+  for provider in "${attempted[@]}"; do
+    case "$provider" in
+      codex)
+        run_codex &
+        codex_pid=$!
+        ;;
+      antigravity)
+        run_antigravity &
+        antigravity_pid=$!
+        ;;
+    esac
+  done
+
+  if (( codex_pid > 0 )); then
+    if wait "$codex_pid"; then CODEX_RUN_RESULT="发送成功"; else CODEX_RUN_RESULT="发送失败"; fi
+  fi
+  if (( antigravity_pid > 0 )); then
+    if wait "$antigravity_pid"; then ANTIGRAVITY_RUN_RESULT="发送成功"; else ANTIGRAVITY_RUN_RESULT="发送失败"; fi
+  fi
 
   save_pi_quota_snapshots
   collect_effective_quotas
-  codex_quota="$(codex_quota_message)" || true
-  antigravity_quota="$(antigravity_quota_message)" || true
 
-  if (( CODEX_QUOTA_IS_FRESH == 1 && ANTIGRAVITY_QUOTA_IS_FRESH == 1 )); then
-    codex_reset="$(five_hour_reset_at "$CODEX_QUOTA_NORMALIZED_FILE")"
-    antigravity_reset="$(five_hour_reset_at "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")"
-    if [[ "$codex_reset" =~ ^[0-9]+$ ]] && [[ "$antigravity_reset" =~ ^[0-9]+$ ]]; then
-      write_last_triggered_window "${codex_reset}:${antigravity_reset}"
+  for provider in "${attempted[@]}"; do
+    local q_file reset_val
+    q_file="$(provider_normalized_quota_file "$provider")"
+    reset_val="$(five_hour_reset_at "$q_file")"
+    if provider_quota_is_fresh "$provider" && [[ "$reset_val" =~ ^[0-9]+$ ]]; then
+      write_provider_last_window "$provider" "$reset_val"
+      local due=$(( now + RUN_INTERVAL_SECONDS ))
+      if (( reset_val + RESET_BUFFER_SECONDS > due )); then
+        due=$(( reset_val + RESET_BUFFER_SECONDS ))
+      fi
+      write_provider_next_due "$provider" "$due"
+    else
+      write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
     fi
-  fi
+  done
 
-  schedule_next_from_resets $(( RUN_STARTED_AT + RUN_INTERVAL_SECONDS ))
+  dispatch_notification "$(task_notification_message "${attempted[@]}")"
+}
 
-  dispatch_notification \
-    "$(notification_message "$codex_result" "$codex_quota" "$antigravity_result" "$antigravity_quota")"
+run_once() {
+  run_selected_providers codex antigravity
+}
+
+run_and_reschedule_selected() {
+  local targets=("$@")
+  (( ${#targets[@]} > 0 )) || targets=(codex antigravity)
+  acquire_run_lock || die "Another model run is already in progress"
+  run_selected_providers "${targets[@]}"
+  release_run_lock
+}
+
+run_and_reschedule() {
+  run_and_reschedule_selected "$@"
 }
 
 send_usage_notification() {
@@ -949,107 +1213,27 @@ send_usage_notification() {
   release_quota_lock
 }
 
-run_and_reschedule() {
-  acquire_run_lock || die "Another model run is already in progress"
-  run_once
-  release_run_lock
-}
-
-five_hour_reset_at() {
-  "$JQ_BIN" -r '.fiveHour.resetAt // empty' "$1" 2>/dev/null
-}
-
-monitor_windows_ready() {
-  local now="$1"
-  local codex_reset antigravity_reset
-
-  (( CODEX_QUOTA_IS_FRESH == 1 && ANTIGRAVITY_QUOTA_IS_FRESH == 1 )) || return 1
-  codex_reset="$(five_hour_reset_at "$CODEX_QUOTA_NORMALIZED_FILE")"
-  antigravity_reset="$(five_hour_reset_at "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")"
-  [[ "$codex_reset" =~ ^[0-9]+$ ]] || return 1
-  [[ "$antigravity_reset" =~ ^[0-9]+$ ]] || return 1
-  (( codex_reset - now >= FRESH_WINDOW_SECONDS )) || return 1
-  (( antigravity_reset - now >= FRESH_WINDOW_SECONDS )) || return 1
-}
-
-monitor_alignment_due() {
-  local now="$1"
-  local due="$now" reset
-
-  for reset in \
-    "$(five_hour_reset_at "$CODEX_QUOTA_NORMALIZED_FILE")" \
-    "$(five_hour_reset_at "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")"; do
-    if [[ "$reset" =~ ^[0-9]+$ ]] && (( reset + RESET_BUFFER_SECONDS > due )); then
-      due=$(( reset + RESET_BUFFER_SECONDS ))
-    fi
-  done
-  print -r -- "$due"
-}
-
 check_schedule() {
-  local now next_due had_due=0 should_run=0
-  local codex_reset antigravity_reset current_window last_window last_task
-  local reset_candidate min_candidate target_due can_run_interval=1
-  now="$(/bin/date '+%s')"
-  if next_due="$(read_next_due)"; then
-    had_due=1
-  fi
+  local due_providers=()
 
   acquire_quota_lock || return 0
   prepare_quota_probe
   collect_effective_quotas
 
-  if (( CODEX_QUOTA_IS_FRESH == 1 && ANTIGRAVITY_QUOTA_IS_FRESH == 1 )); then
-    codex_reset="$(five_hour_reset_at "$CODEX_QUOTA_NORMALIZED_FILE")"
-    antigravity_reset="$(five_hour_reset_at "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")"
-
-    if [[ "$codex_reset" =~ ^[0-9]+$ ]] && [[ "$antigravity_reset" =~ ^[0-9]+$ ]] &&
-       (( codex_reset > now && codex_reset <= now + MAX_WINDOW_FUTURE_SECONDS )) &&
-       (( antigravity_reset > now && antigravity_reset <= now + MAX_WINDOW_FUTURE_SECONDS )); then
-
-      current_window="${codex_reset}:${antigravity_reset}"
-      last_window="$(read_last_triggered_window || true)"
-      last_task="$(read_last_task_at || true)"
-
-      if [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && (( now < last_task + RUN_INTERVAL_SECONDS )); then
-        can_run_interval=0
-      fi
-
-      if [[ -n "$last_window" && "$current_window" == "$last_window" ]]; then
-        local task_base="$now"
-        [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && task_base="$last_task"
-        reset_candidate=$(( (codex_reset > antigravity_reset ? codex_reset : antigravity_reset) + RESET_BUFFER_SECONDS ))
-        min_candidate=$(( task_base + RUN_INTERVAL_SECONDS ))
-        target_due=$(( reset_candidate > min_candidate ? reset_candidate : min_candidate ))
-        write_next_due "$target_due"
-        should_run=0
-      else
-        if (( can_run_interval == 1 )); then
-          should_run=1
-        else
-          target_due=$(( last_task + RUN_INTERVAL_SECONDS ))
-          write_next_due "$target_due"
-          should_run=0
-        fi
-      fi
-    else
-      if (( had_due == 0 )) || (( now >= next_due )); then
-        write_next_due $(( now + 900 ))
-      fi
-    fi
-  else
-    if (( had_due == 0 )) || (( now >= next_due )); then
-      write_next_due $(( now + 900 ))
-    fi
+  if evaluate_provider "codex"; then
+    due_providers+=(codex)
+  fi
+  if evaluate_provider "antigravity"; then
+    due_providers+=(antigravity)
   fi
   release_quota_lock
 
-  if (( should_run == 0 )); then
+  if (( ${#due_providers[@]} == 0 )); then
     return 0
   fi
 
   acquire_run_lock || return 0
-  run_once
+  run_selected_providers "${due_providers[@]}"
   release_run_lock
 }
 
@@ -1079,7 +1263,21 @@ main() {
       wait_schedule
       ;;
     run)
-      run_and_reschedule
+      local target="${2:-all}"
+      case "$target" in
+        codex)
+          run_and_reschedule_selected codex
+          ;;
+        antigravity)
+          run_and_reschedule_selected antigravity
+          ;;
+        all|both|"")
+          run_and_reschedule_selected codex antigravity
+          ;;
+        *)
+          die "Unknown run target: $target (expected: codex, antigravity, or all)"
+          ;;
+      esac
       ;;
     usage)
       send_usage_notification

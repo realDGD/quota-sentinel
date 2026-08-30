@@ -118,21 +118,25 @@ an Authorization header supplied to curl over stdin.
 ./quota-sentinel.sh usage
 ./quota-sentinel.sh status
 ./quota-sentinel.sh discover-feishu-user <email-or-mobile>
-./quota-sentinel.sh run
+./quota-sentinel.sh run [codex|antigravity|all]
 ```
 
-- `check`: 15-minute watchdog probe. Queries live quota without model invocations, checks 5h window state, and triggers task if a new window is detected.
-- `usage`: Instant quota check sent to Feishu without triggering model tasks.
-- `run`: Forces one run and moves the next due time forward.
-- `wait`: Precise sleep timer.
+- `check`: 15-minute watchdog probe. Independently evaluates Codex and Antigravity 5h quota states without model invocations, and triggers only the provider(s) due for execution.
+- `usage`: Instant quota check sent to Feishu for both providers without triggering model tasks.
+- `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
+- `wait`: Precise sleep timer waking at the earliest due deadline (`min(codex, antigravity)`).
 
-## Dynamic Scheduling & Reset Detection
+## Dynamic Independent Scheduling & Reset Detection
 
-- **Window Identification**: Tracks the active 5h window reset timestamps (`last_triggered_window`).
-- **Reset Detection**: Triggers when a newly started 5h window is detected (`remaining >= 4h55m`) or via missed-reset recovery after sleep/startup.
-- **Deduplication**: Once a window is triggered, it will never re-trigger the same 5h window.
-- **Safety Grace & Minimum Interval**: Enforces a minimum interval of 5 hours 01 minute between runs and waits 4 minutes after window reset to allow server stats to settle.
-- **State Persistence**: Stored under `~/Library/Application Support/quota-sentinel/` across reboots and sleep/wake cycles.
+- **Decoupled State Machines**: Codex and Antigravity maintain completely independent 5-hour window states (`last_task_at`, `last_triggered_window`, `next_due_at`).
+- **Targeted Execution & Card Scoping**:
+  - When only Antigravity is due, only Gemini executes and only Gemini appears in the Feishu card (Codex is never marked as failed).
+  - When only Codex is due, only Luna executes and only Luna appears in the Feishu card.
+  - When both are due, both execute in parallel and are rendered in a combined card.
+- **Window Identification**: Identifies windows by individual provider reset timestamps (`window_id = reset_at`).
+- **Deduplication**: Once a provider's window is triggered, it will never re-trigger the same 5h window.
+- **Safety Grace & Minimum Interval**: Enforces a minimum interval of 5 hours 01 minute per provider and waits 4 minutes after window reset to allow server stats to settle.
+- **State Persistence**: Stored independently per provider under `~/Library/Application Support/quota-sentinel/` with automatic legacy migration.
 
 ## LaunchAgents
 
