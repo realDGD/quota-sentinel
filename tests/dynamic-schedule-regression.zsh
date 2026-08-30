@@ -28,14 +28,36 @@ run_selected_providers() {
       codex)
         CODEX_RUN_RESULT="发送成功"
         write_provider_last_task "codex" "$now"
-        write_provider_last_window "codex" "$MOCK_CODEX_RESET"
-        write_provider_next_due "codex" $(( now + RUN_INTERVAL_SECONDS ))
+        if (( MOCK_CODEX_FRESH == 1 )) && (( MOCK_CODEX_RESET > now )); then
+          write_provider_last_known_reset "codex" "$MOCK_CODEX_RESET"
+          write_provider_last_window "codex" "$MOCK_CODEX_RESET"
+          write_provider_next_due "codex" $(( MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS ))
+        else
+          local prev_due
+          prev_due="$(read_provider_next_due "codex" || true)"
+          if [[ "$prev_due" =~ ^[0-9]+$ ]]; then
+            write_provider_next_due "codex" $(( prev_due + RUN_INTERVAL_SECONDS ))
+          else
+            write_provider_next_due "codex" $(( now + RUN_INTERVAL_SECONDS ))
+          fi
+        fi
         ;;
       antigravity)
         ANTIGRAVITY_RUN_RESULT="发送成功"
         write_provider_last_task "antigravity" "$now"
-        write_provider_last_window "antigravity" "$MOCK_ANTIGRAVITY_RESET"
-        write_provider_next_due "antigravity" $(( now + RUN_INTERVAL_SECONDS ))
+        if (( MOCK_ANTIGRAVITY_FRESH == 1 )) && (( MOCK_ANTIGRAVITY_RESET > now )); then
+          write_provider_last_known_reset "antigravity" "$MOCK_ANTIGRAVITY_RESET"
+          write_provider_last_window "antigravity" "$MOCK_ANTIGRAVITY_RESET"
+          write_provider_next_due "antigravity" $(( MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS ))
+        else
+          local prev_due
+          prev_due="$(read_provider_next_due "antigravity" || true)"
+          if [[ "$prev_due" =~ ^[0-9]+$ ]]; then
+            write_provider_next_due "antigravity" $(( prev_due + RUN_INTERVAL_SECONDS ))
+          else
+            write_provider_next_due "antigravity" $(( now + RUN_INTERVAL_SECONDS ))
+          fi
+        fi
         ;;
     esac
   done
@@ -61,235 +83,204 @@ collect_effective_quotas() {
 base_now="$(/bin/date '+%s')"
 
 # -------------------------------------------------------------
-# Case 1: Only Antigravity due -> Runs only Antigravity
+# Case 1: Probe success calibrates deadline to reset_at + 5h01m
+# -------------------------------------------------------------
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 3600 )) # Reset in 1 hour
+MOCK_ANTIGRAVITY_FRESH=1
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 1800 )) # Reset in 30 mins
+check_schedule
+
+codex_due="$(read_provider_next_due codex)"
+anti_due="$(read_provider_next_due antigravity)"
+if (( codex_due != MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 1 failed: Codex next_due ($codex_due) != $(( MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS ))"
+  exit 1
+fi
+if (( anti_due != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 1 failed: Antigravity next_due ($anti_due) != $(( MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS ))"
+  exit 1
+fi
+print -r -- "Case 1 (Probe success calibrates deadline to reset + 5h01m): passed"
+
+# -------------------------------------------------------------
+# Case 2: Probe failure preserves deadline without drift
+# -------------------------------------------------------------
+saved_codex_due="$codex_due"
+saved_anti_due="$anti_due"
+MOCK_CODEX_FRESH=0
+MOCK_ANTIGRAVITY_FRESH=0
+check_schedule
+
+if (( $(read_provider_next_due codex) != saved_codex_due )) ||
+   (( $(read_provider_next_due antigravity) != saved_anti_due )); then
+  print -u2 -r -- "Case 2 failed: Probe failure caused deadline drift!"
+  exit 1
+fi
+print -r -- "Case 2 (Probe failure preserves deadline without drift): passed"
+
+# -------------------------------------------------------------
+# Case 3: Multiple consecutive probe failures (no drift over time)
+# -------------------------------------------------------------
+check_schedule
+check_schedule
+check_schedule
+if (( $(read_provider_next_due codex) != saved_codex_due )) ||
+   (( $(read_provider_next_due antigravity) != saved_anti_due )); then
+  print -u2 -r -- "Case 3 failed: Consecutive probe failures shifted deadline!"
+  exit 1
+fi
+print -r -- "Case 3 (Multiple consecutive probe failures do not drift deadline): passed"
+
+# -------------------------------------------------------------
+# Case 4: Subsequent probe success re-anchors deadline immediately
+# -------------------------------------------------------------
+MOCK_ANTIGRAVITY_FRESH=1
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 7200 )) # New reset in 2 hours
+MOCK_CODEX_FRESH=0 # Codex still failing
+check_schedule
+
+if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 4 failed: Antigravity did not re-anchor to new reset!"
+  exit 1
+fi
+if (( $(read_provider_next_due codex) != saved_codex_due )); then
+  print -u2 -r -- "Case 4 failed: Codex deadline was unexpectedly modified!"
+  exit 1
+fi
+print -r -- "Case 4 (Subsequent probe success re-anchors deadline immediately): passed"
+
+# -------------------------------------------------------------
+# Case 5: When now >= next_due_at, executes provider once
 # -------------------------------------------------------------
 LAST_ATTEMPTED=()
 TOTAL_RUNS=0
-# Codex: existing window from earlier, reset in 3h46m (13560s), already executed
-write_provider_last_task "codex" "$base_now"
-write_provider_last_window "codex" "$(( base_now + 13560 ))"
-MOCK_CODEX_RESET=$(( base_now + 13560 ))
-# Antigravity: new window, reset in 4h59m (17940s), not executed
-write_provider_last_task "antigravity" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "antigravity" "$(( base_now - 1000 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 17940 ))
-
+# Set Antigravity due in past (now reached), Codex far in future
+write_provider_next_due "antigravity" $(( base_now - 10 ))
+write_provider_next_due "codex" $(( base_now + 10000 ))
+MOCK_ANTIGRAVITY_FRESH=0 # probe fails post-run, should advance fallback
+MOCK_CODEX_FRESH=0
 check_schedule
+
 if [[ "${LAST_ATTEMPTED[*]}" != "antigravity" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 1 failed: Expected only antigravity to run, got ${LAST_ATTEMPTED[*]}"
+  print -u2 -r -- "Case 5 failed: Expected only antigravity to run, got ${LAST_ATTEMPTED[*]}"
   exit 1
 fi
-if [[ "$LAST_DISPATCHED_MESSAGE" != *"Gemini 3.7 Flash · Low"* ]] ||
-   [[ "$LAST_DISPATCHED_MESSAGE" == *"GPT-5.6 Luna"* ]]; then
-  print -u2 -r -- "Case 1 failed: Card scope leaked Codex!"
+print -r -- "Case 5 (Reaching next_due_at triggers execution): passed"
+
+# -------------------------------------------------------------
+# Case 6: Continuous failure post-run advances fallback deadline (+5h01m)
+# -------------------------------------------------------------
+new_anti_due="$(read_provider_next_due antigravity)"
+if (( new_anti_due != base_now - 10 + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 6 failed: Post-run fallback not advanced by 5h01m (got $new_anti_due)"
   exit 1
 fi
-print -r -- "Case 1 (Only Antigravity due -> runs and renders only Gemini): passed"
-
-# -------------------------------------------------------------
-# Case 2: Only Codex due -> Runs only Codex
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-# Antigravity: current window already executed
-write_provider_last_task "antigravity" "$base_now"
-write_provider_last_window "antigravity" "$(( base_now + 13560 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 13560 ))
-# Codex: new window, reset in 4h59m (17940s), not executed
-write_provider_last_task "codex" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "codex" "$(( base_now - 1000 ))"
-MOCK_CODEX_RESET=$(( base_now + 17940 ))
-
+# Next immediate check should not repeat
 check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "codex" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 2 failed: Expected only codex to run, got ${LAST_ATTEMPTED[*]}"
+if (( TOTAL_RUNS != 1 )); then
+  print -u2 -r -- "Case 6 failed: Task repeated unexpectedly!"
   exit 1
 fi
-if [[ "$LAST_DISPATCHED_MESSAGE" != *"GPT-5.6 Luna"* ]] ||
-   [[ "$LAST_DISPATCHED_MESSAGE" == *"Gemini 3.7 Flash · Low"* ]]; then
-  print -u2 -r -- "Case 2 failed: Card scope leaked Gemini!"
-  exit 1
-fi
-print -r -- "Case 2 (Only Codex due -> runs and renders only Luna): passed"
+print -r -- "Case 6 (Post-run failure advances fallback by 5h01m without repeat): passed"
 
 # -------------------------------------------------------------
-# Case 3: Both due -> Runs both in one combined execution
+# Case 7: API recovery after fallback execution re-anchors to real reset
 # -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-write_provider_last_task "codex" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "codex" "$(( base_now - 1000 ))"
-MOCK_CODEX_RESET=$(( base_now + 17940 ))
-write_provider_last_task "antigravity" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "antigravity" "$(( base_now - 1000 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 17940 ))
-
-check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "codex antigravity" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 3 failed: Expected both providers to run, got ${LAST_ATTEMPTED[*]}"
-  exit 1
-fi
-if [[ "$LAST_DISPATCHED_MESSAGE" != *"GPT-5.6 Luna"* ]] ||
-   [[ "$LAST_DISPATCHED_MESSAGE" != *"Gemini 3.7 Flash · Low"* ]] ||
-   [[ "$LAST_DISPATCHED_MESSAGE" != *"────────────"* ]]; then
-  print -u2 -r -- "Case 3 failed: Card did not combine both sections properly!"
-  exit 1
-fi
-print -r -- "Case 3 (Both due -> combined run and card): passed"
-
-# -------------------------------------------------------------
-# Case 4: Codex just ran (10 min ago), Antigravity due -> Antigravity runs
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-write_provider_last_task "codex" "$(( base_now - 600 ))"
-write_provider_last_window "codex" "$(( base_now + 17400 ))"
-MOCK_CODEX_RESET=$(( base_now + 17400 ))
-write_provider_last_task "antigravity" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "antigravity" "$(( base_now - 1000 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 17940 ))
-
-check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "antigravity" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 4 failed: Antigravity was blocked by Codex's recent run!"
-  exit 1
-fi
-print -r -- "Case 4 (Codex recently ran -> Antigravity independent run): passed"
-
-# -------------------------------------------------------------
-# Case 5: Antigravity just ran (10 min ago), Codex due -> Codex runs
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-write_provider_last_task "antigravity" "$(( base_now - 600 ))"
-write_provider_last_window "antigravity" "$(( base_now + 17400 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 17400 ))
-write_provider_last_task "codex" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_window "codex" "$(( base_now - 1000 ))"
-MOCK_CODEX_RESET=$(( base_now + 17940 ))
-
-check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "codex" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 5 failed: Codex was blocked by Antigravity's recent run!"
-  exit 1
-fi
-print -r -- "Case 5 (Antigravity recently ran -> Codex independent run): passed"
-
-# -------------------------------------------------------------
-# Case 6: Same Codex window repeated watchdog -> Does not run
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-MOCK_CODEX_RESET=$(( base_now + 15000 ))
-write_provider_last_window "codex" "$MOCK_CODEX_RESET"
-write_provider_last_task "codex" "$(( base_now - 3000 ))"
+MOCK_ANTIGRAVITY_FRESH=1
 MOCK_ANTIGRAVITY_RESET=$(( base_now + 15000 ))
-write_provider_last_window "antigravity" "$MOCK_ANTIGRAVITY_RESET"
-write_provider_last_task "antigravity" "$(( base_now - 3000 ))"
-
 check_schedule
-if (( TOTAL_RUNS != 0 )); then
-  print -u2 -r -- "Case 6 failed: Ran on duplicate window"
+
+if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 7 failed: Recovery did not re-anchor deadline to real reset"
   exit 1
 fi
-print -r -- "Case 6 (Duplicate window deduplication): passed"
+print -r -- "Case 7 (API recovery re-anchors fallback deadline to real reset): passed"
 
 # -------------------------------------------------------------
-# Case 7: Antigravity missed-reset recovery -> Only recovers Antigravity
+# Case 8: Codex and Antigravity independent deadlines
 # -------------------------------------------------------------
 LAST_ATTEMPTED=()
 TOTAL_RUNS=0
-# Antigravity: new window, remaining 4h40m (16800s), unexecuted
-write_provider_last_task "antigravity" "$(( base_now - RUN_INTERVAL_SECONDS - 100 ))"
-write_provider_last_window "antigravity" "$(( base_now - 2000 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 16800 ))
-# Codex: already executed
-write_provider_last_task "codex" "$base_now"
-write_provider_last_window "codex" "$(( base_now + 12000 ))"
-MOCK_CODEX_RESET=$(( base_now + 12000 ))
-
-check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "antigravity" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 7 failed: Antigravity missed-reset recovery failed!"
-  exit 1
-fi
-# Re-check should not repeat
-check_schedule
-if (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 7 failed: Antigravity recovery repeated!"
-  exit 1
-fi
-print -r -- "Case 7 (Antigravity missed-reset recovery isolated and non-repeating): passed"
-
-# -------------------------------------------------------------
-# Case 8: Codex missed-reset recovery -> Only recovers Codex
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-# Codex: new window, remaining 4h40m (16800s), unexecuted
-write_provider_last_task "codex" "$(( base_now - RUN_INTERVAL_SECONDS - 100 ))"
-write_provider_last_window "codex" "$(( base_now - 2000 ))"
-MOCK_CODEX_RESET=$(( base_now + 16800 ))
-# Antigravity: already executed
-write_provider_last_task "antigravity" "$base_now"
-write_provider_last_window "antigravity" "$(( base_now + 12000 ))"
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 12000 ))
+write_provider_next_due "codex" $(( base_now - 10 )) # Codex due
+write_provider_next_due "antigravity" $(( base_now + 5000 )) # Antigravity not due
+MOCK_CODEX_FRESH=0 # probe failing, fallback triggers
+MOCK_ANTIGRAVITY_FRESH=0 # probe failing, keeps 5000
 
 check_schedule
 if [[ "${LAST_ATTEMPTED[*]}" != "codex" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 8 failed: Codex missed-reset recovery failed!"
+  print -u2 -r -- "Case 8 failed: Expected only codex to run, got ${LAST_ATTEMPTED[*]}"
   exit 1
 fi
-check_schedule
-if (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 8 failed: Codex recovery repeated!"
+if (( $(read_provider_next_due antigravity) != base_now + 5000 )); then
+  print -u2 -r -- "Case 8 failed: Antigravity deadline was altered by Codex execution!"
   exit 1
 fi
-print -r -- "Case 8 (Codex missed-reset recovery isolated and non-repeating): passed"
+print -r -- "Case 8 (Codex and Antigravity independent deadlines): passed"
 
 # -------------------------------------------------------------
-# Case 9: Anomaly protection on invalid reset timestamps
+# Case 9: One probe success, one probe failure
 # -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-write_provider_last_task "codex" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-write_provider_last_task "antigravity" "$(( base_now - RUN_INTERVAL_SECONDS - 10 ))"
-MOCK_CODEX_RESET=$(( base_now - 200 )) # Past
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 30000 )) # > 6h in future
+c_prev="$(read_provider_next_due codex)"
+MOCK_CODEX_FRESH=0 # Codex probe fails
+MOCK_ANTIGRAVITY_FRESH=1 # Antigravity probe succeeds
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 8000 ))
 check_schedule
-if (( TOTAL_RUNS != 0 )); then
-  print -u2 -r -- "Case 9 failed: Ran on anomalous reset timestamps!"
+
+if (( $(read_provider_next_due codex) != c_prev )); then
+  print -u2 -r -- "Case 9 failed: Failed Codex probe altered deadline!"
   exit 1
 fi
-print -r -- "Case 9 (Anomalous reset timestamps protected): passed"
+if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
+  print -u2 -r -- "Case 9 failed: Successful Antigravity probe did not calibrate deadline!"
+  exit 1
+fi
+print -r -- "Case 9 (One probe success, one failure handled independently): passed"
 
 # -------------------------------------------------------------
-# Case 10: Task Notification Card Scope formatting
+# Case 10: Anomalous reset data (in past or > 6h in future) is rejected
+# -------------------------------------------------------------
+a_prev="$(read_provider_next_due antigravity)"
+MOCK_ANTIGRAVITY_FRESH=1
+MOCK_ANTIGRAVITY_RESET=$(( base_now - 500 )) # In past
+check_schedule
+if (( $(read_provider_next_due antigravity) != a_prev )); then
+  print -u2 -r -- "Case 10 failed: Past reset timestamp overwritten deadline!"
+  exit 1
+fi
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 30000 )) # > 6h
+check_schedule
+if (( $(read_provider_next_due antigravity) != a_prev )); then
+  print -u2 -r -- "Case 10 failed: Excessive future reset overwritten deadline!"
+  exit 1
+fi
+print -r -- "Case 10 (Anomalous reset data rejected): passed"
+
+# -------------------------------------------------------------
+# Case 11: Task notification card scope strict isolation
 # -------------------------------------------------------------
 CODEX_RUN_RESULT="发送成功"
 ANTIGRAVITY_RUN_RESULT="发送成功"
-msg_codex="$(task_notification_message codex)"
-[[ "$msg_codex" == *"**GPT-5.6 Luna**"* ]]
-[[ "$msg_codex" != *"**Gemini 3.7 Flash · Low**"* ]]
+msg_c="$(task_notification_message codex)"
+[[ "$msg_c" == *"**GPT-5.6 Luna**"* ]]
+[[ "$msg_c" != *"**Gemini 3.7 Flash · Low**"* ]]
 
-msg_anti="$(task_notification_message antigravity)"
-[[ "$msg_anti" != *"**GPT-5.6 Luna**"* ]]
-[[ "$msg_anti" == *"**Gemini 3.7 Flash · Low**"* ]]
+msg_a="$(task_notification_message antigravity)"
+[[ "$msg_a" != *"**GPT-5.6 Luna**"* ]]
+[[ "$msg_a" == *"**Gemini 3.7 Flash · Low**"* ]]
 
 msg_both="$(task_notification_message codex antigravity)"
 [[ "$msg_both" == *"**GPT-5.6 Luna**"* ]]
 [[ "$msg_both" == *"**Gemini 3.7 Flash · Low**"* ]]
 [[ "$msg_both" == *"────────────"* ]]
-print -r -- "Case 10 (Task notification message scope strict isolation): passed"
+print -r -- "Case 11 (Task notification card scope strictly isolated): passed"
 
 # -------------------------------------------------------------
-# Case 11: /usage query is strictly read-only and shows both providers
+# Case 12: /usage query is strictly read-only and shows both providers
 # -------------------------------------------------------------
 write_provider_last_task "codex" 111111
-write_provider_last_window "codex" "win-c"
 write_provider_next_due "codex" 333333
 write_provider_last_task "antigravity" 222222
-write_provider_last_window "antigravity" "win-a"
 write_provider_next_due "antigravity" 444444
 
 MOCK_CODEX_RESET=$(( base_now + 10000 ))
@@ -306,18 +297,16 @@ send_usage_notification
 [[ "$CAPTURED_USAGE_MSG" == *"即时配额查询"* ]]
 
 if [[ "$(read_provider_last_task codex)" != "111111" ]] ||
-   [[ "$(read_provider_last_window codex)" != "win-c" ]] ||
    [[ "$(read_provider_next_due codex)" != "333333" ]] ||
    [[ "$(read_provider_last_task antigravity)" != "222222" ]] ||
-   [[ "$(read_provider_last_window antigravity)" != "win-a" ]] ||
    [[ "$(read_provider_next_due antigravity)" != "444444" ]]; then
-  print -u2 -r -- "Case 11 failed: /usage modified scheduler state!"
+  print -u2 -r -- "Case 12 failed: /usage modified scheduler state!"
   exit 1
 fi
-print -r -- "Case 11 (/usage shows both and leaves scheduler state untouched): passed"
+print -r -- "Case 12 (/usage is strictly read-only and does not touch scheduler): passed"
 
 # -------------------------------------------------------------
-# Case 12: Legacy state migration
+# Case 13: Legacy state migration
 # -------------------------------------------------------------
 rm -rf "$QUOTA_SENTINEL_STATE_DIR"
 mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
@@ -329,9 +318,9 @@ print -r -- "100000:200000" >"$QUOTA_SENTINEL_STATE_DIR/last-triggered-window"
 [[ "$(read_provider_last_task antigravity)" == "987654" ]]
 [[ "$(read_provider_next_due codex)" == "876543" ]]
 [[ "$(read_provider_next_due antigravity)" == "876543" ]]
-[[ "$(read_provider_last_window codex)" == "100000" ]]
-[[ "$(read_provider_last_window antigravity)" == "200000" ]]
-print -r -- "Case 12 (Legacy state migration works seamlessly): passed"
+[[ "$(read_provider_last_known_reset codex)" == "100000" ]]
+[[ "$(read_provider_last_known_reset antigravity)" == "200000" ]]
+print -r -- "Case 13 (Legacy state migration preserved seamlessly): passed"
 
 cleanup
-print -r -- "dynamic schedule regression: all 12 cases passed"
+print -r -- "dynamic schedule regression: all 13 cases passed"

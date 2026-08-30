@@ -52,12 +52,12 @@ run_selected_providers() {
 
 collect_effective_quotas() {
   ensure_temp_dir
-  CODEX_QUOTA_IS_FRESH=1
-  ANTIGRAVITY_QUOTA_IS_FRESH=1
+  CODEX_QUOTA_IS_FRESH=0
+  ANTIGRAVITY_QUOTA_IS_FRESH=0
   local now
   now="$(/bin/date '+%s')"
-  print -r -- '{"source":"CodexBar · cli","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"source":"CodexBar · cli","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"Pi 快照","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"Pi 快照","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
 }
 
 before_check="$(/bin/date '+%s')"

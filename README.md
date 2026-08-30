@@ -126,17 +126,22 @@ an Authorization header supplied to curl over stdin.
 - `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
 - `wait`: Precise sleep timer waking at the earliest due deadline (`min(codex, antigravity)`).
 
-## Dynamic Independent Scheduling & Reset Detection
+## Dynamic Reset Calibration & Fallback Scheduling
 
-- **Decoupled State Machines**: Codex and Antigravity maintain completely independent 5-hour window states (`last_task_at`, `last_triggered_window`, `next_due_at`).
+- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, and `last_task_at`.
+- **Dynamic Calibration from Quota Probes**:
+  - Every 15 minutes, the watchdog probes quota via CodexBar/agy.
+  - When fresh valid `reset_at` is obtained: `next_due_at` is immediately calibrated to `reset_at + 5h01m`.
+  - When probe fails or returns stale snapshot: `next_due_at` is **preserved unchanged** without shifting or drifting forward.
+- **Graceful Fallback & Degradation**:
+  - When `now >= next_due_at`, the due provider executes.
+  - If post-run probes continue to fail, the fallback deadline advances by `+5h01m` (`next_due_at += 18060s`), smoothly degrading to a fixed 5h01m interval.
+  - Any subsequent successful probe immediately re-anchors `next_due_at` to the server's real `reset_at + 5h01m`.
 - **Targeted Execution & Card Scoping**:
-  - When only Antigravity is due, only Gemini executes and only Gemini appears in the Feishu card (Codex is never marked as failed).
-  - When only Codex is due, only Luna executes and only Luna appears in the Feishu card.
-  - When both are due, both execute in parallel and are rendered in a combined card.
-- **Window Identification**: Identifies windows by individual provider reset timestamps (`window_id = reset_at`).
-- **Deduplication**: Once a provider's window is triggered, it will never re-trigger the same 5h window.
-- **Safety Grace & Minimum Interval**: Enforces a minimum interval of 5 hours 01 minute per provider and waits 4 minutes after window reset to allow server stats to settle.
-- **State Persistence**: Stored independently per provider under `~/Library/Application Support/quota-sentinel/` with automatic legacy migration.
+  - When only Antigravity reaches its deadline, only Gemini executes and only Gemini appears in the Feishu card (Codex is never marked as failed).
+  - When only Codex reaches its deadline, only Luna executes and only Luna appears in the Feishu card.
+  - When both reach their deadlines, both execute in parallel and are rendered in a combined card.
+- **State Persistence & Migration**: Stored independently per provider under `~/Library/Application Support/quota-sentinel/` with automatic legacy migration.
 
 ## LaunchAgents
 

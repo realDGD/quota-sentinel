@@ -90,6 +90,11 @@ provider_last_task_file() {
   print -r -- "$STATE_DIR/${provider}-last-task-at"
 }
 
+provider_last_known_reset_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-last-known-reset-at"
+}
+
 provider_last_window_file() {
   local provider="$1"
   print -r -- "$STATE_DIR/${provider}-last-triggered-window"
@@ -146,6 +151,14 @@ migrate_legacy_state() {
         print -r -- "$a_win" >"$STATE_DIR/antigravity-last-triggered-window"
         chmod 600 "$STATE_DIR/antigravity-last-triggered-window"
       fi
+      if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-known-reset-at" ]]; then
+        print -r -- "$c_win" >"$STATE_DIR/codex-last-known-reset-at"
+        chmod 600 "$STATE_DIR/codex-last-known-reset-at"
+      fi
+      if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-known-reset-at" ]]; then
+        print -r -- "$a_win" >"$STATE_DIR/antigravity-last-known-reset-at"
+        chmod 600 "$STATE_DIR/antigravity-last-known-reset-at"
+      fi
     fi
   fi
 }
@@ -188,6 +201,28 @@ write_provider_last_task() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
   file="$(provider_last_task_file "$provider")"
+  temp_file="${file}.tmp.$$"
+  print -r -- "$epoch" >"$temp_file"
+  chmod 600 "$temp_file"
+  mv -f "$temp_file" "$file"
+}
+
+read_provider_last_known_reset() {
+  local provider="$1" file value
+  migrate_legacy_state
+  file="$(provider_last_known_reset_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  print -r -- "$value"
+}
+
+write_provider_last_known_reset() {
+  local provider="$1" epoch="$2" file temp_file
+  [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-known-reset timestamp: $epoch"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  file="$(provider_last_known_reset_file "$provider")"
   temp_file="${file}.tmp.$$"
   print -r -- "$epoch" >"$temp_file"
   chmod 600 "$temp_file"
@@ -1080,58 +1115,41 @@ five_hour_reset_at() {
   "$JQ_BIN" -r '.fiveHour.resetAt // empty' "$1" 2>/dev/null
 }
 
-evaluate_provider() {
-  local provider="$1" now
-  local quota_file reset_at last_window last_task current_window
-  local can_run_interval=1 reset_candidate task_base min_candidate target_due
+calibrate_provider_deadline() {
+  local provider="$1" now quota_file reset_at
   now="$(/bin/date '+%s')"
   quota_file="$(provider_normalized_quota_file "$provider")"
 
-  if ! provider_quota_is_fresh "$provider"; then
-    if ! read_provider_next_due "$provider" >/dev/null 2>&1 || (( now >= $(read_provider_next_due "$provider") )); then
-      write_provider_next_due "$provider" $(( now + 900 ))
+  if provider_quota_is_fresh "$provider"; then
+    reset_at="$(five_hour_reset_at "$quota_file")"
+    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > now && reset_at <= now + MAX_WINDOW_FUTURE_SECONDS )); then
+      write_provider_last_known_reset "$provider" "$reset_at"
+      write_provider_next_due "$provider" $(( reset_at + RUN_INTERVAL_SECONDS ))
+      return 0
     fi
-    return 1
   fi
+  return 1
+}
 
-  reset_at="$(five_hour_reset_at "$quota_file")"
-  if [[ ! "$reset_at" =~ ^[0-9]+$ ]] || (( reset_at <= now || reset_at > now + MAX_WINDOW_FUTURE_SECONDS )); then
-    if ! read_provider_next_due "$provider" >/dev/null 2>&1 || (( now >= $(read_provider_next_due "$provider") )); then
-      write_provider_next_due "$provider" $(( now + 900 ))
+evaluate_provider() {
+  local provider="$1" now next_due
+  now="$(/bin/date '+%s')"
+
+  # 1. Calibrate fallback deadline with fresh valid reset data if available
+  calibrate_provider_deadline "$provider" || true
+
+  # 2. Check if reached next_due_at
+  if next_due="$(read_provider_next_due "$provider")"; then
+    if (( now >= next_due )); then
+      return 0
     fi
-    return 1
   fi
-
-  current_window="$reset_at"
-  last_window="$(read_provider_last_window "$provider" || true)"
-  last_task="$(read_provider_last_task "$provider" || true)"
-
-  if [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && (( now < last_task + RUN_INTERVAL_SECONDS )); then
-    can_run_interval=0
-  fi
-
-  if [[ -n "$last_window" && "$current_window" == "$last_window" ]]; then
-    task_base="$now"
-    [[ -n "$last_task" && "$last_task" =~ ^[0-9]+$ ]] && task_base="$last_task"
-    reset_candidate=$(( reset_at + RESET_BUFFER_SECONDS ))
-    min_candidate=$(( task_base + RUN_INTERVAL_SECONDS ))
-    target_due=$(( reset_candidate > min_candidate ? reset_candidate : min_candidate ))
-    write_provider_next_due "$provider" "$target_due"
-    return 1
-  fi
-
-  if (( can_run_interval == 1 )); then
-    return 0
-  else
-    target_due=$(( last_task + RUN_INTERVAL_SECONDS ))
-    write_provider_next_due "$provider" "$target_due"
-    return 1
-  fi
+  return 1
 }
 
 run_selected_providers() {
   local attempted=("$@")
-  local provider pid codex_pid=0 antigravity_pid=0 now
+  local provider pid codex_pid=0 antigravity_pid=0 now prev_due
   (( ${#attempted[@]} > 0 )) || return 0
 
   status >/dev/null
@@ -1141,7 +1159,6 @@ run_selected_providers() {
   for provider in "${attempted[@]}"; do
     prepare_provider_env "$provider"
     write_provider_last_task "$provider" "$now"
-    write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
   done
 
   for provider in "${attempted[@]}"; do
@@ -1171,15 +1188,20 @@ run_selected_providers() {
     local q_file reset_val
     q_file="$(provider_normalized_quota_file "$provider")"
     reset_val="$(five_hour_reset_at "$q_file")"
-    if provider_quota_is_fresh "$provider" && [[ "$reset_val" =~ ^[0-9]+$ ]]; then
+    if provider_quota_is_fresh "$provider" &&
+       [[ "$reset_val" =~ ^[0-9]+$ ]] &&
+       (( reset_val > now && reset_val <= now + MAX_WINDOW_FUTURE_SECONDS )); then
+      write_provider_last_known_reset "$provider" "$reset_val"
       write_provider_last_window "$provider" "$reset_val"
-      local due=$(( now + RUN_INTERVAL_SECONDS ))
-      if (( reset_val + RESET_BUFFER_SECONDS > due )); then
-        due=$(( reset_val + RESET_BUFFER_SECONDS ))
-      fi
-      write_provider_next_due "$provider" "$due"
+      write_provider_next_due "$provider" $(( reset_val + RUN_INTERVAL_SECONDS ))
     else
-      write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+      # If no fresh valid reset obtained post-run, advance fallback deadline by 5h01m
+      prev_due="$(read_provider_next_due "$provider" || true)"
+      if [[ "$prev_due" =~ ^[0-9]+$ ]] && (( prev_due > now - RUN_INTERVAL_SECONDS )); then
+        write_provider_next_due "$provider" $(( prev_due + RUN_INTERVAL_SECONDS ))
+      else
+        write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+      fi
     fi
   done
 
