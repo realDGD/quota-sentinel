@@ -91,6 +91,36 @@ src_count="$(print -r -- "$c_task" | grep -c '↳ 来源' || true)"
 [[ "$a_task" != *'（剩余'* ]]
 [[ "$u_task" != *'（剩余'* ]]
 
+# -------------------------------------------------------------
+# Case 8: Card JSON 2.0 & Chart Linear Progress Builders
+# -------------------------------------------------------------
+chart_77="$(build_linear_progress_chart 77)"
+print -r -- "$chart_77" | "$JQ_BIN" -e '.tag == "chart" and .height == "28px" and .chart_spec.type == "linearProgress" and .chart_spec.data.values[0].value == 0.77' >/dev/null
+
+chart_clamp="$(build_linear_progress_chart 120)"
+print -r -- "$chart_clamp" | "$JQ_BIN" -e '.chart_spec.data.values[0].value == 1' >/dev/null
+
+chart_neg="$(build_linear_progress_chart -10)"
+print -r -- "$chart_neg" | "$JQ_BIN" -e '.chart_spec.data.values[0].value == 0' >/dev/null
+
+preview_both="$(card_preview both)"
+print -r -- "$preview_both" | "$JQ_BIN" -e '
+  .msg_type == "interactive" and
+  (.content | fromjson | .schema == "2.0" and .body.elements[0].tag == "column_set" and .body.elements[0].flex_mode == "stretch")
+' >/dev/null
+
+preview_single="$(card_preview single)"
+print -r -- "$preview_single" | "$JQ_BIN" -e '
+  .msg_type == "interactive" and
+  (.content | fromjson | .schema == "2.0" and .body.elements[0].tag == "markdown")
+' >/dev/null
+
+preview_usage="$(card_preview usage)"
+print -r -- "$preview_usage" | "$JQ_BIN" -e '
+  .msg_type == "interactive" and
+  ((.content | fromjson) as $card | $card.schema == "2.0" and ($card.body.elements[0].content | contains("即时配额查询")))
+' >/dev/null
+
 [[ "$(feishu_lookup_payload "user@example.com")" == '{"emails":["user@example.com"]}' ]]
 [[ "$(feishu_lookup_payload "13011111111")" == '{"mobiles":["13011111111"]}' ]]
 [[ "$(feishu_lookup_payload "+85212345678")" == '{"mobiles":["+85212345678"]}' ]]

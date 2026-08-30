@@ -534,18 +534,21 @@ send_feishu_message() {
   local app_id="$1"
   local app_secret="$2"
   local user_id="$3"
-  local message="$4"
+  local message_or_payload="$4"
   local token payload response
 
   if [[ "${FEISHU_DRY_RUN:-0}" == "1" ]]; then
-    print -r -- "$message"
+    print -r -- "$message_or_payload"
     return 0
   fi
 
   token="$(feishu_tenant_token "$app_id" "$app_secret")" || return 1
-  # The uuid makes curl-level retries idempotent: Feishu drops duplicate
-  # sends that reuse it within an hour.
-  payload="$(feishu_message_payload "$user_id" "$message" "quota-sentinel-$(/bin/date '+%s')")"
+
+  if [[ "$message_or_payload" =~ '^[[:space:]]*\{' ]] && print -r -- "$message_or_payload" | "$JQ_BIN" -e '.receive_id and .msg_type' >/dev/null 2>&1; then
+    payload="$message_or_payload"
+  else
+    payload="$(feishu_message_payload "$user_id" "$message_or_payload" "quota-sentinel-$(/bin/date '+%s')")"
+  fi
 
   if ! response="$(feishu_api "$token" "im/v1/messages?receive_id_type=user_id" \
     --data-binary "$payload")"; then
@@ -557,6 +560,293 @@ send_feishu_message() {
     print -u2 -r -- "Feishu rejected the message: $(feishu_error_detail "$response")"
     return 1
   fi
+}
+
+build_linear_progress_chart() {
+  local percent="$1"
+  local val="1.0"
+
+  if [[ "$percent" =~ ^-?[0-9]+$ ]]; then
+    (( percent < 0 )) && percent=0
+    (( percent > 100 )) && percent=100
+    val="$("$JQ_BIN" -n --argjson p "$percent" '$p / 100.0')"
+  else
+    val="1.0"
+  fi
+
+  "$JQ_BIN" -n \
+    --argjson val "$val" \
+    '{
+      tag: "chart",
+      aspect_ratio: "16:9",
+      height: "28px",
+      color_theme: "brand",
+      preview: false,
+      chart_spec: {
+        type: "linearProgress",
+        data: {
+          values: [
+            {
+              type: "quota",
+              value: $val
+            }
+          ]
+        },
+        direction: "horizontal",
+        xField: "value",
+        yField: "type",
+        seriesField: "type",
+        axes: [
+          { orient: "left", visible: false, domainLine: { visible: false } },
+          { orient: "bottom", visible: false, domainLine: { visible: false } }
+        ],
+        legends: { visible: false },
+        tooltip: { visible: false },
+        padding: { top: 0, bottom: 0, left: 0, right: 0 },
+        media: []
+      }
+    }'
+}
+
+build_provider_v2_column_elements() {
+  local title="$1" result="$2" quota_file="$3"
+  local five_remaining="0" five_reset="0" weekly_remaining="0" weekly_reset="0" source="未知"
+  local five_duration="未知" weekly_duration="未知" five_reset_time="未知" weekly_reset_time="未知"
+  local now="${CURRENT_FORMAT_TIME:-$(/bin/date '+%s')}"
+
+  if [[ -s "$quota_file" ]]; then
+    five_remaining="$("$JQ_BIN" -r '.fiveHour.remainingPercent // empty' "$quota_file")"
+    five_reset="$("$JQ_BIN" -r '.fiveHour.resetAt // empty' "$quota_file")"
+    weekly_remaining="$("$JQ_BIN" -r '.weekly.remainingPercent // empty' "$quota_file")"
+    weekly_reset="$("$JQ_BIN" -r '.weekly.resetAt // empty' "$quota_file")"
+    source="$("$JQ_BIN" -r '.source // "未知"' "$quota_file")"
+  fi
+
+  if [[ ! "$five_remaining" =~ ^[0-9]+$ ]] ||
+     [[ ! "$five_reset" =~ ^[0-9]+$ ]] ||
+     [[ ! "$weekly_remaining" =~ ^[0-9]+$ ]] ||
+     [[ ! "$weekly_reset" =~ ^[0-9]+$ ]]; then
+    five_remaining=0
+    five_reset=0
+    weekly_remaining=0
+    weekly_reset=0
+    source="不可用"
+    five_duration="未知"
+    five_reset_time="未知"
+    weekly_duration="未知"
+    weekly_reset_time="未知"
+  else
+    five_duration="$(format_duration $(( five_reset - now )))"
+    weekly_duration="$(format_duration $(( weekly_reset - now )))"
+    five_reset_time="$(format_reset_time "$five_reset")"
+    weekly_reset_time="$(format_reset_time "$weekly_reset")"
+  fi
+
+  local header_md="**${title}**\n↳ 来源　${source}"
+  if [[ -n "$result" ]]; then
+    if [[ "$result" == "发送成功" ]]; then
+      header_md+=$'\n🟢 **发送成功**'
+    else
+      header_md+=$'\n🔴 **发送失败**'
+    fi
+  fi
+  header_md+=$'\n\n'"**5 小时**　剩余 ${five_remaining}%"
+
+  local chart_5h chart_weekly
+  chart_5h="$(build_linear_progress_chart "$five_remaining")" || return 1
+  chart_weekly="$(build_linear_progress_chart "$weekly_remaining")" || return 1
+
+  local reset_5h_md="↳ 距离重置：${five_duration}\n↳ 重置时间：${five_reset_time}\n\n**周额度**　剩余 ${weekly_remaining}%"
+  local reset_weekly_md="↳ 距离重置：${weekly_duration}\n↳ 重置时间：${weekly_reset_time}"
+
+  "$JQ_BIN" -n \
+    --arg header_md "$header_md" \
+    --argjson chart_5h "$chart_5h" \
+    --arg reset_5h_md "$reset_5h_md" \
+    --argjson chart_weekly "$chart_weekly" \
+    --arg reset_weekly_md "$reset_weekly_md" \
+    '[
+      { tag: "markdown", content: $header_md },
+      $chart_5h,
+      { tag: "markdown", content: $reset_5h_md },
+      $chart_weekly,
+      { tag: "markdown", content: $reset_weekly_md }
+    ]'
+}
+
+build_feishu_v2_task_payload() {
+  local user_id="$1"
+  local request_uuid="$2"
+  shift 2
+  local attempted=("$@")
+  local header_template="green"
+
+  local p
+  for p in "${attempted[@]}"; do
+    case "$p" in
+      codex)
+        [[ "${CODEX_RUN_RESULT:-发送成功}" != "发送成功" ]] && header_template="red"
+        ;;
+      antigravity)
+        [[ "${ANTIGRAVITY_RUN_RESULT:-发送成功}" != "发送成功" ]] && header_template="red"
+        ;;
+    esac
+  done
+
+  local body_elements_json="[]"
+
+  if (( ${#attempted[@]} == 1 )); then
+    local provider="${attempted[1]}"
+    local provider_elements
+    case "$provider" in
+      codex)
+        provider_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+        ;;
+      antigravity)
+        provider_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+        ;;
+    esac
+
+    body_elements_json="$("$JQ_BIN" -n \
+      --argjson elems "$provider_elements" \
+      '$elems + [
+        { tag: "hr" },
+        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+      ]')"
+  elif (( ${#attempted[@]} >= 2 )); then
+    local luna_elements gemini_elements
+    luna_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+    gemini_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+
+    body_elements_json="$("$JQ_BIN" -n \
+      --argjson luna "$luna_elements" \
+      --argjson gemini "$gemini_elements" \
+      '[
+        {
+          tag: "column_set",
+          flex_mode: "stretch",
+          horizontal_spacing: "medium",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "top",
+              elements: $luna
+            },
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "top",
+              elements: $gemini
+            }
+          ]
+        },
+        { tag: "hr" },
+        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+      ]')"
+  else
+    return 1
+  fi
+
+  "$JQ_BIN" -n \
+    --arg receive_id "$user_id" \
+    --arg template "$header_template" \
+    --arg uuid "$request_uuid" \
+    --argjson elements "$body_elements_json" \
+    '{
+      receive_id: $receive_id,
+      msg_type: "interactive",
+      content: ({
+        schema: "2.0",
+        config: {
+          width_mode: "fill"
+        },
+        header: {
+          template: $template,
+          title: {
+            tag: "plain_text",
+            content: "AI 模型运行与配额"
+          }
+        },
+        body: {
+          direction: "vertical",
+          elements: $elements
+        }
+      } | tostring),
+      uuid: $uuid
+    }'
+}
+
+build_feishu_v2_usage_payload() {
+  local user_id="$1"
+  local request_uuid="$2"
+  local luna_elements gemini_elements
+
+  luna_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+  gemini_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+
+  local body_elements_json
+  body_elements_json="$("$JQ_BIN" -n \
+    --argjson luna "$luna_elements" \
+    --argjson gemini "$gemini_elements" \
+    '[
+      {
+        tag: "markdown",
+        content: "**即时配额查询**　未执行模型任务"
+      },
+      {
+        tag: "column_set",
+        flex_mode: "stretch",
+        horizontal_spacing: "medium",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            vertical_align: "top",
+            elements: $luna
+          },
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            vertical_align: "top",
+            elements: $gemini
+          }
+        ]
+      },
+      { tag: "hr" },
+      { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+    ]')"
+
+  "$JQ_BIN" -n \
+    --arg receive_id "$user_id" \
+    --arg uuid "$request_uuid" \
+    --argjson elements "$body_elements_json" \
+    '{
+      receive_id: $receive_id,
+      msg_type: "interactive",
+      content: ({
+        schema: "2.0",
+        config: {
+          width_mode: "fill"
+        },
+        header: {
+          template: "green",
+          title: {
+            tag: "plain_text",
+            content: "AI 模型运行与配额"
+          }
+        },
+        body: {
+          direction: "vertical",
+          elements: $elements
+        }
+      } | tostring),
+      uuid: $uuid
+    }'
 }
 
 dispatch_notification() {
@@ -1553,7 +1843,16 @@ run_selected_providers() {
     fi
   done
 
-  dispatch_notification "$(task_notification_message "${attempted[@]}")"
+  if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
+    dispatch_notification "$(task_notification_message "${attempted[@]}")"
+  else
+    local card_payload
+    if card_payload="$(build_feishu_v2_task_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "${attempted[@]}")" && [[ -n "$card_payload" ]]; then
+      dispatch_notification "$card_payload"
+    else
+      dispatch_notification "$(task_notification_message "${attempted[@]}")"
+    fi
+  fi
 }
 
 run_once() {
@@ -1579,8 +1878,70 @@ send_usage_notification() {
   collect_effective_quotas
   codex_quota="$(codex_quota_message)" || true
   antigravity_quota="$(antigravity_quota_message)" || true
-  dispatch_notification "$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+
+  if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
+    dispatch_notification "$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+  else
+    local card_payload
+    if card_payload="$(build_feishu_v2_usage_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')")" && [[ -n "$card_payload" ]]; then
+      dispatch_notification "$card_payload"
+    else
+      dispatch_notification "$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+    fi
+  fi
   release_quota_lock
+}
+
+setup_mock_preview_quota() {
+  ensure_temp_dir
+  local now="$(/bin/date '+%s')"
+  print -r -- '{"source":"Native · codex app-server","fresh":true,"capturedAt":'$now',"fiveHour":{"remainingPercent":100,"resetAt":'$(( now + 17880 ))'},"weekly":{"remainingPercent":84,"resetAt":'$(( now + 595800 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"Native · agy local service","fresh":true,"capturedAt":'$now',"fiveHour":{"remainingPercent":77,"resetAt":'$(( now + 17700 ))'},"weekly":{"remainingPercent":86,"resetAt":'$(( now + 369660 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  CODEX_RUN_RESULT="发送成功"
+  ANTIGRAVITY_RUN_RESULT="发送成功"
+}
+
+card_preview() {
+  local mode="${1:-both}"
+  setup_mock_preview_quota
+  local payload
+  case "$mode" in
+    usage)
+      payload="$(build_feishu_v2_usage_payload "mock-user-id" "preview-usage-$(/bin/date +%s)")"
+      ;;
+    single|codex)
+      payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-single-$(/bin/date +%s)" codex)"
+      ;;
+    antigravity)
+      payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-single-$(/bin/date +%s)" antigravity)"
+      ;;
+    both|all|auto|*)
+      payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-both-$(/bin/date +%s)" codex antigravity)"
+      ;;
+  esac
+  print -r -- "$payload" | "$JQ_BIN" .
+}
+
+send_test_card() {
+  local mode="${1:-both}"
+  setup_mock_preview_quota
+  local payload
+  case "$mode" in
+    usage)
+      payload="$(build_feishu_v2_usage_payload "$(feishu_user_id)" "test-usage-$(/bin/date +%s)")"
+      ;;
+    single|codex)
+      payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" codex)"
+      ;;
+    antigravity)
+      payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" antigravity)"
+      ;;
+    both|all|auto|*)
+      payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-both-$(/bin/date +%s)" codex antigravity)"
+      ;;
+  esac
+  dispatch_notification "$payload"
+  print -r -- "Test card sent successfully (mode: $mode)"
 }
 
 check_schedule() {
@@ -1651,6 +2012,12 @@ main() {
       ;;
     usage)
       send_usage_notification
+      ;;
+    card-preview)
+      card_preview "${2:-both}"
+      ;;
+    send-test-card)
+      send_test_card "${2:-both}"
       ;;
     discover-feishu-user)
       require_executable "$CURL_BIN"
