@@ -17,6 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import lark_oapi as lark
+from task_orchestrator import TaskOrchestrator, create_default_orchestrator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +33,7 @@ USER_ID_SERVICE = "com.example.quota-sentinel.feishu-user-id"
 SCRIPT_PATH = "/Users/__USER__/code/quota-sentinel/quota-sentinel.sh"
 LOG_DIR = Path(SCRIPT_PATH).parent / "logs"
 AUTHORIZED_USER_ID: str | None = None
+TASK_ORCHESTRATOR: TaskOrchestrator | None = None
 
 # Outer bound for one /usage subprocess. Must stay above the shell-side
 # worst case (quota.lock wait 20s + Native ~15s + CodexBar live 2x20s + agy
@@ -157,7 +159,9 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
     process: subprocess.Popen[str] | None = None
     started = time.monotonic()
     elapsed = lambda: f"{time.monotonic() - started:.1f}s"
-    try:
+
+    def execute_usage() -> None:
+        nonlocal process
         process = subprocess.Popen(
             ["/bin/zsh", SCRIPT_PATH, "usage"],
             stdout=subprocess.PIPE,
@@ -166,16 +170,29 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
             start_new_session=True,
         )
         _stdout, stderr = process.communicate(timeout=USAGE_COMMAND_TIMEOUT_SECONDS)
-        if process.returncode == 0:
-            logger.info(
-                f"Successfully sent /usage notification for message_id={message_id}"
-                f" (elapsed={elapsed()})"
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode,
+                ["/bin/zsh", SCRIPT_PATH, "usage"],
+                stderr=stderr,
+            )
+
+    try:
+        if TASK_ORCHESTRATOR is not None:
+            TASK_ORCHESTRATOR.run_external_task(
+                "usage", f"feishu:{message_id or 'unknown'}", execute_usage
             )
         else:
-            logger.error(
-                f"Usage command returned {process.returncode} after {elapsed()}:"
-                f" {stderr.strip()}"
-            )
+            execute_usage()
+        logger.info(
+            f"Successfully sent /usage notification for message_id={message_id}"
+            f" (elapsed={elapsed()})"
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            f"Usage command returned {exc.returncode} after {elapsed()}:"
+            f" {(exc.stderr or '').strip()}"
+        )
     except subprocess.TimeoutExpired:
         logger.error(
             f"Usage command timed out for message_id={message_id} after"
@@ -265,12 +282,21 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
 
 
 def main() -> None:
+    global TASK_ORCHESTRATOR
     logger.info("Starting Feishu WebSocket listener...")
     setup_file_logging()
     app_id, app_secret = get_credentials()
     if not get_authorized_user_id():
         logger.critical("Authorized Feishu user ID is missing!")
         sys.exit(1)
+
+    orchestrator_enabled = os.environ.get("QUOTA_SENTINEL_ORCHESTRATOR_ENABLED", "1") != "0"
+    if orchestrator_enabled:
+        TASK_ORCHESTRATOR = create_default_orchestrator(task_logger=logger)
+        TASK_ORCHESTRATOR.start()
+        logger.info("Local task orchestrator started")
+    else:
+        logger.warning("Local task orchestrator disabled by environment")
 
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")
@@ -289,6 +315,14 @@ def main() -> None:
         auto_reconnect=True,
     )
 
+    def stop_for_signal(signum: int, _frame: object) -> None:
+        logger.info(f"Listener received signal {signum}; stopping orchestrator")
+        if TASK_ORCHESTRATOR is not None:
+            TASK_ORCHESTRATOR.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_for_signal)
+
     try:
         client.start()
     except KeyboardInterrupt:
@@ -296,6 +330,9 @@ def main() -> None:
     except Exception as e:
         logger.critical(f"Feishu WebSocket client failed: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        if TASK_ORCHESTRATOR is not None:
+            TASK_ORCHESTRATOR.stop()
 
 
 if __name__ == "__main__":

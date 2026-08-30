@@ -9,8 +9,10 @@
 		<string>/Users/__USER__/code/quota-sentinel/quota-sentinel.sh</string>
 		<string>check</string>
 	</array>
-	<key>RunAtLoad</key>
+	<key>Disabled</key>
 	<true/>
+	<key>RunAtLoad</key>
+	<false/>
   <key>WorkingDirectory</key>
   <string>/private/tmp</string>
 	<key>StartCalendarInterval</key>

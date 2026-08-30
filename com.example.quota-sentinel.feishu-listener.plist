@@ -14,6 +14,8 @@
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>QUOTA_SENTINEL_ORCHESTRATOR_ENABLED</key>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

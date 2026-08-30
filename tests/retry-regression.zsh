@@ -255,7 +255,7 @@ nd_before="$(read_provider_next_due codex)"
 fetch_native_codex_quota() { return 1; }
 check_schedule
 [[ "$(read_provider_next_due codex)" == "$nd_before" ]]
-FRESH_RESET2=$(( T0 + 20000 ))  # 5.6h ahead: inside the 6h sanity bound
+FRESH_RESET2=$(( T0 + 17250 ))  # +250s after the trusted reset: nearby movement, accepted immediately
 fetch_native_codex_quota() {
   "$JQ_BIN" -n --arg now "$(now_epoch)" --argjson reset "$FRESH_RESET2" \
     '{source:"Native · codex app-server",fresh:true,capturedAt:($now|tonumber),fiveHour:{remainingPercent:80,resetAt:$reset},weekly:{remainingPercent:90,resetAt:($reset+500000)}}' \

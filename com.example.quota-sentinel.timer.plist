@@ -9,10 +9,12 @@
     <string>/Users/__USER__/code/quota-sentinel/quota-sentinel.sh</string>
     <string>wait</string>
   </array>
+  <key>Disabled</key>
+  <true/>
   <key>RunAtLoad</key>
-  <true/>
+  <false/>
   <key>KeepAlive</key>
-  <true/>
+  <false/>
   <key>ThrottleInterval</key>
   <integer>60</integer>
   <key>WorkingDirectory</key>

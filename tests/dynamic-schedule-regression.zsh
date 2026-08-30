@@ -105,7 +105,7 @@ check_schedule
 fresh_due_1=$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))
 [[ "$(read_provider_next_due codex)" == "$fresh_due_1" ]]
 
-MOCK_CODEX_RESET=$(( base_now + 4200 ))
+MOCK_CODEX_RESET=$(( base_now + 3840 ))  # +240s: same-window jitter, accepted immediately
 check_schedule
 fresh_due_2=$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))
 [[ "$(read_provider_next_due codex)" == "$fresh_due_2" ]]
@@ -198,7 +198,7 @@ MOCK_CODEX_FRESH=1
 MOCK_CODEX_RESET=$(( base_now + 17940 ))
 MOCK_ANTIGRAVITY_FRESH=0
 MOCK_ANTIGRAVITY_RESET=$(( base_now + 2000 ))
-write_provider_last_task codex $(( base_now - RUN_INTERVAL_SECONDS - 20 ))
+write_provider_last_task codex "$base_now"
 write_provider_last_window codex 111111
 write_provider_next_due codex $(( base_now + 30000 ))
 write_provider_last_task antigravity 222222
@@ -210,7 +210,7 @@ send_usage_notification
 [[ "$CAPTURED_USAGE_MSG" == *"Gemini 3.7 Flash"* ]]
 [[ "$(read_provider_last_known_reset codex)" == "$MOCK_CODEX_RESET" ]]
 [[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
-[[ "$(read_provider_last_task codex)" == "$(( base_now - RUN_INTERVAL_SECONDS - 20 ))" ]]
+[[ "$(read_provider_last_task codex)" == "$base_now" ]]
 [[ "$(read_provider_last_window codex)" == "111111" ]]
 [[ "$(read_provider_next_due antigravity)" == "$(( base_now + 12000 ))" ]]
 [[ "$(read_provider_last_task antigravity)" == "222222" ]]
@@ -242,20 +242,24 @@ sync_provider_deadline_from_quota codex "$base_now"
 [[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
 print -r -- "Case 10 (post-run fresh reset replaces the 5h01 fallback): passed"
 
-# 10b. Each newer fresh observation replaces the prior reset-derived deadline.
+# 10b. Once the scheduled reset has passed, its pending four-minute buffer is
+# armed and a newer Fresh window cannot cancel that execution.
 reset_scheduler_state
 write_provider_last_task codex "$base_now"
 old_reset=$(( base_now + 17940 ))
 old_due=$(( old_reset + RESET_BUFFER_SECONDS ))
-write_provider_last_window codex "$old_reset"
+write_provider_last_known_reset codex "$old_reset"
 write_provider_next_due codex "$old_due"
 rollover_now=$(( base_now + 18000 ))
 MOCK_CODEX_FRESH=1
 MOCK_CODEX_RESET=$(( rollover_now + 17940 ))
 collect_effective_quotas
-sync_provider_deadline_from_quota codex "$rollover_now"
-[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
-print -r -- "Case 10b (latest fresh reset replaces the prior deadline): passed"
+sync_rc=0
+sync_provider_deadline_from_quota codex "$rollover_now" || sync_rc=$?
+(( sync_rc == 2 ))
+[[ "$(read_provider_last_known_reset codex)" == "$old_reset" ]]
+[[ "$(read_provider_next_due codex)" == "$old_due" ]]
+print -r -- "Case 10b (reset buffer blocks newer Fresh calibration): passed"
 
 # 11. Legacy state migration remains compatible.
 reset_scheduler_state

@@ -137,7 +137,36 @@ an Authorization header supplied to curl over stdin.
 - `check`: 15-minute watchdog probe. Independently evaluates Codex and Antigravity 5h quota states without model invocations, and triggers only the provider(s) due for execution.
 - `usage`: Instant quota check sent to Feishu for both providers without triggering model tasks.
 - `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
-- `wait`: Precise sleep timer waking at the earliest due deadline (`min(codex, antigravity)`).
+- `wait`: Legacy standalone precision timer, retained for manual rollback. The
+  normal installation uses the local task orchestrator instead.
+
+## Local Task Orchestrator
+
+The Feishu listener process also hosts a lightweight local task orchestrator.
+It replaces the two independent scheduling LaunchAgents with one durable
+control loop while leaving all deadline policy inside `quota-sentinel.sh`:
+
+- runs one `check` at startup, matching the previous `RunAtLoad` behavior;
+- keeps the same quarter-hour watchdog grid (`:00`, `:15`, `:30`, `:45`);
+- wakes at the earliest provider `next_due_at`, including immediately after a
+  Mac wakes with an overdue deadline;
+- re-reads external state at most 60 seconds later, matching the legacy
+  precision timer's compatibility polling;
+- coalesces a deadline and watchdog that become ready together into one
+  `check`; and
+- applies the existing 60-second due retry backoff after a check.
+
+The orchestrator decides only **when to invoke `check`**. Fresh/stale quota
+authority, reset+4 calibration, provider-specific scheduler-write blocking,
+5h01 fallback, pending debt, retries, and successful-task state commits remain
+implemented exclusively by the shell scheduler and are unchanged.
+
+Task executions and post-run deadline snapshots are stored in
+`~/Library/Application Support/quota-sentinel/task-orchestrator.sqlite3`
+using SQLite WAL mode. An interrupted `running` row is marked `interrupted` on
+restart. Feishu `/usage` is recorded in the same history and wakes the control
+loop to notice any Fresh calibration, but it still runs only the `usage`
+command and never triggers a model task.
 
 ## Execution Bounds & Process Hygiene
 
@@ -168,6 +197,11 @@ results, scheduler state changes (`state: codex next_due_at X -> Y`),
 notification deliveries, and `/usage` busy replies. Logs contain no tokens or
 secrets. Set `QUOTA_SENTINEL_LOG_DIR` to redirect the run log (the test suites do).
 
+The task orchestrator additionally records structured task status, trigger,
+scheduled time, exit code, timeout flag, elapsed time, and provider deadline
+snapshots in `task-orchestrator.sqlite3`. The database and WAL sidecars are
+created with mode 0600; the state directory is mode 0700.
+
 ## Quota Acquisition Hierarchy & Freshness Model
 
 The quota acquisition pipeline strictly follows a 4-tier hierarchy for both providers:
@@ -192,19 +226,34 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 
 - **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ②
   (CodexBar Live) are marked as `FRESH` and eligible to calibrate a provider's
-  deadline to the latest `reset_at + 4m`.
+  deadline to the latest `reset_at + 4m` before its currently scheduled reset
+  occurs. Freshness is necessary but not sufficient: once a provider has a
+  successful `last_task_at`, a reset must also remain inside that task's
+  current-cycle horizon (`last_task_at + 5h + 5m` tolerance). A later Fresh
+  value remains visible in quota cards but cannot write scheduler state. Once
+  the scheduled reset occurs, the provider enters a scheduler-write block
+  until its task succeeds.
   Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
 - **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
 
-## Matured Deadlines & Fresh Calibration (P1-1)
+## Armed Deadlines & Fresh Calibration (P1-1)
 
-Fresh quota may recalibrate a deadline only while the existing deadline has
-not yet matured. Once `now >= next_due_at`, that task debt is committed: the
-due decision wins, fresh data is ignored for this round (logged as
-`matured debt ... ignored`), and the task must be attempted (Pending /
-Initial Burst) before a newer quota reset may move the next cycle. Without
-this rule a quota probe taken at the due moment re-anchors the window and
-starves the task indefinitely (observed live 2026-08-30).
+Fresh quota may recalibrate a reset-based deadline only before its existing
+`reset_at`. From `reset_at` through the four-minute buffer, due execution, and
+any retries, that provider is scheduler-write blocked. Watchdog and `/usage`
+may still fetch/display quota, but cannot replace `last_known_reset_at` or
+`next_due_at`; the task must succeed first. A successful task writes its 5h01
+fallback, releasing the block, and the post-run Fresh probe then calibrates the
+next cycle. Without this rule, a probe during the reset buffer can replace the
+armed deadline with the following window and starve the current task.
+
+The same write seam also prevents pre-reset rolling starvation. The current
+cycle is anchored by that provider's last successful task: reset timestamps may
+move earlier or fluctuate up to five minutes later than the nominal five-hour
+window, but they cannot recede indefinitely with every 15-minute probe. A
+deadline already persisted by an older version beyond this horizon converges
+inward to the horizon plus the unchanged four-minute post-reset buffer. This
+repair never extends a deadline and does not promote Cache or Pi data to Fresh.
 
 ## Failure Retry & Pending Debt
 
@@ -236,8 +285,19 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
   - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
   - Immediately after a real task starts, its provider is seeded with a
     no-quota fallback of `last_task_at + 5h01m`.
-  - Every subsequent valid `FRESH` observation replaces that deadline with the
-    latest `reset_at + 4m`, whether this is earlier or later than the fallback.
+  - Before the scheduled reset, every subsequent valid `FRESH` observation
+    inside the current-cycle horizon replaces that deadline with the latest
+    `reset_at + 4m`, whether this is earlier or later than the fallback. The
+    five-minute horizon tolerance validates small reset timestamp movement; it
+    does not replace or alter either the `+1m` fallback grace or the `+4m`
+    observed-reset grace.
+  - A Fresh reset beyond `last_task_at + 5h + 5m` is treated as a future
+    generation or rolling observation: it remains available for display but
+    cannot overwrite `last_known_reset_at` or `next_due_at`.
+  - From the scheduled reset until successful execution, that Provider's
+    scheduler calibration is paused. The 15-minute Watchdog and `/usage` cannot
+    overwrite its armed deadline; success releases the block and the post-run
+    probe supplies the next Fresh schedule.
   - The 5h01 value is a degradation fallback, not a hard minimum between two
     real tasks.
   - `/usage` reuses the same fresh-only calibration after its live query but
@@ -259,6 +319,14 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
 
 ## LaunchAgents
 
-- `com.example.quota-sentinel.plist`: Periodic 15-minute watchdog (`check`).
-- `com.example.quota-sentinel.timer.plist`: Continuous precision timer (`wait`).
-- `com.example.quota-sentinel.feishu-listener.plist`: Feishu WebSocket listener for `/usage`.
+- `com.example.quota-sentinel.feishu-listener.plist`: Active Feishu WebSocket
+  listener and local task-orchestrator host.
+- `com.example.quota-sentinel.plist`: Disabled legacy 15-minute watchdog,
+  retained as a rollback artifact.
+- `com.example.quota-sentinel.timer.plist`: Disabled legacy precision timer,
+  retained as a rollback artifact.
+
+Only the listener/orchestrator LaunchAgent may be loaded during normal
+operation. Loading either legacy scheduler at the same time would create a
+second scheduling entry point, even though the shell run lock still prevents
+duplicate model execution.

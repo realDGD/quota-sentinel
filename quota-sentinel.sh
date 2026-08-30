@@ -32,9 +32,12 @@ readonly CODEXBAR_CODEX_CACHE_FILE="$STATE_DIR/codexbar-codex-last-success.json"
 readonly CODEXBAR_ANTIGRAVITY_CACHE_FILE="$STATE_DIR/codexbar-antigravity-last-success.json"
 readonly PI_CODEX_SNAPSHOT_FILE="$STATE_DIR/pi-codex-quota.json"
 readonly PI_ANTIGRAVITY_SNAPSHOT_FILE="$STATE_DIR/pi-antigravity-quota.json"
-readonly RUN_INTERVAL_SECONDS=18060      # 5 hours 01 minute
-readonly RESET_BUFFER_SECONDS=240        # 4 minutes after reset
-readonly MAX_WINDOW_FUTURE_SECONDS=21600 # 6 hours
+readonly RUN_INTERVAL_SECONDS=18060              # 5 hours 01 minute
+readonly RESET_BUFFER_SECONDS=240                # 4 minutes after reset
+readonly RESET_NEAR_MOVEMENT_SECONDS=300         # immediate same-window jitter
+readonly RESET_CONFIRM_MIN_AGE_SECONDS=60        # independent observation gap
+readonly RESET_CONFIRM_MATCH_SECONDS=30          # stable timestamp tolerance
+readonly MAX_WINDOW_FUTURE_SECONDS=21600         # 6 hours
 readonly QUOTA_LOCK_WAIT_SECONDS=20
 readonly TIMER_RECHECK_SECONDS=60
 # Hard execution bounds: a hung model task or quota probe must never hold the
@@ -172,6 +175,11 @@ provider_retry_pending_file() {
 provider_last_known_reset_file() {
   local provider="$1"
   print -r -- "$STATE_DIR/${provider}-last-known-reset-at"
+}
+
+provider_reset_candidate_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-reset-candidate"
 }
 
 provider_last_window_file() {
@@ -360,6 +368,34 @@ write_provider_last_known_reset() {
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-known-reset timestamp: $epoch"
   file="$(provider_last_known_reset_file "$provider")"
   atomic_write_state_file "$file" "$epoch"
+}
+
+# A far-later reset must survive a separate observation before it may replace
+# the current trusted reset. Candidate and observation time share one atomic
+# file so a crash can only lose a promotion opportunity, never create one.
+read_provider_reset_candidate() {
+  local provider="$1" file value reset observed
+  file="$(provider_reset_candidate_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
+  reset="${value%%:*}"
+  observed="${value##*:}"
+  [[ "$reset" =~ ^[0-9]+$ && "$observed" =~ ^[0-9]+$ ]] || return 1
+  print -r -- "$reset:$observed"
+}
+
+write_provider_reset_candidate() {
+  local provider="$1" reset="$2" observed="$3" file
+  [[ "$reset" =~ ^[0-9]+$ ]] || die "Invalid reset candidate timestamp: $reset"
+  [[ "$observed" =~ ^[0-9]+$ ]] || die "Invalid reset candidate observation: $observed"
+  file="$(provider_reset_candidate_file "$provider")"
+  atomic_write_state_file "$file" "$reset:$observed"
+}
+
+clear_provider_reset_candidate() {
+  local provider="$1" file
+  file="$(provider_reset_candidate_file "$provider")"
+  rm -f -- "$file"
 }
 
 read_provider_last_window() {
@@ -2202,6 +2238,21 @@ provider_fallback_due() {
   fi
 }
 
+# A trusted reset from before the most recent successful task belongs to the
+# previous generation. A reset still in the future after that success remains
+# authoritative (for example when a task was manually run before the window
+# reset), so last_task alone is never used as a hard reset ceiling.
+provider_current_trusted_reset() {
+  local provider="$1" trusted_reset last_task
+  trusted_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
+  [[ "$trusted_reset" =~ ^[0-9]+$ ]] || return 1
+  last_task="$(read_provider_last_task "$provider" 2>/dev/null || true)"
+  if [[ "$last_task" =~ ^[0-9]+$ ]] && (( trusted_reset <= last_task )); then
+    return 1
+  fi
+  print -r -- "$trusted_reset"
+}
+
 valid_provider_reset_at() {
   local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file reset_at
   quota_file="$(provider_normalized_quota_file "$provider")"
@@ -2212,18 +2263,107 @@ valid_provider_reset_at() {
   print -r -- "$reset_at"
 }
 
-# Synchronize the scheduler only from live Native/CodexBar data. Every valid
-# fresh observation replaces the current deadline with reset + four minutes.
-# The 5h01 value is seeded after a real task only as a fallback for subsequent
-# probe failures; it is not a hard minimum interval.
+# Report why a provider's scheduler is temporarily write-blocked. A reset-based
+# deadline becomes committed as soon as its reset occurs, not only after the
+# four-minute buffer matures. Pending/overdue task debt remains blocked until a
+# verified success writes a new fallback deadline.
+provider_schedule_block_reason() {
+  local provider="$1" now="${2:-$(/bin/date '+%s')}"
+  local pending next_due scheduled_reset
+
+  pending="$(read_provider_retry_pending "$provider" 2>/dev/null || true)"
+  if [[ "$pending" == "1" ]]; then
+    print -r -- "retry-pending"
+    return 0
+  fi
+
+  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
+  [[ "$next_due" =~ ^[0-9]+$ ]] || return 1
+  if (( now >= next_due )); then
+    print -r -- "overdue"
+    return 0
+  fi
+
+  scheduled_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
+  if [[ "$scheduled_reset" =~ ^[0-9]+$ ]] &&
+     (( next_due == scheduled_reset + RESET_BUFFER_SECONDS && now >= scheduled_reset )); then
+    print -r -- "reset-buffer"
+    return 0
+  fi
+
+  return 1
+}
+
+# Synchronize the scheduler only from live Native/CodexBar data. Before the
+# scheduled reset, every valid fresh observation may replace the deadline with
+# reset + four minutes. From that reset until successful execution, scheduler
+# writes are blocked; /usage may still display its newly fetched quota.
 sync_provider_deadline_from_quota() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}" reset_at reset_due
+  local provider="$1" now="${2:-$(/bin/date '+%s')}"
+  local reset_at reset_due block_reason existing_reset existing_due trusted_reset
+  local candidate_record candidate_reset candidate_observed candidate_delta confirmed_reset
 
   reset_at="$(valid_provider_reset_at "$provider" "$now")" || return 1
   reset_due=$(( reset_at + RESET_BUFFER_SECONDS ))
 
-  write_provider_last_known_reset "$provider" "$reset_at"
-  write_provider_next_due "$provider" "$reset_due"
+  block_reason="$(provider_schedule_block_reason "$provider" "$now" 2>/dev/null || true)"
+  if [[ -n "$block_reason" ]]; then
+    existing_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
+    existing_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
+    log_info "sched $provider: sync blocked reason=$block_reason reset=$existing_reset due=$existing_due now=$now; fresh candidate reset=$reset_at deferred until success"
+    return 2
+  fi
+
+  trusted_reset="$(provider_current_trusted_reset "$provider" 2>/dev/null || true)"
+  if [[ ! "$trusted_reset" =~ ^[0-9]+$ ]]; then
+    # The first Fresh reset of a generation establishes a finite anchor. It may
+    # legitimately be much later than last_task+5h, as observed live when a
+    # provider window remained fixed after a manual early task.
+    clear_provider_reset_candidate "$provider"
+    write_provider_last_known_reset "$provider" "$reset_at"
+    write_provider_next_due "$provider" "$reset_due"
+    log_info "sched $provider: fresh reset established generation anchor reset=$reset_at due=$reset_due"
+    return 0
+  fi
+
+  # Earlier resets and small movement around the current reset preserve the
+  # original dynamic policy. Only a large later jump needs confirmation.
+  if (( reset_at <= trusted_reset + RESET_NEAR_MOVEMENT_SECONDS )); then
+    clear_provider_reset_candidate "$provider"
+    write_provider_last_known_reset "$provider" "$reset_at"
+    write_provider_next_due "$provider" "$reset_due"
+    return 0
+  fi
+
+  candidate_record="$(read_provider_reset_candidate "$provider" 2>/dev/null || true)"
+  if [[ "$candidate_record" == *:* ]]; then
+    candidate_reset="${candidate_record%%:*}"
+    candidate_observed="${candidate_record##*:}"
+    candidate_delta=$(( reset_at - candidate_reset ))
+    (( candidate_delta < 0 )) && candidate_delta=$(( -candidate_delta ))
+    if (( candidate_delta <= RESET_CONFIRM_MATCH_SECONDS &&
+          now - candidate_observed >= RESET_CONFIRM_MIN_AGE_SECONDS )); then
+      # Use the later of the two stable observations so the four-minute safety
+      # buffer is never shortened by small timestamp jitter.
+      confirmed_reset="$candidate_reset"
+      (( reset_at > confirmed_reset )) && confirmed_reset="$reset_at"
+      clear_provider_reset_candidate "$provider"
+      write_provider_last_known_reset "$provider" "$confirmed_reset"
+      write_provider_next_due "$provider" $(( confirmed_reset + RESET_BUFFER_SECONDS ))
+      log_info "sched $provider: far reset promoted after stable observations old_reset=$trusted_reset new_reset=$confirmed_reset first_seen=$candidate_observed confirmed_at=$now"
+      return 0
+    fi
+    if (( candidate_delta <= RESET_CONFIRM_MATCH_SECONDS )); then
+      log_info "sched $provider: far reset awaiting independent confirmation trusted_reset=$trusted_reset candidate=$candidate_reset observed_at=$candidate_observed now=$now"
+      return 3
+    fi
+  fi
+
+  write_provider_reset_candidate "$provider" "$reset_at" "$now"
+  existing_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
+  existing_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
+  log_warn "sched $provider: far-later fresh reset deferred trusted_reset=$trusted_reset candidate=$reset_at observed_at=$now; preserved reset=$existing_reset due=$existing_due"
+  return 3
 }
 
 evaluate_provider() {
@@ -2244,7 +2384,8 @@ evaluate_provider() {
     return 0
   fi
 
-  # Not matured: fresh quota may recalibrate the deadline, earlier or later.
+  # Not due: Fresh may recalibrate earlier or later only before the scheduled
+  # reset. The shared sync layer blocks writes during its four-minute buffer.
   # Stale cache/snapshots never write it.
   sync_provider_deadline_from_quota "$provider" "$now" || true
 
@@ -2274,6 +2415,7 @@ commit_provider_success() {
   write_provider_last_attempt "$provider" "$success_at"
   write_provider_last_task "$provider" "$success_at"
   write_provider_retry_pending "$provider" 0
+  clear_provider_reset_candidate "$provider"
   write_provider_next_due "$provider" $(( success_at + RUN_INTERVAL_SECONDS ))
   case "$provider" in
     codex) CODEX_RUN_RESULT="发送成功" ;;

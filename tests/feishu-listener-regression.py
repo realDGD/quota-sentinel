@@ -19,9 +19,11 @@ class TestFeishuListener(unittest.TestCase):
     def setUp(self):
         feishu_listener.dedup_cache = feishu_listener.LRUCache()
         feishu_listener.AUTHORIZED_USER_ID = "test-user-123"
+        feishu_listener.TASK_ORCHESTRATOR = None
 
     def tearDown(self):
         feishu_listener.AUTHORIZED_USER_ID = None
+        feishu_listener.TASK_ORCHESTRATOR = None
 
     @patch("feishu_listener.submit_usage_command")
     def test_user_usage_command_triggers_handler(self, mock_handler):
@@ -107,6 +109,34 @@ class TestFeishuListener(unittest.TestCase):
         feishu_listener.on_message_receive(mock_data)
 
         mock_handler.assert_not_called()
+
+    @patch("feishu_listener.subprocess.Popen")
+    def test_usage_is_recorded_by_orchestrator_without_changing_command(
+        self, mock_popen
+    ):
+        process = mock_popen.return_value
+        process.communicate.return_value = ("", "")
+        process.returncode = 0
+        process.poll.return_value = 0
+        orchestrator = MagicMock()
+        orchestrator.run_external_task.side_effect = (
+            lambda _task_name, _trigger, action: action()
+        )
+        feishu_listener.TASK_ORCHESTRATOR = orchestrator
+
+        feishu_listener.handle_usage_command("test-user-123", "msg-history")
+
+        orchestrator.run_external_task.assert_called_once()
+        task_name, trigger, _action = orchestrator.run_external_task.call_args.args
+        self.assertEqual(task_name, "usage")
+        self.assertEqual(trigger, "feishu:msg-history")
+        mock_popen.assert_called_once_with(
+            ["/bin/zsh", feishu_listener.SCRIPT_PATH, "usage"],
+            stdout=feishu_listener.subprocess.PIPE,
+            stderr=feishu_listener.subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
 
 
 if __name__ == "__main__":

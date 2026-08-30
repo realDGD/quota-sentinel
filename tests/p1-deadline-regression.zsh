@@ -1,7 +1,9 @@
 #!/bin/zsh
-# P1-1 deadline regression: a matured (already due) deadline is a committed
-# debt that fresh quota may not cancel, while un-matured deadlines keep full
-# dynamic fresh calibration (earlier or later). Maps the live production
+# P1-1 deadline regression: a reset-based deadline becomes committed when its
+# reset occurs and stays blocked through its four-minute buffer, due execution,
+# and any retries. Before that reset, Fresh keeps dynamic calibration inside
+# the current task's bounded five-hour cycle horizon.
+# Maps the live production
 # starvation (2026-08-30 18:11:35 due, probe 18:11:39, fresh reset 23:11:38,
 # deadline pushed to 23:15:38, burst never ran) onto deterministic cases.
 # Fully isolated: temp state/logs, mock pi, stubbed probes — no real models.
@@ -115,13 +117,16 @@ check_schedule
 assert_log_contains "matured debt due="
 print -r -- "  PASS: check_schedule committed the debt and ran the burst"
 
-print -r -- "== P1-1B / V1: un-matured deadline — fresh may push it later =="
+print -r -- "== P1-1B / V1: before scheduled reset — nearby Fresh may push it later =="
 reset_state
-write_provider_next_due codex $(( T + 3000 ))
-set_fresh codex $(( T + 5000 ))
+OLD_RESET=$(( T + 2760 ))
+NEW_RESET=$(( OLD_RESET + 240 ))
+write_provider_last_known_reset codex "$OLD_RESET"
+write_provider_next_due codex $(( OLD_RESET + RESET_BUFFER_SECONDS ))
+set_fresh codex "$NEW_RESET"
 evaluate_provider codex "$T" && due=0 || due=1
 [[ "$due" == 1 ]]
-[[ "$(cat "$ND_FILE")" == "$(( T + 5000 + RESET_BUFFER_SECONDS ))" ]]
+[[ "$(cat "$ND_FILE")" == "$(( NEW_RESET + RESET_BUFFER_SECONDS ))" ]]
 print -r -- "  PASS: NOT_DUE with deadline recalibrated to reset+4min"
 
 print -r -- "== P1-1C / V2: un-matured deadline — fresh may pull it earlier =="
@@ -249,6 +254,136 @@ evaluate_provider codex "$T" && due=0 || due=1
 [[ "$due" == 1 ]]
 [[ "$(cat "$ND_FILE")" == "$(( T + 3000 ))" ]]
 print -r -- "  PASS: stale data still cannot write deadlines in either direction"
+
+print -r -- "== P1-1K: reset crossed but +4m pending — fresh cannot cancel armed deadline =="
+reset_state
+OLD_RESET=$(( T - 96 ))
+OLD_DUE=$(( OLD_RESET + RESET_BUFFER_SECONDS ))
+NEW_RESET=$(( T + 18000 ))
+write_provider_last_known_reset codex "$OLD_RESET"
+write_provider_next_due codex "$OLD_DUE"
+set_fresh codex "$NEW_RESET"
+evaluate_provider codex "$T" && due=0 || due=1
+[[ "$due" == 1 ]]
+[[ "$(read_provider_last_known_reset codex)" == "$OLD_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$OLD_DUE" ]]
+print -r -- "  PASS: armed reset+4m deadline stays frozen until it fires"
+
+print -r -- "== P1-1L: direct sync (/usage path) also respects the armed deadline =="
+reset_state
+OLD_RESET=$(( T - 96 ))
+OLD_DUE=$(( OLD_RESET + RESET_BUFFER_SECONDS ))
+NEW_RESET=$(( T + 18000 ))
+write_provider_last_known_reset codex "$OLD_RESET"
+write_provider_next_due codex "$OLD_DUE"
+set_fresh codex "$NEW_RESET"
+sync_rc=0
+sync_provider_deadline_from_quota codex "$T" || sync_rc=$?
+(( sync_rc != 0 ))
+[[ "$(read_provider_last_known_reset codex)" == "$OLD_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$OLD_DUE" ]]
+print -r -- "  PASS: /usage may display fresh data but cannot rewrite the armed schedule"
+
+print -r -- "== P1-1M: success releases the block and post-run fresh takes over =="
+commit_provider_success codex "$T"
+[[ "$(read_provider_next_due codex)" == "$(( T + RUN_INTERVAL_SECONDS ))" ]]
+sync_provider_deadline_from_quota codex "$T"
+[[ "$(read_provider_last_known_reset codex)" == "$NEW_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( NEW_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "  PASS: successful execution unlocks the next fresh cycle"
+
+print -r -- "== P1-1N: direct sync cannot cancel an overdue deadline =="
+reset_state
+OLD_RESET=$(( T - 400 ))
+OLD_DUE=$(( OLD_RESET + RESET_BUFFER_SECONDS ))
+NEW_RESET=$(( T + 18000 ))
+write_provider_last_known_reset codex "$OLD_RESET"
+write_provider_next_due codex "$OLD_DUE"
+set_fresh codex "$NEW_RESET"
+sync_rc=0
+sync_provider_deadline_from_quota codex "$T" || sync_rc=$?
+(( sync_rc != 0 ))
+[[ "$(read_provider_last_known_reset codex)" == "$OLD_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$OLD_DUE" ]]
+print -r -- "  PASS: overdue task debt also blocks /usage scheduler writes"
+
+print -r -- "== P1-1O: rolling Fresh cannot starve either provider =="
+for provider in codex antigravity; do
+  reset_state
+  CYCLE_START="$T"
+  EXPECTED_DUE=$(( CYCLE_START + 18000 + RESET_BUFFER_SECONDS ))
+  write_provider_last_task "$provider" "$CYCLE_START"
+  write_provider_next_due "$provider" $(( CYCLE_START + RUN_INTERVAL_SECONDS ))
+  matured=0
+  for step in {0..31}; do
+    PROBE_NOW=$(( CYCLE_START + step * 900 ))
+    set_fresh "$provider" $(( PROBE_NOW + 18000 ))
+    if evaluate_provider "$provider" "$PROBE_NOW"; then
+      matured=1
+      break
+    fi
+  done
+  [[ "$matured" == "1" ]]
+  [[ "$(read_provider_next_due "$provider")" == "$EXPECTED_DUE" ]]
+  print -r -- "  PASS: $provider matured after bounded rolling probes; due stayed $EXPECTED_DUE"
+done
+
+print -r -- "== P1-1P: first fixed Fresh reset may be later than last_task + 5h =="
+reset_state
+CYCLE_START="$T"
+FIXED_RESET=$(( CYCLE_START + 19800 ))
+write_provider_last_task codex "$CYCLE_START"
+write_provider_next_due codex $(( CYCLE_START + RUN_INTERVAL_SECONDS ))
+set_fresh codex "$FIXED_RESET"
+sync_provider_deadline_from_quota codex "$CYCLE_START"
+[[ "$(read_provider_last_known_reset codex)" == "$FIXED_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( FIXED_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "  PASS: fixed Native reset remained authoritative despite the older task anchor"
+
+print -r -- "== P1-1Q: a far-later reset needs stability across probes =="
+reset_state
+CYCLE_START="$T"
+TRUSTED_RESET=$(( CYCLE_START + 3600 ))
+FIXED_RESET=$(( CYCLE_START + 19800 ))
+write_provider_last_task codex "$CYCLE_START"
+write_provider_last_known_reset codex "$TRUSTED_RESET"
+write_provider_next_due codex $(( TRUSTED_RESET + RESET_BUFFER_SECONDS ))
+set_fresh codex "$FIXED_RESET"
+sync_rc=0
+sync_provider_deadline_from_quota codex "$CYCLE_START" || sync_rc=$?
+(( sync_rc != 0 ))
+[[ "$(read_provider_last_known_reset codex)" == "$TRUSTED_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( TRUSTED_RESET + RESET_BUFFER_SECONDS ))" ]]
+set_fresh codex "$FIXED_RESET"
+sync_rc=0
+sync_provider_deadline_from_quota codex $(( CYCLE_START + 30 )) || sync_rc=$?
+(( sync_rc != 0 ))
+[[ "$(read_provider_last_known_reset codex)" == "$TRUSTED_RESET" ]]
+set_fresh codex "$FIXED_RESET"
+sync_provider_deadline_from_quota codex $(( CYCLE_START + 900 ))
+[[ "$(read_provider_last_known_reset codex)" == "$FIXED_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( FIXED_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "  PASS: first far movement deferred; unchanged second observation promoted"
+
+print -r -- "== P1-1R: near and earlier reset movement remains immediate =="
+reset_state
+CYCLE_START="$T"
+TRUSTED_RESET=$(( CYCLE_START + 18000 ))
+NEAR_RESET=$(( TRUSTED_RESET + 240 ))
+EARLY_RESET=$(( CYCLE_START + 15000 ))
+write_provider_last_task codex "$CYCLE_START"
+write_provider_last_known_reset codex "$TRUSTED_RESET"
+write_provider_next_due codex $(( TRUSTED_RESET + RESET_BUFFER_SECONDS ))
+set_fresh codex "$NEAR_RESET"
+sync_provider_deadline_from_quota codex "$CYCLE_START"
+NEAR_DUE=$(( NEAR_RESET + RESET_BUFFER_SECONDS ))
+[[ "$(read_provider_last_known_reset codex)" == "$NEAR_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$NEAR_DUE" ]]
+set_fresh codex "$EARLY_RESET"
+sync_provider_deadline_from_quota codex "$CYCLE_START"
+[[ "$(read_provider_last_known_reset codex)" == "$EARLY_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( EARLY_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "  PASS: nearby later movement and earlier refresh both stayed dynamic"
 
 cleanup
 print -r -- "p1 deadline regression: all cases passed"
