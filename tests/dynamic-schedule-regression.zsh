@@ -393,10 +393,11 @@ collect_effective_quotas() {
 }
 CAPTURED_USAGE_MSG=""
 send_usage_notification
-[[ "$CAPTURED_USAGE_MSG" == *"来源　Native · codex app-server"* ]]
-[[ "$CAPTURED_USAGE_MSG" == *"来源　CodexBar · cached"* ]]
+[[ "$CAPTURED_USAGE_MSG" == *"Native · codex app-server"* ]]
+[[ "$CAPTURED_USAGE_MSG" == *"CodexBar · cached"* ]]
 [[ "$CAPTURED_USAGE_MSG" == *"⚠️ 可能不是最新"* ]]
 [[ "$CAPTURED_USAGE_MSG" != *"↳"* ]]
+[[ "$CAPTURED_USAGE_MSG" != *"来源"* ]]
 print -r -- "Case 17 (/usage source labels with mixed fresh/stale tiers): passed"
 
 cleanup

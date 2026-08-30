@@ -581,7 +581,7 @@ build_linear_progress_chart() {
     '{
       tag: "chart",
       aspect_ratio: "16:9",
-      height: "26px",
+      height: "24px",
       preview: false,
       chart_spec: {
         type: "linearProgress",
@@ -597,16 +597,17 @@ build_linear_progress_chart() {
         xField: "value",
         yField: "type",
         seriesField: "type",
+        roundCap: true,
         color: [$color],
         progress: {
           style: {
             fill: $color,
-            cornerRadius: 4
+            cornerRadius: 5
           }
         },
         track: {
           style: {
-            cornerRadius: 4
+            cornerRadius: 5
           }
         },
         bandWidth: 10,
@@ -616,13 +617,13 @@ build_linear_progress_chart() {
         ],
         legends: { visible: false },
         tooltip: { visible: false },
-        padding: { top: 0, bottom: 0, left: 0, right: 0 }
+        padding: { top: 0, bottom: 0, left: 2, right: 2 }
       }
     }'
 }
 
 build_provider_v2_elements() {
-  local title="$1" result="$2" quota_file="$3"
+  local title="$1" result="$2" quota_file="$3" layout_mode="${4:-dual}"
   local five_remaining="0" five_reset="0" weekly_remaining="0" weekly_reset="0" raw_source="未知"
   local five_duration="未知" weekly_duration="未知" five_reset_time="未知" weekly_reset_time="未知"
   local now="${CURRENT_FORMAT_TIME:-$(/bin/date '+%s')}"
@@ -658,19 +659,19 @@ build_provider_v2_elements() {
   local title_md="**${title}**"
   local source_md=""
   if [[ "$raw_source" == *"cached"* ]]; then
-    source_md="来源　CodexBar · cached\n⚠️ 可能不是最新"
+    source_md="CodexBar · cached\n⚠️ 可能不是最新"
   elif [[ "$raw_source" == *"快照"* ]]; then
-    source_md="来源　Pi 快照\n⚠️ 可能不是最新"
+    source_md="Pi 快照\n⚠️ 可能不是最新"
   else
-    source_md="来源　${raw_source}"
+    source_md="${raw_source}"
   fi
 
   local status_md=""
   if [[ -n "$result" ]]; then
     if [[ "$result" == "发送成功" ]]; then
-      status_md="🟢 **发送成功**"
+      status_md="🟢 **成功**"
     else
-      status_md="🔴 **发送失败**"
+      status_md="🔴 **失败**"
     fi
   fi
 
@@ -678,38 +679,136 @@ build_provider_v2_elements() {
   chart_5h="$(build_linear_progress_chart "$five_remaining" "#57D0FB")" || return 1
   chart_weekly="$(build_linear_progress_chart "$weekly_remaining" "#54A6FD")" || return 1
 
-  "$JQ_BIN" -n \
-    --arg title "$title_md" \
-    --arg src "$source_md" \
-    --arg stat "$status_md" \
-    --arg f_rem "$five_remaining" \
-    --argjson chart_5h "$chart_5h" \
-    --arg f_dur "$five_duration" \
-    --arg f_res "$five_reset_time" \
-    --arg w_rem "$weekly_remaining" \
-    --argjson chart_weekly "$chart_weekly" \
-    --arg w_dur "$weekly_duration" \
-    --arg w_res "$weekly_reset_time" \
-    '[
-      { tag: "markdown", content: $title },
-      { tag: "markdown", content: $src }
-    ] +
-    (if $stat != "" then [{ tag: "markdown", content: $stat }] else [] end) +
-    [
-      { tag: "markdown", content: ("**5 小时**　剩余 " + $f_rem + "%") },
-      $chart_5h,
-      {
-        tag: "markdown",
-        content: ("距离重置　" + $f_dur + "\n重置时间　" + $f_res)
-      },
-      { tag: "hr" },
-      { tag: "markdown", content: ("**周额度**　剩余 " + $w_rem + "%") },
-      $chart_weekly,
-      {
-        tag: "markdown",
-        content: ("距离重置　" + $w_dur + "\n重置时间　" + $w_res)
-      }
-    ]'
+  if [[ "$layout_mode" == "single" ]]; then
+    "$JQ_BIN" -n \
+      --arg title "$title_md" \
+      --arg src "$source_md" \
+      --arg stat "$status_md" \
+      --arg f_rem "$five_remaining" \
+      --argjson chart_5h "$chart_5h" \
+      --arg f_dur "$five_duration" \
+      --arg f_res "$five_reset_time" \
+      --arg w_rem "$weekly_remaining" \
+      --argjson chart_weekly "$chart_weekly" \
+      --arg w_dur "$weekly_duration" \
+      --arg w_res "$weekly_reset_time" \
+      '(if $stat != "" then [
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 3,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: $title }]
+            },
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: $stat }]
+            }
+          ]
+        }
+      ] else [
+        { tag: "markdown", content: $title }
+      ] end) +
+      [
+        { tag: "markdown", content: $src },
+        {
+          tag: "column_set",
+          flex_mode: "stretch",
+          horizontal_spacing: "medium",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "top",
+              elements: [
+                { tag: "markdown", content: ("**5 小时**　剩余 " + $f_rem + "%") },
+                $chart_5h,
+                {
+                  tag: "markdown",
+                  content: ("距离重置　" + $f_dur + "\n重置时间　" + $f_res)
+                }
+              ]
+            },
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "top",
+              elements: [
+                { tag: "markdown", content: ("**周额度**　剩余 " + $w_rem + "%") },
+                $chart_weekly,
+                {
+                  tag: "markdown",
+                  content: ("距离重置　" + $w_dur + "\n重置时间　" + $w_res)
+                }
+              ]
+            }
+          ]
+        }
+      ]'
+  else
+    "$JQ_BIN" -n \
+      --arg title "$title_md" \
+      --arg src "$source_md" \
+      --arg stat "$status_md" \
+      --arg f_rem "$five_remaining" \
+      --argjson chart_5h "$chart_5h" \
+      --arg f_dur "$five_duration" \
+      --arg f_res "$five_reset_time" \
+      --arg w_rem "$weekly_remaining" \
+      --argjson chart_weekly "$chart_weekly" \
+      --arg w_dur "$weekly_duration" \
+      --arg w_res "$weekly_reset_time" \
+      '(if $stat != "" then [
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          columns: [
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 3,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: $title }]
+            },
+            {
+              tag: "column",
+              width: "weighted",
+              weight: 1,
+              vertical_align: "center",
+              elements: [{ tag: "markdown", content: $stat }]
+            }
+          ]
+        }
+      ] else [
+        { tag: "markdown", content: $title }
+      ] end) +
+      [
+        { tag: "markdown", content: $src },
+        { tag: "markdown", content: ("**5 小时**　剩余 " + $f_rem + "%") },
+        $chart_5h,
+        {
+          tag: "markdown",
+          content: ("距离重置　" + $f_dur + "\n重置时间　" + $f_res)
+        },
+        { tag: "hr" },
+        { tag: "markdown", content: ("**周额度**　剩余 " + $w_rem + "%") },
+        $chart_weekly,
+        {
+          tag: "markdown",
+          content: ("距离重置　" + $w_dur + "\n重置时间　" + $w_res)
+        },
+        { tag: "hr" }
+      ]'
+  fi
 }
 
 build_feishu_v2_task_payload() {
@@ -738,10 +837,10 @@ build_feishu_v2_task_payload() {
     local provider_elements
     case "$provider" in
       codex)
-        provider_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+        provider_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE" "single")" || return 1
         ;;
       antigravity)
-        provider_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+        provider_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" "single")" || return 1
         ;;
     esac
 
@@ -753,8 +852,8 @@ build_feishu_v2_task_payload() {
       ]')"
   elif (( ${#attempted[@]} >= 2 )); then
     local luna_elements gemini_elements
-    luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
-    gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+    luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE" "dual")" || return 1
+    gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" "dual")" || return 1
 
     body_elements_json="$("$JQ_BIN" -n \
       --argjson luna "$luna_elements" \
@@ -781,7 +880,6 @@ build_feishu_v2_task_payload() {
             }
           ]
         },
-        { tag: "hr" },
         { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
       ]')"
   else
@@ -822,8 +920,8 @@ build_feishu_v2_usage_payload() {
   local request_uuid="$2"
   local luna_elements gemini_elements
 
-  luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
-  gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+  luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "" "$CODEX_QUOTA_NORMALIZED_FILE" "dual")" || return 1
+  gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" "dual")" || return 1
 
   local body_elements_json
   body_elements_json="$("$JQ_BIN" -n \
@@ -855,7 +953,6 @@ build_feishu_v2_usage_payload() {
           }
         ]
       },
-      { tag: "hr" },
       { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
     ]')"
 
@@ -1609,9 +1706,9 @@ format_provider_card_section() {
   local formatted_result=""
   if [[ -n "$result" ]]; then
     if [[ "$result" == "发送成功" ]]; then
-      formatted_result="🟢 **发送成功**"
+      formatted_result="🟢 **成功**"
     else
-      formatted_result="🔴 **发送失败**"
+      formatted_result="🔴 **失败**"
     fi
   fi
 
@@ -1619,21 +1716,28 @@ format_provider_card_section() {
   quota_message="${quota_message//周额度：/**周额度**　}"
   quota_message="${quota_message//距离重置：/距离重置　}"
   quota_message="${quota_message//重置时间：/重置时间　}"
-  quota_message="${quota_message//来源：/来源　}"
 
   local lines=("${(@f)quota_message}")
-  local out_lines=("$title")
+  local out_lines=()
+  if [[ -n "$formatted_result" ]]; then
+    out_lines+=("${title}    ${formatted_result}")
+  else
+    out_lines+=("$title")
+  fi
+
   local quota_body=()
   local src=""
 
   for line in "${lines[@]}"; do
-    if [[ "$line" == "来源"* ]]; then
-      if [[ "$line" == *"cached"* ]]; then
-        src=$'来源　CodexBar · cached\n⚠️ 可能不是最新'
-      elif [[ "$line" == *"快照"* ]]; then
-        src=$'来源　Pi 快照\n⚠️ 可能不是最新'
+    if [[ "$line" == "来源："* || "$line" == "来源　"* || "$line" == "来源"* ]]; then
+      local raw_src="${line#来源[：　]}"
+      raw_src="${raw_src#来源}"
+      if [[ "$raw_src" == *"cached"* ]]; then
+        src=$'CodexBar · cached\n⚠️ 可能不是最新'
+      elif [[ "$raw_src" == *"快照"* ]]; then
+        src=$'Pi 快照\n⚠️ 可能不是最新'
       else
-        src="$line"
+        src="$raw_src"
       fi
     else
       quota_body+=("$line")
@@ -1642,9 +1746,6 @@ format_provider_card_section() {
 
   if [[ -n "$src" ]]; then
     out_lines+=("$src")
-  fi
-  if [[ -n "$formatted_result" ]]; then
-    out_lines+=("$formatted_result")
   fi
   out_lines+=("")
   out_lines+=("${quota_body[@]}")

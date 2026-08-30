@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
+class TestFeishuCardV2RefinedLayout(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../quota-sentinel.sh"))
@@ -20,53 +20,51 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
         return res.stdout.strip()
 
     # -------------------------------------------------------------
-    # Case 1 & 2: Linear Progress Chart value mapping & colors
+    # Case 1 & 2: Progress Roundness & Value Mapping (0%, 1%, 50%, 77%, 99%, 100%)
     # -------------------------------------------------------------
-    def test_case_1_and_2_chart_linear_progress_and_colors(self):
-        # 5-hour chart with #57D0FB
-        out_5h = self.run_zsh_fn('build_linear_progress_chart 77 "#57D0FB"')
-        chart_5h = json.loads(out_5h)
-        self.assertEqual(chart_5h["tag"], "chart")
-        self.assertEqual(chart_5h["height"], "26px")
-        self.assertEqual(chart_5h["aspect_ratio"], "16:9")
-        self.assertEqual(chart_5h["chart_spec"]["type"], "linearProgress")
-        self.assertEqual(chart_5h["chart_spec"]["color"], ["#57D0FB"])
-        self.assertEqual(chart_5h["chart_spec"]["progress"]["style"]["fill"], "#57D0FB")
-        self.assertEqual(chart_5h["chart_spec"]["data"]["values"][0]["value"], 0.77)
-        self.assertFalse(chart_5h["preview"])
-
-        # Weekly chart with #54A6FD
-        out_w = self.run_zsh_fn('build_linear_progress_chart 86 "#54A6FD"')
-        chart_w = json.loads(out_w)
-        self.assertEqual(chart_w["chart_spec"]["type"], "linearProgress")
-        self.assertEqual(chart_w["chart_spec"]["color"], ["#54A6FD"])
-        self.assertEqual(chart_w["chart_spec"]["progress"]["style"]["fill"], "#54A6FD")
-        self.assertEqual(chart_w["chart_spec"]["data"]["values"][0]["value"], 0.86)
+    def test_case_1_and_2_progress_roundness_and_values(self):
+        for pct, expected_val in [(0, 0), (1, 0.01), (50, 0.5), (77, 0.77), (99, 0.99), (100, 1)]:
+            out = self.run_zsh_fn(f'build_linear_progress_chart {pct} "#57D0FB"')
+            c = json.loads(out)
+            self.assertEqual(c["tag"], "chart")
+            self.assertEqual(c["height"], "24px")
+            spec = c["chart_spec"]
+            self.assertEqual(spec["type"], "linearProgress")
+            self.assertTrue(spec.get("roundCap"))
+            self.assertEqual(spec["progress"]["style"]["cornerRadius"], 5)
+            self.assertEqual(spec["track"]["style"]["cornerRadius"], 5)
+            self.assertEqual(spec["data"]["values"][0]["value"], expected_val)
+            self.assertEqual(spec["color"], ["#57D0FB"])
+            self.assertEqual(spec["progress"]["style"]["fill"], "#57D0FB")
 
     # -------------------------------------------------------------
-    # Case 3 & 4: Boundary values and clamping
+    # Case 3: Weekly Progress Color (#54A6FD)
     # -------------------------------------------------------------
-    def test_case_3_and_4_boundary_and_clamping(self):
-        out_0 = self.run_zsh_fn('build_linear_progress_chart 0 "#57D0FB"')
-        self.assertEqual(json.loads(out_0)["chart_spec"]["data"]["values"][0]["value"], 0)
+    def test_case_3_weekly_progress_color(self):
+        out = self.run_zsh_fn('build_linear_progress_chart 86 "#54A6FD"')
+        c = json.loads(out)
+        self.assertEqual(c["chart_spec"]["color"], ["#54A6FD"])
+        self.assertEqual(c["chart_spec"]["progress"]["style"]["fill"], "#54A6FD")
+        self.assertEqual(c["chart_spec"]["data"]["values"][0]["value"], 0.86)
 
-        out_100 = self.run_zsh_fn('build_linear_progress_chart 100 "#57D0FB"')
-        self.assertEqual(json.loads(out_100)["chart_spec"]["data"]["values"][0]["value"], 1)
-
+    # -------------------------------------------------------------
+    # Case 4: Clamping and invalid fallback
+    # -------------------------------------------------------------
+    def test_case_4_clamping_and_fallback(self):
         out_neg = self.run_zsh_fn('build_linear_progress_chart -10 "#57D0FB"')
         self.assertEqual(json.loads(out_neg)["chart_spec"]["data"]["values"][0]["value"], 0)
 
         out_over = self.run_zsh_fn('build_linear_progress_chart 150 "#57D0FB"')
         self.assertEqual(json.loads(out_over)["chart_spec"]["data"]["values"][0]["value"], 1)
 
-        out_invalid = self.run_zsh_fn('build_linear_progress_chart "" "#57D0FB"')
+        out_invalid = self.run_zsh_fn('build_linear_progress_chart "invalid" "#57D0FB"')
         self.assertEqual(json.loads(out_invalid)["chart_spec"]["data"]["values"][0]["value"], 1.0)
 
     # -------------------------------------------------------------
-    # Case 5: Provider elements structure (2 charts per provider, divider)
+    # Case 5: Single Provider Quota Horizontal Side-by-Side (5h | Weekly)
     # -------------------------------------------------------------
-    def test_case_5_provider_elements_structure(self):
-        fixture_file = os.path.join(self.test_dir.name, "quota-test.json")
+    def test_case_5_single_provider_horizontal_quotas(self):
+        fixture_file = os.path.join(self.test_dir.name, "codex-quota.json")
         with open(fixture_file, "w") as f:
             json.dump({
                 "source": "Native · codex app-server",
@@ -76,40 +74,64 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
                 "weekly": {"remainingPercent": 84, "resetAt": 1788600000}
             }, f)
 
-        out = self.run_zsh_fn(f'build_provider_v2_elements "GPT-5.6 Luna" "发送成功" "{fixture_file}"')
+        out = self.run_zsh_fn(f'build_provider_v2_elements "GPT-5.6 Luna" "发送成功" "{fixture_file}" "single"')
         elems = json.loads(out)
-        self.assertEqual(len(elems), 10)
-        # Element 0: Title
-        self.assertEqual(elems[0]["content"], "**GPT-5.6 Luna**")
-        # Element 1: Source (no arrow)
-        self.assertEqual(elems[1]["content"], "来源　Native · codex app-server")
-        # Element 2: Status
-        self.assertEqual(elems[2]["content"], "🟢 **发送成功**")
-        # Element 3: 5h Title & Percent
-        self.assertEqual(elems[3]["content"], "**5 小时**　剩余 100%")
-        # Element 4: 5h Chart (#57D0FB)
-        self.assertEqual(elems[4]["tag"], "chart")
-        self.assertEqual(elems[4]["chart_spec"]["color"], ["#57D0FB"])
-        # Element 5: 5h Reset Info (no arrow, space instead of colon)
-        self.assertIn("距离重置　", elems[5]["content"])
-        self.assertIn("重置时间　", elems[5]["content"])
-        self.assertNotIn("↳", elems[5]["content"])
-        # Element 6: Official Divider
-        self.assertEqual(elems[6]["tag"], "hr")
-        # Element 7: Weekly Title & Percent
-        self.assertEqual(elems[7]["content"], "**周额度**　剩余 84%")
-        # Element 8: Weekly Chart (#54A6FD)
-        self.assertEqual(elems[8]["tag"], "chart")
-        self.assertEqual(elems[8]["chart_spec"]["color"], ["#54A6FD"])
-        # Element 9: Weekly Reset Info
-        self.assertIn("距离重置　", elems[9]["content"])
-        self.assertIn("重置时间　", elems[9]["content"])
-        self.assertNotIn("↳", elems[9]["content"])
+        self.assertEqual(len(elems), 3)
+
+        # Element 0: Header row (column_set with Model Name + Status)
+        header_row = elems[0]
+        self.assertEqual(header_row["tag"], "column_set")
+        self.assertEqual(len(header_row["columns"]), 2)
+        self.assertIn("GPT-5.6 Luna", header_row["columns"][0]["elements"][0]["content"])
+        self.assertIn("🟢 **成功**", header_row["columns"][1]["elements"][0]["content"])
+
+        # Element 1: Source (no "来源" keyword)
+        source_elem = elems[1]
+        self.assertEqual(source_elem["tag"], "markdown")
+        self.assertEqual(source_elem["content"], "Native · codex app-server")
+
+        # Element 2: Quota Column Set (5h and Weekly side-by-side)
+        quota_col_set = elems[2]
+        self.assertEqual(quota_col_set["tag"], "column_set")
+        self.assertEqual(len(quota_col_set["columns"]), 2)
+        # Left column: 5h
+        left_col = quota_col_set["columns"][0]["elements"]
+        self.assertIn("5 小时", left_col[0]["content"])
+        self.assertEqual(left_col[1]["chart_spec"]["color"], ["#57D0FB"])
+        self.assertIn("距离重置　", left_col[2]["content"])
+        # Right column: Weekly
+        right_col = quota_col_set["columns"][1]["elements"]
+        self.assertIn("周额度", right_col[0]["content"])
+        self.assertEqual(right_col[1]["chart_spec"]["color"], ["#54A6FD"])
+        self.assertIn("重置时间　", right_col[2]["content"])
 
     # -------------------------------------------------------------
-    # Case 6: Card width_mode is default
+    # Case 6: Dual Provider Structure & Provider-End Divider
     # -------------------------------------------------------------
-    def test_case_6_card_width_mode_is_default(self):
+    def test_case_6_dual_provider_structure_and_divider(self):
+        fixture_file = os.path.join(self.test_dir.name, "anti-quota.json")
+        with open(fixture_file, "w") as f:
+            json.dump({
+                "source": "Native · agy local service",
+                "fresh": True,
+                "capturedAt": 1788000000,
+                "fiveHour": {"remainingPercent": 77, "resetAt": 1788018000},
+                "weekly": {"remainingPercent": 86, "resetAt": 1788600000}
+            }, f)
+
+        out = self.run_zsh_fn(f'build_provider_v2_elements "Gemini 3.7 Flash · Low" "发送成功" "{fixture_file}" "dual"')
+        elems = json.loads(out)
+        # Elements: Header row, Source, 5h, Chart, Reset, hr, Weekly, Chart, Reset, provider-end hr
+        self.assertEqual(len(elems), 10)
+        self.assertEqual(elems[0]["tag"], "column_set") # Header row
+        self.assertEqual(elems[1]["content"], "Native · agy local service") # Source
+        self.assertEqual(elems[5]["tag"], "hr") # 5h/Weekly divider
+        self.assertEqual(elems[9]["tag"], "hr") # Provider-end divider
+
+    # -------------------------------------------------------------
+    # Case 7: Card width_mode is default
+    # -------------------------------------------------------------
+    def test_case_7_card_width_mode_is_default(self):
         out = self.run_zsh_fn('card_preview both')
         payload = json.loads(out)
         card = json.loads(payload["content"])
@@ -117,30 +139,32 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
         self.assertEqual(card["config"]["width_mode"], "default")
 
     # -------------------------------------------------------------
-    # Case 7: Absolute absence of '↳' in user-visible text
+    # Case 8: Absence of '↳' and '来源' in user-visible text
     # -------------------------------------------------------------
-    def test_case_7_no_arrow_symbols(self):
+    def test_case_8_no_arrows_and_no_source_prefix(self):
         out = self.run_zsh_fn('card_preview both')
         payload = json.loads(out)
         card = json.loads(payload["content"])
 
-        def check_no_arrows(obj):
+        def check_text_nodes(obj):
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if k in ("content", "text") and isinstance(v, str):
                         self.assertNotIn("↳", v, f"Arrow '↳' found in '{k}': {repr(v)}")
+                        self.assertNotIn("来源　", v, f"Source prefix '来源　' found in '{k}': {repr(v)}")
+                        self.assertNotIn("来源：", v, f"Source prefix '来源：' found in '{k}': {repr(v)}")
                     else:
-                        check_no_arrows(v)
+                        check_text_nodes(v)
             elif isinstance(obj, list):
                 for item in obj:
-                    check_no_arrows(item)
+                    check_text_nodes(item)
 
-        check_no_arrows(card)
+        check_text_nodes(card)
 
     # -------------------------------------------------------------
-    # Case 8: Absence of literal \n in text
+    # Case 9: Absence of literal \n in text
     # -------------------------------------------------------------
-    def test_case_8_no_literal_backslash_n(self):
+    def test_case_9_no_literal_backslash_n(self):
         out = self.run_zsh_fn('card_preview both')
         payload = json.loads(out)
         card = json.loads(payload["content"])
@@ -159,89 +183,9 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
         check_text_nodes(card)
 
     # -------------------------------------------------------------
-    # Case 9 & 10: Single Provider Scope (no empty column)
+    # Case 10: /usage mode structure (no status)
     # -------------------------------------------------------------
-    def test_case_9_codex_only_single_column(self):
-        fixture_file = os.path.join(self.test_dir.name, "codex-quota.json")
-        with open(fixture_file, "w") as f:
-            json.dump({
-                "source": "Native · codex app-server",
-                "fresh": True,
-                "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 100, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 84, "resetAt": 1788600000}
-            }, f)
-
-        out = self.run_zsh_fn(f'CODEX_QUOTA_NORMALIZED_FILE="{fixture_file}" CODEX_RUN_RESULT="发送成功" build_feishu_v2_task_payload "user1" "uuid1" codex')
-        payload = json.loads(out)
-        card = json.loads(payload["content"])
-        self.assertEqual(card["schema"], "2.0")
-        tags = [e["tag"] for e in card["body"]["elements"]]
-        self.assertNotIn("column_set", tags)
-        self.assertEqual(card["header"]["template"], "green")
-        self.assertIn("GPT-5.6 Luna", card["body"]["elements"][0]["content"])
-        self.assertNotIn("Gemini", json.dumps(card))
-
-    def test_case_10_antigravity_only_single_column(self):
-        fixture_file = os.path.join(self.test_dir.name, "antigravity-quota.json")
-        with open(fixture_file, "w") as f:
-            json.dump({
-                "source": "Native · agy local service",
-                "fresh": True,
-                "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 77, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 86, "resetAt": 1788600000}
-            }, f)
-
-        out = self.run_zsh_fn(f'ANTIGRAVITY_QUOTA_NORMALIZED_FILE="{fixture_file}" ANTIGRAVITY_RUN_RESULT="发送成功" build_feishu_v2_task_payload "user1" "uuid1" antigravity')
-        payload = json.loads(out)
-        card = json.loads(payload["content"])
-        self.assertEqual(card["schema"], "2.0")
-        tags = [e["tag"] for e in card["body"]["elements"]]
-        self.assertNotIn("column_set", tags)
-        self.assertIn("Gemini 3.7 Flash · Low", card["body"]["elements"][0]["content"])
-        self.assertNotIn("Luna", json.dumps(card))
-
-    # -------------------------------------------------------------
-    # Case 11: Dual Provider Responsive Columns
-    # -------------------------------------------------------------
-    def test_case_11_dual_provider_responsive_columns(self):
-        f_codex = os.path.join(self.test_dir.name, "codex.json")
-        f_anti = os.path.join(self.test_dir.name, "anti.json")
-        with open(f_codex, "w") as f:
-            json.dump({
-                "source": "Native · codex app-server",
-                "fresh": True,
-                "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 100, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 84, "resetAt": 1788600000}
-            }, f)
-        with open(f_anti, "w") as f:
-            json.dump({
-                "source": "Native · agy local service",
-                "fresh": True,
-                "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 77, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 86, "resetAt": 1788600000}
-            }, f)
-
-        out = self.run_zsh_fn(f'CODEX_QUOTA_NORMALIZED_FILE="{f_codex}" ANTIGRAVITY_QUOTA_NORMALIZED_FILE="{f_anti}" CODEX_RUN_RESULT="发送成功" ANTIGRAVITY_RUN_RESULT="发送成功" build_feishu_v2_task_payload "user1" "uuid1" codex antigravity')
-        payload = json.loads(out)
-        card = json.loads(payload["content"])
-        self.assertEqual(card["schema"], "2.0")
-        col_set = card["body"]["elements"][0]
-        self.assertEqual(col_set["tag"], "column_set")
-        self.assertEqual(col_set["flex_mode"], "stretch")
-        self.assertEqual(len(col_set["columns"]), 2)
-        self.assertEqual(col_set["columns"][0]["width"], "weighted")
-        self.assertEqual(col_set["columns"][0]["weight"], 1)
-        self.assertEqual(col_set["columns"][1]["width"], "weighted")
-        self.assertEqual(col_set["columns"][1]["weight"], 1)
-
-    # -------------------------------------------------------------
-    # Case 12: /usage Dual Provider & No Status Lines
-    # -------------------------------------------------------------
-    def test_case_12_usage_card_structure(self):
+    def test_case_10_usage_structure(self):
         f_codex = os.path.join(self.test_dir.name, "codex.json")
         f_anti = os.path.join(self.test_dir.name, "anti.json")
         with open(f_codex, "w") as f:
@@ -268,15 +212,14 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
         self.assertEqual(card["body"]["elements"][0]["tag"], "markdown")
         self.assertIn("即时配额查询", card["body"]["elements"][0]["content"])
         card_str = json.dumps(card)
-        self.assertNotIn("发送成功", card_str)
-        self.assertNotIn("发送失败", card_str)
+        self.assertNotIn("成功", card_str)
+        self.assertNotIn("失败", card_str)
 
     # -------------------------------------------------------------
-    # Case 13: Stale warning preservation
+    # Case 11: Stale warning preservation
     # -------------------------------------------------------------
-    def test_case_13_stale_warning_preservation(self):
+    def test_case_11_stale_warning_preservation(self):
         f_cached = os.path.join(self.test_dir.name, "cached.json")
-        f_snapshot = os.path.join(self.test_dir.name, "snapshot.json")
         with open(f_cached, "w") as f:
             json.dump({
                 "source": "CodexBar · cached（可能不是最新）",
@@ -286,28 +229,16 @@ class TestFeishuCardV2AndLinearProgressChart(unittest.TestCase):
                 "fiveHour": {"remainingPercent": 60, "resetAt": 1788018000},
                 "weekly": {"remainingPercent": 70, "resetAt": 1788600000}
             }, f)
-        with open(f_snapshot, "w") as f:
-            json.dump({
-                "source": "Pi 快照（可能不是最新）",
-                "fresh": False,
-                "cached": True,
-                "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 50, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 60, "resetAt": 1788600000}
-            }, f)
 
-        out_c = self.run_zsh_fn(f'build_provider_v2_elements "Gemini 3.7 Flash · Low" "发送成功" "{f_cached}"')
-        self.assertIn("来源　CodexBar · cached", out_c)
-        self.assertIn("⚠️ 可能不是最新", out_c)
-
-        out_s = self.run_zsh_fn(f'build_provider_v2_elements "GPT-5.6 Luna" "发送成功" "{f_snapshot}"')
-        self.assertIn("来源　Pi 快照", out_s)
-        self.assertIn("⚠️ 可能不是最新", out_s)
+        out_c = self.run_zsh_fn(f'build_provider_v2_elements "Gemini 3.7 Flash · Low" "发送成功" "{f_cached}" "single"')
+        elems = json.loads(out_c)
+        self.assertIn("CodexBar · cached", elems[1]["content"])
+        self.assertIn("⚠️ 可能不是最新", elems[1]["content"])
 
     # -------------------------------------------------------------
-    # Case 14: Unicode quota_bar fallback preservation
+    # Case 12: Unicode fallback preservation
     # -------------------------------------------------------------
-    def test_case_14_unicode_fallback_preservation(self):
+    def test_case_12_unicode_fallback_preservation(self):
         out_bar = self.run_zsh_fn('quota_bar 77')
         self.assertEqual(out_bar, "■■■■■■■■□□")
 
