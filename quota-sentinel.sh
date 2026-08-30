@@ -3,7 +3,10 @@
 set -euo pipefail
 
 readonly PI_BIN="/opt/homebrew/bin/pi"
+readonly CODEX_BIN="/opt/homebrew/bin/codex"
+readonly AGY_BIN="/opt/homebrew/bin/agy"
 readonly CODEXBAR_BIN="/opt/homebrew/bin/codexbar"
+readonly PYTHON3_BIN="/usr/bin/python3"
 readonly CURL_BIN="/usr/bin/curl"
 readonly JQ_BIN="/opt/homebrew/bin/jq"
 readonly SECURITY_BIN="/usr/bin/security"
@@ -23,6 +26,8 @@ readonly FEISHU_USER_ID_SERVICE="com.example.quota-sentinel.feishu-user-id"
 readonly STATE_DIR="${QUOTA_SENTINEL_STATE_DIR:-/Users/__USER__/Library/Application Support/quota-sentinel}"
 readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"
 readonly QUOTA_LOCK_FILE="$STATE_DIR/quota.lock"
+readonly CODEXBAR_CODEX_CACHE_FILE="$STATE_DIR/codexbar-codex-last-success.json"
+readonly CODEXBAR_ANTIGRAVITY_CACHE_FILE="$STATE_DIR/codexbar-antigravity-last-success.json"
 readonly PI_CODEX_SNAPSHOT_FILE="$STATE_DIR/pi-codex-quota.json"
 readonly PI_ANTIGRAVITY_SNAPSHOT_FILE="$STATE_DIR/pi-antigravity-quota.json"
 readonly RUN_INTERVAL_SECONDS=18060      # 5 hours 01 minute
@@ -606,7 +611,11 @@ provider_normalized_quota_file() {
 }
 
 provider_quota_is_fresh() {
-  local provider="$1"
+  local provider="$1" q_file
+  q_file="$(provider_normalized_quota_file "$provider" 2>/dev/null || true)"
+  if [[ -n "$q_file" && -s "$q_file" ]] && "$JQ_BIN" -e '.fresh == true' "$q_file" >/dev/null 2>&1; then
+    return 0
+  fi
   case "$provider" in
     codex) (( CODEX_QUOTA_IS_FRESH == 1 )) ;;
     antigravity) (( ANTIGRAVITY_QUOTA_IS_FRESH == 1 )) ;;
@@ -763,8 +772,9 @@ normalize_pi_codex_quota() {
       $primary_used >= 0 and $primary_used <= 100 and
       $secondary_used >= 0 and $secondary_used <= 100) |
     {
-      source: "Pi 响应头快照",
-      fetchedAt: (.capturedAt // null),
+      source: "Pi 快照（可能不是最新）",
+      fresh: false,
+      capturedAt: (.capturedAt // (now | floor)),
       fiveHour: {remainingPercent: (100 - $primary_used), resetAt: $primary_reset},
       weekly: {remainingPercent: (100 - $secondary_used), resetAt: $secondary_reset}
     }
@@ -782,8 +792,9 @@ normalize_pi_antigravity_quota() {
     select($five_remaining >= 0 and $five_remaining <= 100 and
       $weekly_remaining >= 0 and $weekly_remaining <= 100) |
     {
-      source: "Pi Antigravity API 快照",
-      fetchedAt: (.capturedAt // null),
+      source: "Pi 快照（可能不是最新）",
+      fresh: false,
+      capturedAt: (.capturedAt // (now | floor)),
       fiveHour: {remainingPercent: $five_remaining, resetAt: $five_reset},
       weekly: {remainingPercent: $weekly_remaining, resetAt: $weekly_reset}
     }
@@ -807,8 +818,9 @@ normalize_codexbar_codex_quota() {
     ([$windows[] | select(.windowMinutes == 10080 and .usedPercent != null)][0] // empty) as $weekly |
     select($five != null and $weekly != null) |
     {
-      source: ("CodexBar · " + ($row.source // "unknown")),
-      fetchedAt: ($usage.updatedAt // null),
+      source: ("CodexBar · " + ($row.source // "cli")),
+      fresh: true,
+      capturedAt: (now | floor),
       fiveHour: {remainingPercent: remaining($five.usedPercent), resetAt: epoch($five.resetsAt)},
       weekly: {remainingPercent: remaining($weekly.usedPercent), resetAt: epoch($weekly.resetsAt)}
     }
@@ -832,37 +844,253 @@ normalize_codexbar_antigravity_quota() {
     ([$windows[] | select(.window.windowMinutes == 10080 and (((.id // "") | contains("gemini")) or ((.title // "") | ascii_downcase | contains("gemini"))))][0].window // empty) as $weekly |
     select($five != null and $weekly != null) |
     {
-      source: ("CodexBar · " + ($row.source // "unknown")),
-      fetchedAt: ($usage.updatedAt // null),
+      source: ("CodexBar · " + ($row.source // "cli")),
+      fresh: true,
+      capturedAt: (now | floor),
       fiveHour: {remainingPercent: remaining($five.usedPercent), resetAt: epoch($five.resetsAt)},
       weekly: {remainingPercent: remaining($weekly.usedPercent), resetAt: epoch($weekly.resetsAt)}
     }
   ' "$input" >"$output"
 }
 
+fetch_native_codex_quota() {
+  local output="$1"
+  [[ -x "$CODEX_BIN" ]] || return 1
+  require_executable "$PYTHON3_BIN"
+  "$PYTHON3_BIN" -c '
+import json, subprocess, time, sys, os
+
+def get_codex_native(codex_bin):
+    if not os.path.exists(codex_bin) or not os.access(codex_bin, os.X_OK):
+        return None
+    try:
+        proc = subprocess.Popen(
+            [codex_bin, "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        def send_and_wait(req_id, method, params):
+            req = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}) + "\n"
+            proc.stdin.write(req)
+            proc.stdin.flush()
+            t_end = time.time() + 4
+            while time.time() < t_end:
+                line = proc.stdout.readline()
+                if not line: break
+                try:
+                    data = json.loads(line)
+                    if data.get("id") == req_id: return data
+                except Exception:
+                    continue
+            return None
+
+        init_res = send_and_wait(1, "initialize", {"clientInfo": {"name": "quota-sentinel", "version": "1.0"}})
+        if not init_res:
+            proc.terminate(); proc.wait(); return None
+        rate_res = send_and_wait(2, "account/rateLimits/read", {})
+        proc.terminate(); proc.wait()
+        if not rate_res: return None
+
+        rl = rate_res.get("result", {}).get("rateLimits", {})
+        p = rl.get("primary", {})
+        s = rl.get("secondary", {})
+        if not p or not s: return None
+
+        five_h = p if p.get("windowDurationMins", 300) <= 360 else s
+        weekly = s if s.get("windowDurationMins", 10080) > 360 else p
+
+        now = int(time.time())
+        return {
+            "source": "Native · codex app-server",
+            "fresh": True,
+            "capturedAt": now,
+            "fiveHour": {
+                "remainingPercent": max(0, min(100, 100 - five_h.get("usedPercent", 0))),
+                "resetAt": five_h.get("resetsAt")
+            },
+            "weekly": {
+                "remainingPercent": max(0, min(100, 100 - weekly.get("usedPercent", 0))),
+                "resetAt": weekly.get("resetsAt")
+            }
+        }
+    except Exception:
+        return None
+
+res = get_codex_native(sys.argv[1])
+if res and res.get("fiveHour", {}).get("resetAt") and res.get("weekly", {}).get("resetAt"):
+    print(json.dumps(res))
+    sys.exit(0)
+sys.exit(1)
+' "$CODEX_BIN" >"$output" 2>/dev/null || return 1
+  [[ -s "$output" ]] || return 1
+}
+
+fetch_native_antigravity_quota() {
+  local output="$1"
+  require_executable "$PYTHON3_BIN"
+  "$PYTHON3_BIN" -c '
+import json, subprocess, time, ssl, urllib.request, datetime, os, sys
+
+def get_antigravity_native():
+    ports = []
+    agy_session_file = os.path.expanduser("~/.codexbar/antigravity/agy-session.json")
+    if os.path.exists(agy_session_file):
+        try:
+            with open(agy_session_file, "r") as f:
+                sess = json.load(f)
+                pid = sess[0].get("pid")
+                if pid:
+                    res = subprocess.run(["lsof", "-Pan", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True)
+                    for line in res.stdout.splitlines():
+                        if "LISTEN" in line and ":" in line:
+                            p_str = line.split()[-2].split(":")[-1]
+                            if p_str.isdigit():
+                                ports.append(int(p_str))
+        except Exception:
+            pass
+
+    if not ports:
+        res = subprocess.run(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            if "agy" in line or "language_server" in line:
+                for part in line.split():
+                    if ":" in part:
+                        p = part.split(":")[-1]
+                        if p.isdigit():
+                            ports.append(int(p))
+
+    ports = list(dict.fromkeys(ports))
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    data = None
+    for port in ports:
+        url = f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={"Content-Type": "application/json", "Connect-Protocol-Version": "1"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=1.5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                break
+        except Exception:
+            continue
+
+    if not data:
+        return None
+
+    gemini_group = None
+    for g in data.get("response", {}).get("groups", []):
+        if "gemini" in g.get("displayName", "").lower():
+            gemini_group = g
+            break
+    if not gemini_group and data.get("response", {}).get("groups"):
+        gemini_group = data["response"]["groups"][0]
+
+    five_h_bucket = None
+    weekly_bucket = None
+    for b in gemini_group.get("buckets", []):
+        if b.get("window") == "5h" or "5-hour" in b.get("displayName", "").lower() or "5h" in b.get("bucketId", "").lower():
+            five_h_bucket = b
+        elif b.get("window") == "weekly" or "weekly" in b.get("displayName", "").lower() or "weekly" in b.get("bucketId", "").lower():
+            weekly_bucket = b
+
+    def iso_to_epoch(iso_str):
+        if not iso_str: return None
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+
+    now = int(time.time())
+    five_h_rem = round(five_h_bucket.get("remainingFraction", 0) * 100)
+    weekly_rem = round(weekly_bucket.get("remainingFraction", 0) * 100)
+
+    return {
+        "source": "Native · agy local service",
+        "fresh": True,
+        "capturedAt": now,
+        "fiveHour": {
+            "remainingPercent": five_h_rem,
+            "resetAt": iso_to_epoch(five_h_bucket.get("resetTime"))
+        },
+        "weekly": {
+            "remainingPercent": weekly_rem,
+            "resetAt": iso_to_epoch(weekly_bucket.get("resetTime"))
+        }
+    }
+
+res = get_antigravity_native()
+if res and res.get("fiveHour", {}).get("resetAt") and res.get("weekly", {}).get("resetAt"):
+    print(json.dumps(res))
+    sys.exit(0)
+sys.exit(1)
+' >"$output" 2>/dev/null || return 1
+  [[ -s "$output" ]] || return 1
+}
+
 fetch_codexbar_codex_quota() {
+  local output="$1"
   [[ -x "$CODEXBAR_BIN" ]] || return 1
   if "$CODEXBAR_BIN" usage --provider codex --source cli --format json --json-only --no-color \
     >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
-    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$CODEX_QUOTA_NORMALIZED_FILE"; then
+    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    atomic_copy "$output" "$CODEXBAR_CODEX_CACHE_FILE"
     return 0
   fi
   if "$CODEXBAR_BIN" usage --provider codex --source oauth --format json --json-only --no-color \
     >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
-    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$CODEX_QUOTA_NORMALIZED_FILE"; then
+    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    atomic_copy "$output" "$CODEXBAR_CODEX_CACHE_FILE"
     return 0
   fi
   return 1
 }
 
 fetch_codexbar_antigravity_quota() {
+  local output="$1"
   [[ -x "$CODEXBAR_BIN" ]] || return 1
   if "$CODEXBAR_BIN" usage --provider antigravity --source cli --format json --json-only --no-color \
     >"$CODEXBAR_ANTIGRAVITY_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-antigravity.stderr" &&
-    normalize_codexbar_antigravity_quota "$CODEXBAR_ANTIGRAVITY_RAW_FILE" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+    normalize_codexbar_antigravity_quota "$CODEXBAR_ANTIGRAVITY_RAW_FILE" "$output"; then
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    atomic_copy "$output" "$CODEXBAR_ANTIGRAVITY_CACHE_FILE"
     return 0
   fi
   return 1
+}
+
+use_codexbar_cached_codex() {
+  local output="$1"
+  [[ -s "$CODEXBAR_CODEX_CACHE_FILE" ]] || return 1
+  "$JQ_BIN" -e '
+    . + {
+      source: "CodexBar · cached（可能不是最新）",
+      fresh: false
+    }
+  ' "$CODEXBAR_CODEX_CACHE_FILE" >"$output" 2>/dev/null || return 1
+  [[ -s "$output" ]] || return 1
+}
+
+use_codexbar_cached_antigravity() {
+  local output="$1"
+  [[ -s "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" ]] || return 1
+  "$JQ_BIN" -e '
+    . + {
+      source: "CodexBar · cached（可能不是最新）",
+      fresh: false
+    }
+  ' "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" >"$output" 2>/dev/null || return 1
+  [[ -s "$output" ]] || return 1
 }
 
 atomic_copy() {
@@ -877,45 +1105,71 @@ save_pi_quota_snapshots() {
   local antigravity_normalized="$LAST_TEMP_DIR/antigravity-pi-normalized.json"
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
-  normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$codex_normalized" &&
+  if normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$codex_normalized"; then
     atomic_copy "$codex_normalized" "$PI_CODEX_SNAPSHOT_FILE" || true
-  normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$antigravity_normalized" &&
+  fi
+  if normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$antigravity_normalized"; then
     atomic_copy "$antigravity_normalized" "$PI_ANTIGRAVITY_SNAPSHOT_FILE" || true
+  fi
 }
 
-use_pi_or_saved_codex_fallback() {
+use_pi_snapshot_codex() {
+  local output="$1"
   local normalized="$LAST_TEMP_DIR/codex-pi-normalized.json"
   if normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$normalized"; then
-    cp -p "$normalized" "$CODEX_QUOTA_NORMALIZED_FILE"
-    CODEX_QUOTA_IS_FRESH=1
+    cp -p "$normalized" "$output"
     return 0
   fi
   [[ -s "$PI_CODEX_SNAPSHOT_FILE" ]] || return 1
-  cp -p "$PI_CODEX_SNAPSHOT_FILE" "$CODEX_QUOTA_NORMALIZED_FILE"
+  cp -p "$PI_CODEX_SNAPSHOT_FILE" "$output"
 }
 
-use_pi_or_saved_antigravity_fallback() {
+use_pi_snapshot_antigravity() {
+  local output="$1"
   local normalized="$LAST_TEMP_DIR/antigravity-pi-normalized.json"
   if normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$normalized"; then
-    cp -p "$normalized" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
-    ANTIGRAVITY_QUOTA_IS_FRESH=1
+    cp -p "$normalized" "$output"
     return 0
   fi
   [[ -s "$PI_ANTIGRAVITY_SNAPSHOT_FILE" ]] || return 1
-  cp -p "$PI_ANTIGRAVITY_SNAPSHOT_FILE" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  cp -p "$PI_ANTIGRAVITY_SNAPSHOT_FILE" "$output"
+}
+
+use_pi_or_saved_codex_fallback() {
+  use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"
+}
+
+use_pi_or_saved_antigravity_fallback() {
+  use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
 }
 
 collect_effective_quotas() {
   prepare_quota_probe
-  if fetch_codexbar_codex_quota; then
+
+  # Codex 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
+  if fetch_native_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
     CODEX_QUOTA_IS_FRESH=1
+  elif fetch_codexbar_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
+    CODEX_QUOTA_IS_FRESH=1
+  elif use_codexbar_cached_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
+    CODEX_QUOTA_IS_FRESH=0
+  elif use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
+    CODEX_QUOTA_IS_FRESH=0
   else
-    use_pi_or_saved_codex_fallback || true
+    CODEX_QUOTA_IS_FRESH=0
   fi
-  if fetch_codexbar_antigravity_quota; then
+
+  # Antigravity 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
+  if fetch_native_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
     ANTIGRAVITY_QUOTA_IS_FRESH=1
+  elif fetch_codexbar_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+    ANTIGRAVITY_QUOTA_IS_FRESH=1
+  elif use_codexbar_cached_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+    ANTIGRAVITY_QUOTA_IS_FRESH=0
+  elif use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+    ANTIGRAVITY_QUOTA_IS_FRESH=0
   else
-    use_pi_or_saved_antigravity_fallback || true
+    ANTIGRAVITY_QUOTA_IS_FRESH=0
   fi
 }
 
@@ -1090,8 +1344,8 @@ status() {
   feishu_ready || die "Feishu enterprise-app credentials are not configured"
   print -r -- "ready"
   print -r -- "channel: feishu enterprise app"
-  if [[ -x "$CODEXBAR_BIN" ]]; then
-    print -r -- "quota primary: CodexBar (Codex CLI / Antigravity agy)"
+  if [[ -x "$CODEX_BIN" ]] || [[ -x "$CODEXBAR_BIN" ]]; then
+    print -r -- "quota primary: Native Direct (Codex app-server / Antigravity agy) · CodexBar fallback"
   else
     print -r -- "quota primary: unavailable; last Pi snapshots may be used"
   fi

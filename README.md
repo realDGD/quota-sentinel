@@ -126,11 +126,36 @@ an Authorization header supplied to curl over stdin.
 - `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
 - `wait`: Precise sleep timer waking at the earliest due deadline (`min(codex, antigravity)`).
 
+## Quota Acquisition Hierarchy & Freshness Model
+
+The quota acquisition pipeline strictly follows a 4-tier hierarchy for both providers:
+
+```text
+① Native Direct (FRESH)
+   Codex: codex app-server JSON-RPC (account/rateLimits/read)
+   Antigravity: agy localhost HTTPS (RetrieveUserQuotaSummary)
+   ↓ (fail)
+② CodexBar Live (FRESH)
+   codexbar usage --provider <codex|antigravity> --source cli
+   (On success: updates local CodexBar cache snapshot)
+   ↓ (fail)
+③ CodexBar Cached (STALE / DISPLAY ONLY)
+   codexbar-<provider>-last-success.json
+   (Tagged as "CodexBar · cached（可能不是最新）", NEVER alters scheduler deadline)
+   ↓ (fail)
+④ Pi Snapshot (STALE / DISPLAY ONLY)
+   pi-<provider>-quota.json
+   (Tagged as "Pi 快照（可能不是最新）", NEVER alters scheduler deadline)
+```
+
+- **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ② (CodexBar Live) are marked as `FRESH` and eligible to calibrate `next_due_at = reset_at + 5h01m`. Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
+- **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
+
 ## Dynamic Reset Calibration & Fallback Scheduling
 
 - **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, and `last_task_at`.
 - **Dynamic Calibration from Quota Probes**:
-  - Every 15 minutes, the watchdog probes quota via CodexBar/agy.
+  - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
   - When fresh valid `reset_at` is obtained: `next_due_at` is immediately calibrated to `reset_at + 5h01m`.
   - When probe fails or returns stale snapshot: `next_due_at` is **preserved unchanged** without shifting or drifting forward.
 - **Graceful Fallback & Degradation**:

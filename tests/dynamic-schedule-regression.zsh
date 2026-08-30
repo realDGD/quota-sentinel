@@ -69,14 +69,14 @@ collect_effective_quotas() {
   CODEX_QUOTA_IS_FRESH="$MOCK_CODEX_FRESH"
   ANTIGRAVITY_QUOTA_IS_FRESH="$MOCK_ANTIGRAVITY_FRESH"
   if (( MOCK_CODEX_FRESH == 1 )); then
-    print -r -- '{"source":"CodexBar · codex-cli","fiveHour":{"remainingPercent":80,"resetAt":'$MOCK_CODEX_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_CODEX_RESET + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+    print -r -- '{"source":"Native · codex app-server","fresh":true,"fiveHour":{"remainingPercent":80,"resetAt":'$MOCK_CODEX_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_CODEX_RESET + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
   else
-    print -r -- '{"source":"Pi 响应头快照","fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_CODEX_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_CODEX_RESET + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+    print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_CODEX_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_CODEX_RESET + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
   fi
   if (( MOCK_ANTIGRAVITY_FRESH == 1 )); then
-    print -r -- '{"source":"CodexBar · cli","fiveHour":{"remainingPercent":95,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+    print -r -- '{"source":"Native · agy local service","fresh":true,"fiveHour":{"remainingPercent":95,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
   else
-    print -r -- '{"source":"Pi Antigravity API 快照","fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+    print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
   fi
 }
 
@@ -322,5 +322,66 @@ print -r -- "100000:200000" >"$QUOTA_SENTINEL_STATE_DIR/last-triggered-window"
 [[ "$(read_provider_last_known_reset antigravity)" == "200000" ]]
 print -r -- "Case 13 (Legacy state migration preserved seamlessly): passed"
 
+# -------------------------------------------------------------
+# Case 14: 4-tier Fallback Hierarchy & Cache saving
+# -------------------------------------------------------------
+fixture_out="$TEST_TEMP_DIR/codex-cached-test.json"
+print -r -- '{"provider":"codex","source":"CodexBar · codex-cli","fresh":true,"capturedAt":1788000000,"fiveHour":{"remainingPercent":70,"resetAt":1788050000},"weekly":{"remainingPercent":80,"resetAt":1788650000}}' >"$CODEXBAR_CODEX_CACHE_FILE"
+
+use_codexbar_cached_codex "$fixture_out"
+[[ "$(jq -r '.source' "$fixture_out")" == "CodexBar · cached（可能不是最新）" ]]
+[[ "$(jq -r '.fresh' "$fixture_out")" == "false" ]]
+[[ "$(jq -r '.fiveHour.remainingPercent' "$fixture_out")" == "70" ]]
+print -r -- "Case 14 (CodexBar cache tier properly tagged and stale): passed"
+
+# -------------------------------------------------------------
+# Case 15: CodexBar cache never calibrates scheduler deadline
+# -------------------------------------------------------------
+target_future_due=$(( base_now + 10000 ))
+write_provider_next_due "codex" "$target_future_due"
+# Mock collect_effective_quotas returning stale cache with new reset
+collect_effective_quotas() {
+  ensure_temp_dir
+  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":70,"resetAt":'$(( base_now + 1000 ))'},"weekly":{"remainingPercent":80,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":70,"resetAt":'$(( base_now + 1000 ))'},"weekly":{"remainingPercent":80,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+}
+check_schedule
+if (( $(read_provider_next_due codex) != target_future_due )); then
+  print -u2 -r -- "Case 15 failed: Stale CodexBar cache calibrated deadline!"
+  exit 1
+fi
+print -r -- "Case 15 (CodexBar cache does not calibrate deadline): passed"
+
+# -------------------------------------------------------------
+# Case 16: Pi Snapshot fallback never calibrates scheduler deadline
+# -------------------------------------------------------------
+target_future_due_anti=$(( base_now + 12000 ))
+write_provider_next_due "antigravity" "$target_future_due_anti"
+collect_effective_quotas() {
+  ensure_temp_dir
+  print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$(( base_now + 2000 ))'},"weekly":{"remainingPercent":50,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$(( base_now + 2000 ))'},"weekly":{"remainingPercent":50,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+}
+check_schedule
+if (( $(read_provider_next_due antigravity) != target_future_due_anti )); then
+  print -u2 -r -- "Case 16 failed: Pi snapshot calibrated deadline!"
+  exit 1
+fi
+print -r -- "Case 16 (Pi snapshot does not calibrate deadline): passed"
+
+# -------------------------------------------------------------
+# Case 17: /usage source labels with mixed fresh / stale levels
+# -------------------------------------------------------------
+collect_effective_quotas() {
+  ensure_temp_dir
+  print -r -- '{"source":"Native · codex app-server","fresh":true,"fiveHour":{"remainingPercent":80,"resetAt":'$(( base_now + 3600 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":60,"resetAt":'$(( base_now + 1800 ))'},"weekly":{"remainingPercent":70,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+}
+CAPTURED_USAGE_MSG=""
+send_usage_notification
+[[ "$CAPTURED_USAGE_MSG" == *"↳ 来源　Native · codex app-server"* ]]
+[[ "$CAPTURED_USAGE_MSG" == *"↳ 来源　CodexBar · cached（可能不是最新）"* ]]
+print -r -- "Case 17 (/usage source labels with mixed fresh/stale tiers): passed"
+
 cleanup
-print -r -- "dynamic schedule regression: all 13 cases passed"
+print -r -- "dynamic schedule regression: all 17 cases passed"
