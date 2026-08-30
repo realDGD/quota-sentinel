@@ -9,67 +9,34 @@ source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
 trap cleanup EXIT
 
-is_due 100
-write_next_due 200
+write_provider_next_due codex 300
+write_provider_next_due antigravity 200
 [[ "$(read_next_due)" == "200" ]]
-[[ "$(stat -f '%Lp' "$(provider_next_due_file "codex")")" == "600" ]]
-[[ "$(stat -f '%Lp' "$(provider_next_due_file "antigravity")")" == "600" ]]
+[[ "$(read_provider_next_due codex)" == "300" ]]
+[[ "$(read_provider_next_due antigravity)" == "200" ]]
+[[ "$(stat -f '%Lp' "$(provider_next_due_file codex)")" == "600" ]]
+[[ "$(stat -f '%Lp' "$(provider_next_due_file antigravity)")" == "600" ]]
 
-if is_due 199; then
-  print -u2 -r -- "schedule regression: future timestamp was treated as due"
-  exit 1
-fi
-is_due 200
-is_due 201
-
-schedule_next_after_run 201
-[[ "$(read_next_due)" == "18261" ]]
-(( $(read_next_due) - 201 == RUN_INTERVAL_SECONDS ))
-
-schedule_next_after_run 18261
-[[ "$(read_next_due)" == "36321" ]]
-(( $(read_next_due) - 18261 == RUN_INTERVAL_SECONDS ))
+write_provider_last_task codex 1000
+[[ "$(provider_fallback_due codex 9999)" == "$(( 1000 + RUN_INTERVAL_SECONDS ))" ]]
+[[ "$(provider_fallback_due antigravity 9999)" == "9999" ]]
 
 acquire_run_lock
 (( RUN_LOCK_HELD == 1 ))
 [[ -f "$RUN_LOCK_FILE" ]]
 [[ "$(stat -f '%Lp' "$RUN_LOCK_FILE")" == "600" ]]
+if "$SHLOCK_BIN" -p "$$" -f "$RUN_LOCK_FILE"; then
+  print -u2 -r -- "schedule regression: duplicate run lock was acquired"
+  exit 1
+fi
 release_run_lock
 [[ ! -e "$RUN_LOCK_FILE" ]]
 
-typeset -gi RUN_COUNT=0
-run_selected_providers() {
-  (( RUN_COUNT += 1 ))
-  local now
-  now="$(/bin/date '+%s')"
-  RUN_STARTED_AT="$now"
-  for p in "$@"; do
-    write_provider_last_task "$p" "$now"
-    write_provider_last_window "$p" "$(( now + 17900 ))"
-    write_provider_next_due "$p" $(( now + RUN_INTERVAL_SECONDS ))
-  done
-}
+acquire_quota_lock
+(( QUOTA_LOCK_HELD == 1 ))
+[[ -f "$QUOTA_LOCK_FILE" ]]
+release_quota_lock
+[[ ! -e "$QUOTA_LOCK_FILE" ]]
 
-collect_effective_quotas() {
-  ensure_temp_dir
-  CODEX_QUOTA_IS_FRESH=0
-  ANTIGRAVITY_QUOTA_IS_FRESH=0
-  local now
-  now="$(/bin/date '+%s')"
-  print -r -- '{"source":"Pi 快照","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"source":"Pi 快照","fiveHour":{"remainingPercent":90,"resetAt":'$(( now + 17900 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
-}
-
-before_check="$(/bin/date '+%s')"
-write_next_due $(( before_check - 1 ))
-check_schedule
-after_check="$(/bin/date '+%s')"
-scheduled_due="$(read_next_due)"
-(( RUN_COUNT == 1 ))
-(( scheduled_due >= before_check + RUN_INTERVAL_SECONDS ))
-(( scheduled_due <= after_check + RUN_INTERVAL_SECONDS ))
-
-check_schedule
-(( RUN_COUNT == 1 ))
-
+cleanup
 print -r -- "schedule regression: ok"

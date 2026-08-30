@@ -7,10 +7,13 @@
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import lark_oapi as lark
 
@@ -24,7 +27,9 @@ logger = logging.getLogger("feishu_listener")
 KEYCHAIN_ACCOUNT = "quota-sentinel"
 APP_ID_SERVICE = "com.example.quota-sentinel.feishu-app-id"
 APP_SECRET_SERVICE = "com.example.quota-sentinel.feishu-app-secret"
+USER_ID_SERVICE = "com.example.quota-sentinel.feishu-user-id"
 SCRIPT_PATH = "/Users/__USER__/code/quota-sentinel/quota-sentinel.sh"
+AUTHORIZED_USER_ID: str | None = None
 
 
 def read_keychain(service: str) -> str:
@@ -60,6 +65,15 @@ def get_credentials() -> tuple[str, str]:
     return app_id, app_secret
 
 
+def get_authorized_user_id() -> str:
+    global AUTHORIZED_USER_ID
+    if AUTHORIZED_USER_ID is None:
+        AUTHORIZED_USER_ID = os.environ.get("FEISHU_USER_ID") or read_keychain(
+            USER_ID_SERVICE
+        )
+    return AUTHORIZED_USER_ID
+
+
 class LRUCache:
     def __init__(self, maxsize: int = 1000, ttl_seconds: float = 3600):
         self.maxsize = maxsize
@@ -76,35 +90,89 @@ class LRUCache:
             self.cache.popitem(last=False)
         return True
 
+    def contains(self, key: str) -> bool:
+        now = time.time()
+        self.cleanup(now)
+        return key in self.cache
+
     def cleanup(self, now: float) -> None:
         while self.cache and now - next(iter(self.cache.values())) > self.ttl:
             self.cache.popitem(last=False)
 
 
 dedup_cache = LRUCache()
+command_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-usage")
+command_slot = threading.BoundedSemaphore(1)
+
+
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def handle_usage_command(sender_id: str, message_id: str) -> None:
     logger.info(
         f"Triggering usage query for sender {sender_id} (message_id={message_id})"
     )
+    process: subprocess.Popen[str] | None = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["/bin/zsh", SCRIPT_PATH, "usage"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=45,
+            start_new_session=True,
         )
-        if result.returncode == 0:
+        _stdout, stderr = process.communicate(timeout=60)
+        if process.returncode == 0:
             logger.info(
                 f"Successfully sent /usage notification for message_id={message_id}"
             )
         else:
             logger.error(
-                f"Usage command returned {result.returncode}: {result.stderr.strip()}"
+                f"Usage command returned {process.returncode}: {stderr.strip()}"
             )
+    except subprocess.TimeoutExpired:
+        logger.error(f"Usage command timed out for message_id={message_id}")
     except Exception as e:
         logger.error(f"Error executing usage command: {e}")
+    finally:
+        if process is not None:
+            terminate_process_group(process)
+
+
+def submit_usage_command(sender_id: str, message_id: str) -> bool:
+    # The Feishu SDK invokes handlers on its asyncio receive loop. Running the
+    # shell synchronously there would block ACKs and WebSocket heartbeats.
+    if not command_slot.acquire(blocking=False):
+        # Only the configured recipient can reach this path, and all results go
+        # to that same private chat. Let the in-flight result satisfy repeated
+        # commands instead of queueing duplicate quota probes.
+        logger.info("Coalescing /usage with the query already in progress")
+        return True
+    try:
+        future: Future[None] = command_executor.submit(
+            handle_usage_command, sender_id, message_id
+        )
+    except Exception:
+        command_slot.release()
+        raise
+    future.add_done_callback(lambda _future: command_slot.release())
+    return True
 
 
 def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
@@ -124,9 +192,12 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
             logger.debug(f"Ignoring message from non-user sender_type: {sender_type}")
             return
 
-        message_id = getattr(message, "message_id", "")
-        if message_id and not dedup_cache.add(message_id):
-            logger.debug(f"Ignoring duplicate message_id: {message_id}")
+        sender_id_obj = getattr(sender, "sender_id", None)
+        sender_id = getattr(sender_id_obj, "user_id", "")
+        if not sender_id or sender_id != get_authorized_user_id():
+            logger.warning(
+                f"Ignoring command from unauthorized user {sender_id or 'unknown'}"
+            )
             return
 
         # 2. Check message type and content
@@ -146,10 +217,13 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
 
         # Check for /usage command (case-insensitive)
         if text.lower() == "/usage":
-            sender_id_obj = getattr(sender, "sender_id", None)
-            sender_id = getattr(sender_id_obj, "user_id", "") or "unknown"
+            message_id = getattr(message, "message_id", "")
+            if message_id and dedup_cache.contains(message_id):
+                logger.debug(f"Ignoring duplicate message_id: {message_id}")
+                return
             logger.info(f"Received /usage command from user {sender_id}")
-            handle_usage_command(sender_id, message_id)
+            if submit_usage_command(sender_id, message_id) and message_id:
+                dedup_cache.add(message_id)
         else:
             logger.debug(f"Ignored non-usage text command: {text}")
 
@@ -160,6 +234,9 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
 def main() -> None:
     logger.info("Starting Feishu WebSocket listener...")
     app_id, app_secret = get_credentials()
+    if not get_authorized_user_id():
+        logger.critical("Authorized Feishu user ID is missing!")
+        sys.exit(1)
 
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")
@@ -171,7 +248,10 @@ def main() -> None:
         app_id=app_id,
         app_secret=app_secret,
         event_handler=event_handler,
-        log_level=lark.LogLevel.INFO,
+        # The SDK INFO message prints its WebSocket URL, including ephemeral
+        # access_key/ticket query parameters. Keep SDK output at ERROR while
+        # retaining our own command lifecycle logs above.
+        log_level=lark.LogLevel.ERROR,
         auto_reconnect=True,
     )
 

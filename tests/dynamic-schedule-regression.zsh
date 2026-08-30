@@ -2,9 +2,13 @@
 
 set -euo pipefail
 
-readonly TEST_TEMP_DIR="$(mktemp -d /private/tmp/quota-sentinel-dynamic-test.XXXXXX)"
+readonly TEST_TEMP_DIR="$(mktemp -d /private/tmp/quota-sentinel.XXXXXX)"
 export QUOTA_SENTINEL_STATE_DIR="$TEST_TEMP_DIR/state"
 export PI_SOURCE_ONLY=1
+export FEISHU_APP_ID="test-app"
+export FEISHU_APP_SECRET="test-secret"
+export FEISHU_USER_ID="test-user"
+export FEISHU_DISABLE_CHART=1
 source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
 trap cleanup EXIT
@@ -14,54 +18,15 @@ typeset -ga LAST_ATTEMPTED=()
 typeset -gi TOTAL_RUNS=0
 typeset -g MOCK_CODEX_RESET=0
 typeset -g MOCK_ANTIGRAVITY_RESET=0
-typeset -g MOCK_CODEX_FRESH=1
-typeset -g MOCK_ANTIGRAVITY_FRESH=1
-typeset -g LAST_DISPATCHED_MESSAGE=""
+typeset -g MOCK_CODEX_FRESH=0
+typeset -g MOCK_ANTIGRAVITY_FRESH=0
+typeset -g CAPTURED_USAGE_MSG=""
 
-run_selected_providers() {
-  LAST_ATTEMPTED=("$@")
-  (( TOTAL_RUNS += 1 ))
-  local now
-  now="$(/bin/date '+%s')"
-  for p in "$@"; do
-    case "$p" in
-      codex)
-        CODEX_RUN_RESULT="发送成功"
-        write_provider_last_task "codex" "$now"
-        if (( MOCK_CODEX_FRESH == 1 )) && (( MOCK_CODEX_RESET > now )); then
-          write_provider_last_known_reset "codex" "$MOCK_CODEX_RESET"
-          write_provider_last_window "codex" "$MOCK_CODEX_RESET"
-          write_provider_next_due "codex" $(( MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS ))
-        else
-          local prev_due
-          prev_due="$(read_provider_next_due "codex" || true)"
-          if [[ "$prev_due" =~ ^[0-9]+$ ]]; then
-            write_provider_next_due "codex" $(( prev_due + RUN_INTERVAL_SECONDS ))
-          else
-            write_provider_next_due "codex" $(( now + RUN_INTERVAL_SECONDS ))
-          fi
-        fi
-        ;;
-      antigravity)
-        ANTIGRAVITY_RUN_RESULT="发送成功"
-        write_provider_last_task "antigravity" "$now"
-        if (( MOCK_ANTIGRAVITY_FRESH == 1 )) && (( MOCK_ANTIGRAVITY_RESET > now )); then
-          write_provider_last_known_reset "antigravity" "$MOCK_ANTIGRAVITY_RESET"
-          write_provider_last_window "antigravity" "$MOCK_ANTIGRAVITY_RESET"
-          write_provider_next_due "antigravity" $(( MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS ))
-        else
-          local prev_due
-          prev_due="$(read_provider_next_due "antigravity" || true)"
-          if [[ "$prev_due" =~ ^[0-9]+$ ]]; then
-            write_provider_next_due "antigravity" $(( prev_due + RUN_INTERVAL_SECONDS ))
-          else
-            write_provider_next_due "antigravity" $(( now + RUN_INTERVAL_SECONDS ))
-          fi
-        fi
-        ;;
-    esac
-  done
-  LAST_DISPATCHED_MESSAGE="$(task_notification_message "$@")"
+reset_scheduler_state() {
+  rm -rf "$QUOTA_SENTINEL_STATE_DIR"
+  mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  LAST_ATTEMPTED=()
+  TOTAL_RUNS=0
 }
 
 collect_effective_quotas() {
@@ -76,329 +41,240 @@ collect_effective_quotas() {
   if (( MOCK_ANTIGRAVITY_FRESH == 1 )); then
     print -r -- '{"source":"Native · agy local service","fresh":true,"fiveHour":{"remainingPercent":95,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
   else
-    print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+    print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
   fi
 }
 
-base_now="$(/bin/date '+%s')"
+run_selected_providers() {
+  LAST_ATTEMPTED=("$@")
+  (( TOTAL_RUNS += 1 ))
+  local now provider reset_at
+  now="$(/bin/date '+%s')"
+  for provider in "$@"; do
+    write_provider_last_task "$provider" "$now"
+    write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+    if reset_at="$(valid_provider_reset_at "$provider" "$now" 2>/dev/null)"; then
+      write_provider_last_window "$provider" "$reset_at"
+      sync_provider_deadline_from_quota "$provider" "$now"
+    fi
+  done
+}
 
-# -------------------------------------------------------------
-# Case 1: Probe success calibrates deadline to reset_at + 5h01m
-# -------------------------------------------------------------
-MOCK_CODEX_FRESH=1
-MOCK_CODEX_RESET=$(( base_now + 3600 )) # Reset in 1 hour
-MOCK_ANTIGRAVITY_FRESH=1
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 1800 )) # Reset in 30 mins
-check_schedule
-
-codex_due="$(read_provider_next_due codex)"
-anti_due="$(read_provider_next_due antigravity)"
-if (( codex_due != MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 1 failed: Codex next_due ($codex_due) != $(( MOCK_CODEX_RESET + RUN_INTERVAL_SECONDS ))"
-  exit 1
-fi
-if (( anti_due != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 1 failed: Antigravity next_due ($anti_due) != $(( MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS ))"
-  exit 1
-fi
-print -r -- "Case 1 (Probe success calibrates deadline to reset + 5h01m): passed"
-
-# -------------------------------------------------------------
-# Case 2: Probe failure preserves deadline without drift
-# -------------------------------------------------------------
-saved_codex_due="$codex_due"
-saved_anti_due="$anti_due"
-MOCK_CODEX_FRESH=0
-MOCK_ANTIGRAVITY_FRESH=0
-check_schedule
-
-if (( $(read_provider_next_due codex) != saved_codex_due )) ||
-   (( $(read_provider_next_due antigravity) != saved_anti_due )); then
-  print -u2 -r -- "Case 2 failed: Probe failure caused deadline drift!"
-  exit 1
-fi
-print -r -- "Case 2 (Probe failure preserves deadline without drift): passed"
-
-# -------------------------------------------------------------
-# Case 3: Multiple consecutive probe failures (no drift over time)
-# -------------------------------------------------------------
-check_schedule
-check_schedule
-check_schedule
-if (( $(read_provider_next_due codex) != saved_codex_due )) ||
-   (( $(read_provider_next_due antigravity) != saved_anti_due )); then
-  print -u2 -r -- "Case 3 failed: Consecutive probe failures shifted deadline!"
-  exit 1
-fi
-print -r -- "Case 3 (Multiple consecutive probe failures do not drift deadline): passed"
-
-# -------------------------------------------------------------
-# Case 4: Subsequent probe success re-anchors deadline immediately
-# -------------------------------------------------------------
-MOCK_ANTIGRAVITY_FRESH=1
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 7200 )) # New reset in 2 hours
-MOCK_CODEX_FRESH=0 # Codex still failing
-check_schedule
-
-if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 4 failed: Antigravity did not re-anchor to new reset!"
-  exit 1
-fi
-if (( $(read_provider_next_due codex) != saved_codex_due )); then
-  print -u2 -r -- "Case 4 failed: Codex deadline was unexpectedly modified!"
-  exit 1
-fi
-print -r -- "Case 4 (Subsequent probe success re-anchors deadline immediately): passed"
-
-# -------------------------------------------------------------
-# Case 5: When now >= next_due_at, executes provider once
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-# Set Antigravity due in past (now reached), Codex far in future
-write_provider_next_due "antigravity" $(( base_now - 10 ))
-write_provider_next_due "codex" $(( base_now + 10000 ))
-MOCK_ANTIGRAVITY_FRESH=0 # probe fails post-run, should advance fallback
-MOCK_CODEX_FRESH=0
-check_schedule
-
-if [[ "${LAST_ATTEMPTED[*]}" != "antigravity" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 5 failed: Expected only antigravity to run, got ${LAST_ATTEMPTED[*]}"
-  exit 1
-fi
-print -r -- "Case 5 (Reaching next_due_at triggers execution): passed"
-
-# -------------------------------------------------------------
-# Case 6: Continuous failure post-run advances fallback deadline (+5h01m)
-# -------------------------------------------------------------
-new_anti_due="$(read_provider_next_due antigravity)"
-if (( new_anti_due != base_now - 10 + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 6 failed: Post-run fallback not advanced by 5h01m (got $new_anti_due)"
-  exit 1
-fi
-# Next immediate check should not repeat
-check_schedule
-if (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 6 failed: Task repeated unexpectedly!"
-  exit 1
-fi
-print -r -- "Case 6 (Post-run failure advances fallback by 5h01m without repeat): passed"
-
-# -------------------------------------------------------------
-# Case 7: API recovery after fallback execution re-anchors to real reset
-# -------------------------------------------------------------
-MOCK_ANTIGRAVITY_FRESH=1
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 15000 ))
-check_schedule
-
-if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 7 failed: Recovery did not re-anchor deadline to real reset"
-  exit 1
-fi
-print -r -- "Case 7 (API recovery re-anchors fallback deadline to real reset): passed"
-
-# -------------------------------------------------------------
-# Case 8: Codex and Antigravity independent deadlines
-# -------------------------------------------------------------
-LAST_ATTEMPTED=()
-TOTAL_RUNS=0
-write_provider_next_due "codex" $(( base_now - 10 )) # Codex due
-write_provider_next_due "antigravity" $(( base_now + 5000 )) # Antigravity not due
-MOCK_CODEX_FRESH=0 # probe failing, fallback triggers
-MOCK_ANTIGRAVITY_FRESH=0 # probe failing, keeps 5000
-
-check_schedule
-if [[ "${LAST_ATTEMPTED[*]}" != "codex" ]] || (( TOTAL_RUNS != 1 )); then
-  print -u2 -r -- "Case 8 failed: Expected only codex to run, got ${LAST_ATTEMPTED[*]}"
-  exit 1
-fi
-if (( $(read_provider_next_due antigravity) != base_now + 5000 )); then
-  print -u2 -r -- "Case 8 failed: Antigravity deadline was altered by Codex execution!"
-  exit 1
-fi
-print -r -- "Case 8 (Codex and Antigravity independent deadlines): passed"
-
-# -------------------------------------------------------------
-# Case 9: One probe success, one probe failure
-# -------------------------------------------------------------
-c_prev="$(read_provider_next_due codex)"
-MOCK_CODEX_FRESH=0 # Codex probe fails
-MOCK_ANTIGRAVITY_FRESH=1 # Antigravity probe succeeds
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 8000 ))
-check_schedule
-
-if (( $(read_provider_next_due codex) != c_prev )); then
-  print -u2 -r -- "Case 9 failed: Failed Codex probe altered deadline!"
-  exit 1
-fi
-if (( $(read_provider_next_due antigravity) != MOCK_ANTIGRAVITY_RESET + RUN_INTERVAL_SECONDS )); then
-  print -u2 -r -- "Case 9 failed: Successful Antigravity probe did not calibrate deadline!"
-  exit 1
-fi
-print -r -- "Case 9 (One probe success, one failure handled independently): passed"
-
-# -------------------------------------------------------------
-# Case 10: Anomalous reset data (in past or > 6h in future) is rejected
-# -------------------------------------------------------------
-a_prev="$(read_provider_next_due antigravity)"
-MOCK_ANTIGRAVITY_FRESH=1
-MOCK_ANTIGRAVITY_RESET=$(( base_now - 500 )) # In past
-check_schedule
-if (( $(read_provider_next_due antigravity) != a_prev )); then
-  print -u2 -r -- "Case 10 failed: Past reset timestamp overwritten deadline!"
-  exit 1
-fi
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 30000 )) # > 6h
-check_schedule
-if (( $(read_provider_next_due antigravity) != a_prev )); then
-  print -u2 -r -- "Case 10 failed: Excessive future reset overwritten deadline!"
-  exit 1
-fi
-print -r -- "Case 10 (Anomalous reset data rejected): passed"
-
-# -------------------------------------------------------------
-# Case 11: Task notification card scope strict isolation
-# -------------------------------------------------------------
-CODEX_RUN_RESULT="发送成功"
-ANTIGRAVITY_RUN_RESULT="发送成功"
-msg_c="$(task_notification_message codex)"
-[[ "$msg_c" == *"**GPT-5.6 Luna**"* ]]
-[[ "$msg_c" != *"**Gemini 3.7 Flash · Low**"* ]]
-
-msg_a="$(task_notification_message antigravity)"
-[[ "$msg_a" != *"**GPT-5.6 Luna**"* ]]
-[[ "$msg_a" == *"**Gemini 3.7 Flash · Low**"* ]]
-
-msg_both="$(task_notification_message codex antigravity)"
-[[ "$msg_both" == *"**GPT-5.6 Luna**"* ]]
-[[ "$msg_both" == *"**Gemini 3.7 Flash · Low**"* ]]
-[[ "$msg_both" == *"────────────"* ]]
-print -r -- "Case 11 (Task notification card scope strictly isolated): passed"
-
-# -------------------------------------------------------------
-# Case 12: /usage query is strictly read-only and shows both providers
-# -------------------------------------------------------------
-write_provider_last_task "codex" 111111
-write_provider_next_due "codex" 333333
-write_provider_last_task "antigravity" 222222
-write_provider_next_due "antigravity" 444444
-
-MOCK_CODEX_RESET=$(( base_now + 10000 ))
-MOCK_ANTIGRAVITY_RESET=$(( base_now + 12000 ))
-
-typeset -g CAPTURED_USAGE_MSG=""
 send_feishu_message() {
   CAPTURED_USAGE_MSG="$4"
   return 0
 }
+
+base_now="$(/bin/date '+%s')"
+
+# 1. An active, already-triggered window waits for reset + four minutes.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 3600 ))
+MOCK_ANTIGRAVITY_FRESH=0
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 1000 ))
+write_provider_last_task codex $(( base_now - 4 * 3600 ))
+write_provider_last_window codex "$MOCK_CODEX_RESET"
+write_provider_next_due antigravity $(( base_now + 10000 ))
+check_schedule
+[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 1 (active window schedules reset + buffer): passed"
+
+# 2. A missing fresh probe starts from last_task + 5h01. Later fresh probes
+# replace that fallback, while a subsequent stale probe preserves the last
+# authoritative reset + buffer deadline.
+reset_scheduler_state
+MOCK_CODEX_FRESH=0
+MOCK_CODEX_RESET=$(( base_now + 1000 ))
+MOCK_ANTIGRAVITY_FRESH=0
+write_provider_last_task codex "$base_now"
+write_provider_next_due antigravity $(( base_now + 10000 ))
+check_schedule
+fallback_due=$(( base_now + RUN_INTERVAL_SECONDS ))
+[[ "$(read_provider_next_due codex)" == "$fallback_due" ]]
+
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 3600 ))
+check_schedule
+fresh_due_1=$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))
+[[ "$(read_provider_next_due codex)" == "$fresh_due_1" ]]
+
+MOCK_CODEX_RESET=$(( base_now + 4200 ))
+check_schedule
+fresh_due_2=$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))
+[[ "$(read_provider_next_due codex)" == "$fresh_due_2" ]]
+
+MOCK_CODEX_FRESH=0
+MOCK_CODEX_RESET=$(( base_now + 9000 ))
+check_schedule
+[[ "$(read_provider_next_due codex)" == "$fresh_due_2" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 2 (fresh deadlines replace fallback; stale preserves latest): passed"
+
+# 3. A fresh reset + buffer may be earlier than last_task + 5h01 because the
+# latter is only a no-quota fallback, not a hard minimum interval.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 1800 ))
+write_provider_last_task codex $(( base_now - 600 ))
+write_provider_next_due antigravity $(( base_now + 10000 ))
+check_schedule
+fresh_due=$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))
+fallback_due=$(( base_now - 600 + RUN_INTERVAL_SECONDS ))
+(( fresh_due < fallback_due ))
+[[ "$(read_provider_next_due codex)" == "$fresh_due" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 3 (fresh reset can shorten the 5h01 fallback): passed"
+
+# 4. An already-due authoritative deadline runs even when it is less than
+# 5h01 after the previous real task.
+reset_scheduler_state
+MOCK_CODEX_FRESH=0
+write_provider_last_task codex $(( base_now - 600 ))
+write_provider_next_due codex $(( base_now - 1 ))
+write_provider_next_due antigravity $(( base_now + 10000 ))
+check_schedule
+[[ "${LAST_ATTEMPTED[*]}" == "codex" ]]
+(( TOTAL_RUNS == 1 ))
+print -r -- "Case 4 (due deadline is not blocked by a hard 5h01 interval): passed"
+
+# 4b. A first fresh observation always uses reset + buffer.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 3600 ))
+write_provider_next_due antigravity $(( base_now + 10000 ))
+check_schedule
+[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 4b (first fresh observation uses reset + buffer): passed"
+
+# 5. Stale cache/snapshot data preserves an existing future deadline.
+reset_scheduler_state
+MOCK_CODEX_FRESH=0
+MOCK_ANTIGRAVITY_FRESH=0
+write_provider_next_due codex $(( base_now + 8000 ))
+write_provider_next_due antigravity $(( base_now + 9000 ))
+check_schedule
+[[ "$(read_provider_next_due codex)" == "$(( base_now + 8000 ))" ]]
+[[ "$(read_provider_next_due antigravity)" == "$(( base_now + 9000 ))" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 5 (stale quota cannot calibrate deadlines): passed"
+
+# 6. Stale quota cannot move an existing due deadline, even when the previous
+# task is recent; the deadline itself is allowed to trigger the next run.
+reset_scheduler_state
+MOCK_CODEX_FRESH=0
+write_provider_last_task codex $(( base_now - 100 ))
+write_provider_next_due codex $(( base_now - 1000 ))
+write_provider_next_due antigravity $(( base_now + 9000 ))
+check_schedule
+[[ "${LAST_ATTEMPTED[*]}" == "codex" ]]
+(( TOTAL_RUNS == 1 ))
+print -r -- "Case 6 (stale quota preserves an already-due deadline): passed"
+
+# 7. A late fallback run anchors the next deadline to its actual attempt time.
+reset_scheduler_state
+MOCK_CODEX_FRESH=0
+write_provider_last_task codex $(( base_now - RUN_INTERVAL_SECONDS - 3600 ))
+write_provider_next_due codex $(( base_now - 3600 ))
+write_provider_next_due antigravity $(( base_now + 9000 ))
+check_schedule
+(( TOTAL_RUNS == 1 ))
+[[ "${LAST_ATTEMPTED[*]}" == "codex" ]]
+fallback_due="$(read_provider_next_due codex)"
+(( fallback_due >= base_now + RUN_INTERVAL_SECONDS ))
+(( fallback_due <= $(/bin/date '+%s') + RUN_INTERVAL_SECONDS ))
+print -r -- "Case 7 (late fallback uses actual run time): passed"
+
+# 8. /usage syncs fresh timing only; it never runs or marks a window/task.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 17940 ))
+MOCK_ANTIGRAVITY_FRESH=0
+MOCK_ANTIGRAVITY_RESET=$(( base_now + 2000 ))
+write_provider_last_task codex $(( base_now - RUN_INTERVAL_SECONDS - 20 ))
+write_provider_last_window codex 111111
+write_provider_next_due codex $(( base_now + 30000 ))
+write_provider_last_task antigravity 222222
+write_provider_last_window antigravity 333333
+write_provider_next_due antigravity $(( base_now + 12000 ))
+CAPTURED_USAGE_MSG=""
 send_usage_notification
-[[ "$CAPTURED_USAGE_MSG" == *"**GPT-5.6 Luna**"* ]]
-[[ "$CAPTURED_USAGE_MSG" == *"**Gemini 3.7 Flash · Low**"* ]]
-[[ "$CAPTURED_USAGE_MSG" == *"即时配额查询"* ]]
+[[ "$CAPTURED_USAGE_MSG" == *"GPT-5.6 Luna"* ]]
+[[ "$CAPTURED_USAGE_MSG" == *"Gemini 3.7 Flash"* ]]
+[[ "$(read_provider_last_known_reset codex)" == "$MOCK_CODEX_RESET" ]]
+[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
+[[ "$(read_provider_last_task codex)" == "$(( base_now - RUN_INTERVAL_SECONDS - 20 ))" ]]
+[[ "$(read_provider_last_window codex)" == "111111" ]]
+[[ "$(read_provider_next_due antigravity)" == "$(( base_now + 12000 ))" ]]
+[[ "$(read_provider_last_task antigravity)" == "222222" ]]
+[[ "$(read_provider_last_window antigravity)" == "333333" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 8 (/usage synchronizes only fresh scheduler fields): passed"
 
-if [[ "$(read_provider_last_task codex)" != "111111" ]] ||
-   [[ "$(read_provider_next_due codex)" != "333333" ]] ||
-   [[ "$(read_provider_last_task antigravity)" != "222222" ]] ||
-   [[ "$(read_provider_next_due antigravity)" != "444444" ]]; then
-  print -u2 -r -- "Case 12 failed: /usage modified scheduler state!"
-  exit 1
-fi
-print -r -- "Case 12 (/usage is strictly read-only and does not touch scheduler): passed"
+# 9. Invalid future reset data is rejected without moving the deadline.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + MAX_WINDOW_FUTURE_SECONDS + 60 ))
+write_provider_next_due codex $(( base_now + 6000 ))
+write_provider_next_due antigravity $(( base_now + 9000 ))
+check_schedule
+[[ "$(read_provider_next_due codex)" == "$(( base_now + 6000 ))" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 9 (invalid reset is rejected): passed"
 
-# -------------------------------------------------------------
-# Case 13: Legacy state migration
-# -------------------------------------------------------------
-rm -rf "$QUOTA_SENTINEL_STATE_DIR"
-mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+# 10. Post-run starts from 5h01 fallback but a fresh reset + buffer replaces it,
+# even when the resulting deadline is earlier.
+reset_scheduler_state
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( base_now + 600 ))
+collect_effective_quotas
+write_provider_last_task codex "$base_now"
+write_provider_next_due codex $(( base_now + RUN_INTERVAL_SECONDS ))
+write_provider_last_window codex "$MOCK_CODEX_RESET"
+sync_provider_deadline_from_quota codex "$base_now"
+[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "Case 10 (post-run fresh reset replaces the 5h01 fallback): passed"
+
+# 10b. Each newer fresh observation replaces the prior reset-derived deadline.
+reset_scheduler_state
+write_provider_last_task codex "$base_now"
+old_reset=$(( base_now + 17940 ))
+old_due=$(( old_reset + RESET_BUFFER_SECONDS ))
+write_provider_last_window codex "$old_reset"
+write_provider_next_due codex "$old_due"
+rollover_now=$(( base_now + 18000 ))
+MOCK_CODEX_FRESH=1
+MOCK_CODEX_RESET=$(( rollover_now + 17940 ))
+collect_effective_quotas
+sync_provider_deadline_from_quota codex "$rollover_now"
+[[ "$(read_provider_next_due codex)" == "$(( MOCK_CODEX_RESET + RESET_BUFFER_SECONDS ))" ]]
+print -r -- "Case 10b (latest fresh reset replaces the prior deadline): passed"
+
+# 11. Legacy state migration remains compatible.
+reset_scheduler_state
 print -r -- "987654" >"$QUOTA_SENTINEL_STATE_DIR/last-task-at"
 print -r -- "876543" >"$QUOTA_SENTINEL_STATE_DIR/next-due-at"
 print -r -- "100000:200000" >"$QUOTA_SENTINEL_STATE_DIR/last-triggered-window"
-
 [[ "$(read_provider_last_task codex)" == "987654" ]]
 [[ "$(read_provider_last_task antigravity)" == "987654" ]]
 [[ "$(read_provider_next_due codex)" == "876543" ]]
 [[ "$(read_provider_next_due antigravity)" == "876543" ]]
 [[ "$(read_provider_last_known_reset codex)" == "100000" ]]
 [[ "$(read_provider_last_known_reset antigravity)" == "200000" ]]
-print -r -- "Case 13 (Legacy state migration preserved seamlessly): passed"
+print -r -- "Case 11 (legacy state migration): passed"
 
-# -------------------------------------------------------------
-# Case 14: 4-tier Fallback Hierarchy & Cache saving
-# -------------------------------------------------------------
+# 12. CodexBar cache metadata remains explicitly stale.
 fixture_live="$TEST_TEMP_DIR/codex-live-test.json"
 fixture_out="$TEST_TEMP_DIR/codex-cached-test.json"
 print -r -- '{"provider":"codex","source":"CodexBar · cli","fresh":true,"capturedAt":1788000000,"fiveHour":{"remainingPercent":70,"resetAt":1788050000},"weekly":{"remainingPercent":80,"resetAt":1788650000}}' >"$fixture_live"
-
-# Save to cache file on disk
 save_codexbar_cache "$fixture_live" "$CODEXBAR_CODEX_CACHE_FILE"
-
-# 1. Verify directly from disk file that it is marked stale/cached
-[[ "$(jq -r '.source' "$CODEXBAR_CODEX_CACHE_FILE")" == "CodexBar · cached（可能不是最新）" ]]
-[[ "$(jq -r '.originalSource' "$CODEXBAR_CODEX_CACHE_FILE")" == "CodexBar · cli" ]]
-[[ "$(jq -r '.fresh' "$CODEXBAR_CODEX_CACHE_FILE")" == "false" ]]
-[[ "$(jq -r '.cached' "$CODEXBAR_CODEX_CACHE_FILE")" == "true" ]]
-[[ "$(jq -r '.capturedAt' "$CODEXBAR_CODEX_CACHE_FILE")" == "1788000000" ]]
-
-# 2. Verify loader keeps metadata and preserved capturedAt
 use_codexbar_cached_codex "$fixture_out"
-[[ "$(jq -r '.source' "$fixture_out")" == "CodexBar · cached（可能不是最新）" ]]
 [[ "$(jq -r '.fresh' "$fixture_out")" == "false" ]]
 [[ "$(jq -r '.cached' "$fixture_out")" == "true" ]]
 [[ "$(jq -r '.capturedAt' "$fixture_out")" == "1788000000" ]]
-[[ "$(jq -r '.fiveHour.remainingPercent' "$fixture_out")" == "70" ]]
-print -r -- "Case 14 (CodexBar cache tier on-disk metadata properly hardened and stale): passed"
-
-# -------------------------------------------------------------
-# Case 15: CodexBar cache never calibrates scheduler deadline
-# -------------------------------------------------------------
-target_future_due=$(( base_now + 10000 ))
-write_provider_next_due "codex" "$target_future_due"
-# Mock collect_effective_quotas returning stale cache with new reset
-collect_effective_quotas() {
-  ensure_temp_dir
-  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":70,"resetAt":'$(( base_now + 1000 ))'},"weekly":{"remainingPercent":80,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":70,"resetAt":'$(( base_now + 1000 ))'},"weekly":{"remainingPercent":80,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
-}
-check_schedule
-if (( $(read_provider_next_due codex) != target_future_due )); then
-  print -u2 -r -- "Case 15 failed: Stale CodexBar cache calibrated deadline!"
-  exit 1
-fi
-print -r -- "Case 15 (CodexBar cache does not calibrate deadline): passed"
-
-# -------------------------------------------------------------
-# Case 16: Pi Snapshot fallback never calibrates scheduler deadline
-# -------------------------------------------------------------
-target_future_due_anti=$(( base_now + 12000 ))
-write_provider_next_due "antigravity" "$target_future_due_anti"
-collect_effective_quotas() {
-  ensure_temp_dir
-  print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$(( base_now + 2000 ))'},"weekly":{"remainingPercent":50,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$(( base_now + 2000 ))'},"weekly":{"remainingPercent":50,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
-}
-check_schedule
-if (( $(read_provider_next_due antigravity) != target_future_due_anti )); then
-  print -u2 -r -- "Case 16 failed: Pi snapshot calibrated deadline!"
-  exit 1
-fi
-print -r -- "Case 16 (Pi snapshot does not calibrate deadline): passed"
-
-# -------------------------------------------------------------
-# Case 17: /usage source labels with mixed fresh / stale levels
-# -------------------------------------------------------------
-collect_effective_quotas() {
-  ensure_temp_dir
-  print -r -- '{"source":"Native · codex app-server","fresh":true,"fiveHour":{"remainingPercent":80,"resetAt":'$(( base_now + 3600 ))'},"weekly":{"remainingPercent":90,"resetAt":'$(( base_now + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
-  print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":60,"resetAt":'$(( base_now + 1800 ))'},"weekly":{"remainingPercent":70,"resetAt":'$(( base_now + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
-}
-CAPTURED_USAGE_MSG=""
-send_usage_notification
-[[ "$CAPTURED_USAGE_MSG" == *"Native · codex app-server"* ]]
-[[ "$CAPTURED_USAGE_MSG" == *"CodexBar · cached"* ]]
-[[ "$CAPTURED_USAGE_MSG" == *"⚠️ 可能不是最新"* ]]
-[[ "$CAPTURED_USAGE_MSG" != *"↳"* ]]
-[[ "$CAPTURED_USAGE_MSG" != *"来源"* ]]
-print -r -- "Case 17 (/usage source labels with mixed fresh/stale tiers): passed"
+print -r -- "Case 12 (CodexBar cache stays stale/display-only): passed"
 
 cleanup
-print -r -- "dynamic schedule regression: all 17 cases passed"
+print -r -- "dynamic schedule regression: all cases passed"

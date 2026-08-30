@@ -31,9 +31,10 @@ readonly CODEXBAR_ANTIGRAVITY_CACHE_FILE="$STATE_DIR/codexbar-antigravity-last-s
 readonly PI_CODEX_SNAPSHOT_FILE="$STATE_DIR/pi-codex-quota.json"
 readonly PI_ANTIGRAVITY_SNAPSHOT_FILE="$STATE_DIR/pi-antigravity-quota.json"
 readonly RUN_INTERVAL_SECONDS=18060      # 5 hours 01 minute
-readonly FRESH_WINDOW_SECONDS=17700      # 4 hours 55 minutes
 readonly RESET_BUFFER_SECONDS=240        # 4 minutes after reset
 readonly MAX_WINDOW_FUTURE_SECONDS=21600 # 6 hours
+readonly QUOTA_LOCK_WAIT_SECONDS=20
+readonly TIMER_RECHECK_SECONDS=60
 
 typeset -g LAST_TEMP_DIR=""
 typeset -g CODEX_AGENT_DIR=""
@@ -52,7 +53,6 @@ typeset -g CODEX_QUOTA_IS_FRESH=0
 typeset -g ANTIGRAVITY_QUOTA_IS_FRESH=0
 typeset -g CODEX_RUN_RESULT=""
 typeset -g ANTIGRAVITY_RUN_RESULT=""
-typeset -g RUN_STARTED_AT=0
 typeset -gi RUN_LOCK_HELD=0
 typeset -gi QUOTA_LOCK_HELD=0
 
@@ -273,72 +273,6 @@ read_next_due() {
   print -r -- "$min_due"
 }
 
-write_next_due() {
-  local epoch="$1"
-  write_provider_next_due "codex" "$epoch"
-  write_provider_next_due "antigravity" "$epoch"
-}
-
-read_last_task_at() {
-  read_provider_last_task "codex"
-}
-
-write_last_task_at() {
-  local epoch="$1"
-  write_provider_last_task "codex" "$epoch"
-}
-
-read_last_triggered_window() {
-  read_provider_last_window "codex"
-}
-
-write_last_triggered_window() {
-  local window_id="$1"
-  write_provider_last_window "codex" "$window_id"
-}
-
-reserve_next_run() {
-  local now
-  now="$(/bin/date '+%s')"
-  RUN_STARTED_AT="$now"
-  schedule_next_after_run "$now"
-}
-
-schedule_next_after_run() {
-  local now="$1"
-  [[ "$now" =~ ^[0-9]+$ ]] || die "Invalid current timestamp"
-  write_next_due $(( now + RUN_INTERVAL_SECONDS ))
-}
-
-schedule_next_from_resets() {
-  local baseline="$1"
-  local due="$baseline" reset
-
-  if (( CODEX_QUOTA_IS_FRESH == 1 )); then
-    reset="$("$JQ_BIN" -r '.fiveHour.resetAt // empty' "$CODEX_QUOTA_NORMALIZED_FILE" 2>/dev/null)"
-    if [[ "$reset" =~ ^[0-9]+$ ]] && (( reset + RESET_BUFFER_SECONDS > due )); then
-      due=$(( reset + RESET_BUFFER_SECONDS ))
-    fi
-  fi
-  if (( ANTIGRAVITY_QUOTA_IS_FRESH == 1 )); then
-    reset="$("$JQ_BIN" -r '.fiveHour.resetAt // empty' "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" 2>/dev/null)"
-    if [[ "$reset" =~ ^[0-9]+$ ]] && (( reset + RESET_BUFFER_SECONDS > due )); then
-      due=$(( reset + RESET_BUFFER_SECONDS ))
-    fi
-  fi
-
-  write_next_due "$due"
-}
-
-is_due() {
-  local now="$1"
-  local next_due
-  if ! next_due="$(read_next_due)"; then
-    return 0
-  fi
-  (( now >= next_due ))
-}
-
 acquire_run_lock() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -357,6 +291,16 @@ acquire_quota_lock() {
   fi
   chmod 600 "$QUOTA_LOCK_FILE"
   QUOTA_LOCK_HELD=1
+}
+
+acquire_quota_lock_with_timeout() {
+  local deadline now
+  deadline=$(( $(/bin/date '+%s') + QUOTA_LOCK_WAIT_SECONDS ))
+  while ! acquire_quota_lock; do
+    now="$(/bin/date '+%s')"
+    (( now < deadline )) || return 1
+    "$SLEEP_BIN" 1
+  done
 }
 
 release_run_lock() {
@@ -508,7 +452,7 @@ feishu_message_payload() {
           {tag: "div", text: {tag: "lark_md", content: $text}},
           {tag: "hr"},
           {tag: "note", elements: [
-            {tag: "plain_text", content: "Pi 自动任务 · 间隔至少 5 小时 01 分"}
+            {tag: "plain_text", content: "Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底"}
           ]}
         ]
       } | tostring),
@@ -897,7 +841,7 @@ build_feishu_v2_task_payload() {
     body_elements_json="$("$JQ_BIN" -n \
       --argjson elems "$provider_elements" \
       '$elems + [
-        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底</font>" }
       ]')"
   elif (( ${#attempted[@]} >= 2 )); then
     local luna_elements gemini_elements
@@ -929,7 +873,7 @@ build_feishu_v2_task_payload() {
             }
           ]
         },
-        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+        { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底</font>" }
       ]')"
   else
     return 1
@@ -1002,7 +946,7 @@ build_feishu_v2_usage_payload() {
           }
         ]
       },
-      { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · 间隔至少 5 小时 01 分</font>" }
+      { tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底</font>" }
     ]')"
 
   "$JQ_BIN" -n \
@@ -1340,39 +1284,51 @@ fetch_native_codex_quota() {
   [[ -x "$CODEX_BIN" ]] || return 1
   require_executable "$PYTHON3_BIN"
   "$PYTHON3_BIN" -c '
-import json, subprocess, time, sys, os
+import json, os, selectors, subprocess, sys, time
 
 def get_codex_native(codex_bin):
     if not os.path.exists(codex_bin) or not os.access(codex_bin, os.X_OK):
         return None
+    proc = None
     try:
         proc = subprocess.Popen(
             [codex_bin, "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        pending = b""
+
         def send_and_wait(req_id, method, params):
-            req = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}) + "\n"
+            nonlocal pending
+            req = (json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}) + "\n").encode()
             proc.stdin.write(req)
             proc.stdin.flush()
-            t_end = time.time() + 4
-            while time.time() < t_end:
-                line = proc.stdout.readline()
-                if not line: break
-                try:
-                    data = json.loads(line)
-                    if data.get("id") == req_id: return data
-                except Exception:
-                    continue
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    try:
+                        data = json.loads(line)
+                        if data.get("id") == req_id:
+                            return data
+                    except Exception:
+                        pass
+                events = selector.select(max(0, deadline - time.monotonic()))
+                if not events:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                pending += chunk
             return None
 
         init_res = send_and_wait(1, "initialize", {"clientInfo": {"name": "quota-sentinel", "version": "1.0"}})
         if not init_res:
-            proc.terminate(); proc.wait(); return None
+            return None
         rate_res = send_and_wait(2, "account/rateLimits/read", {})
-        proc.terminate(); proc.wait()
         if not rate_res: return None
 
         rl = rate_res.get("result", {}).get("rateLimits", {})
@@ -1399,6 +1355,14 @@ def get_codex_native(codex_bin):
         }
     except Exception:
         return None
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
 
 res = get_codex_native(sys.argv[1])
 if res and res.get("fiveHour", {}).get("resetAt") and res.get("weekly", {}).get("resetAt"):
@@ -1906,7 +1870,9 @@ discover_feishu_user() {
   print -r -- "Configured Feishu user ID: $user_id"
 }
 
-status() {
+validate_run_requirements() {
+  local providers=("$@") provider
+  (( ${#providers[@]} > 0 )) || providers=(codex antigravity)
   require_executable "$PI_BIN"
   require_executable "$CURL_BIN"
   require_executable "$JQ_BIN"
@@ -1914,12 +1880,27 @@ status() {
   require_executable "$SHLOCK_BIN"
   require_executable "$SLEEP_BIN"
   [[ -r "$PI_AUTH_FILE" ]] || die "Pi OAuth credential is not readable: $PI_AUTH_FILE"
-  "$JQ_BIN" -e 'has("openai-codex") and has("antigravity")' "$PI_AUTH_FILE" >/dev/null ||
-    die "Pi credentials for Codex or Antigravity are missing"
-  [[ -r "$CODEX_QUOTA_EXTENSION" ]] || die "Codex quota hook is not readable"
-  [[ -r "$ANTIGRAVITY_QUOTA_EXTENSION" ]] || die "Antigravity quota hook is not readable"
-  [[ -r "$ANTIGRAVITY_PROVIDER_EXTENSION" ]] || die "Antigravity provider extension is not readable"
+  for provider in "${providers[@]}"; do
+    case "$provider" in
+      codex)
+        "$JQ_BIN" -e 'has("openai-codex")' "$PI_AUTH_FILE" >/dev/null ||
+          die "Pi credential for Codex is missing"
+        [[ -r "$CODEX_QUOTA_EXTENSION" ]] || die "Codex quota hook is not readable"
+        ;;
+      antigravity)
+        "$JQ_BIN" -e 'has("antigravity")' "$PI_AUTH_FILE" >/dev/null ||
+          die "Pi credential for Antigravity is missing"
+        [[ -r "$ANTIGRAVITY_QUOTA_EXTENSION" ]] || die "Antigravity quota hook is not readable"
+        [[ -r "$ANTIGRAVITY_PROVIDER_EXTENSION" ]] || die "Antigravity provider extension is not readable"
+        ;;
+      *) die "Unknown provider: $provider" ;;
+    esac
+  done
   feishu_ready || die "Feishu enterprise-app credentials are not configured"
+}
+
+status() {
+  validate_run_requirements codex antigravity
   print -r -- "ready"
   print -r -- "channel: feishu enterprise app"
   if [[ -x "$CODEX_BIN" ]] || [[ -x "$CODEXBAR_BIN" ]]; then
@@ -1947,53 +1928,78 @@ five_hour_reset_at() {
   "$JQ_BIN" -r '.fiveHour.resetAt // empty' "$1" 2>/dev/null
 }
 
-calibrate_provider_deadline() {
-  local provider="$1" now quota_file reset_at
-  now="$(/bin/date '+%s')"
-  quota_file="$(provider_normalized_quota_file "$provider")"
-
-  if provider_quota_is_fresh "$provider"; then
-    reset_at="$(five_hour_reset_at "$quota_file")"
-    if [[ "$reset_at" =~ ^[0-9]+$ ]] && (( reset_at > now && reset_at <= now + MAX_WINDOW_FUTURE_SECONDS )); then
-      write_provider_last_known_reset "$provider" "$reset_at"
-      write_provider_next_due "$provider" $(( reset_at + RUN_INTERVAL_SECONDS ))
-      return 0
-    fi
+provider_fallback_due() {
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" last_task
+  last_task="$(read_provider_last_task "$provider" || true)"
+  if [[ "$last_task" =~ ^[0-9]+$ ]]; then
+    print -r -- $(( last_task + RUN_INTERVAL_SECONDS ))
+  else
+    print -r -- "$now"
   fi
-  return 1
+}
+
+valid_provider_reset_at() {
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file reset_at
+  quota_file="$(provider_normalized_quota_file "$provider")"
+  provider_quota_is_fresh "$provider" || return 1
+  reset_at="$(five_hour_reset_at "$quota_file")"
+  [[ "$reset_at" =~ ^[0-9]+$ ]] || return 1
+  (( reset_at > now && reset_at <= now + MAX_WINDOW_FUTURE_SECONDS )) || return 1
+  print -r -- "$reset_at"
+}
+
+# Synchronize the scheduler only from live Native/CodexBar data. Every valid
+# fresh observation replaces the current deadline with reset + four minutes.
+# The 5h01 value is seeded after a real task only as a fallback for subsequent
+# probe failures; it is not a hard minimum interval.
+sync_provider_deadline_from_quota() {
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" reset_at reset_due
+
+  reset_at="$(valid_provider_reset_at "$provider" "$now")" || return 1
+  reset_due=$(( reset_at + RESET_BUFFER_SECONDS ))
+
+  write_provider_last_known_reset "$provider" "$reset_at"
+  write_provider_next_due "$provider" "$reset_due"
 }
 
 evaluate_provider() {
-  local provider="$1" now next_due
-  now="$(/bin/date '+%s')"
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" next_due fallback_due
 
-  # 1. Calibrate fallback deadline with fresh valid reset data if available
-  calibrate_provider_deadline "$provider" || true
+  # Fresh quota may move the deadline. Stale cache/snapshots never write it.
+  sync_provider_deadline_from_quota "$provider" "$now" || true
 
-  # 2. Check if reached next_due_at
-  if next_due="$(read_provider_next_due "$provider")"; then
-    if (( now >= next_due )); then
-      return 0
-    fi
+  # With no usable deadline, seed the no-quota fallback from the last real task.
+  # An existing deadline is preserved exactly when the current probe is stale.
+  next_due="$(read_provider_next_due "$provider" || true)"
+  if [[ ! "$next_due" =~ ^[0-9]+$ ]]; then
+    fallback_due="$(provider_fallback_due "$provider" "$now")"
+    next_due="$fallback_due"
+    write_provider_next_due "$provider" "$next_due"
   fi
-  return 1
+
+  (( now >= next_due ))
 }
 
 run_selected_providers() {
   local attempted=("$@")
-  local provider pid codex_pid=0 antigravity_pid=0 now prev_due
+  local provider codex_pid=0 antigravity_pid=0 attempt_at probe_now reset_val
   (( ${#attempted[@]} > 0 )) || return 0
 
-  status >/dev/null
+  validate_run_requirements "${attempted[@]}"
   ensure_temp_dir
-  now="$(/bin/date '+%s')"
 
+  # Finish all fallible preparation before recording any attempt or starting a
+  # provider. This avoids marking provider A as run if provider B setup fails.
   for provider in "${attempted[@]}"; do
     prepare_provider_env "$provider"
-    write_provider_last_task "$provider" "$now"
   done
 
   for provider in "${attempted[@]}"; do
+    attempt_at="$(/bin/date '+%s')"
+    write_provider_last_task "$provider" "$attempt_at"
+    # Seed the durable no-quota fallback before the model starts. A later
+    # successful fresh probe replaces this with reset + four minutes.
+    write_provider_next_due "$provider" $(( attempt_at + RUN_INTERVAL_SECONDS ))
     case "$provider" in
       codex)
         run_codex &
@@ -2014,28 +2020,18 @@ run_selected_providers() {
   fi
 
   save_pi_quota_snapshots
-  collect_effective_quotas
-
-  for provider in "${attempted[@]}"; do
-    local q_file reset_val
-    q_file="$(provider_normalized_quota_file "$provider")"
-    reset_val="$(five_hour_reset_at "$q_file")"
-    if provider_quota_is_fresh "$provider" &&
-       [[ "$reset_val" =~ ^[0-9]+$ ]] &&
-       (( reset_val > now && reset_val <= now + MAX_WINDOW_FUTURE_SECONDS )); then
-      write_provider_last_known_reset "$provider" "$reset_val"
-      write_provider_last_window "$provider" "$reset_val"
-      write_provider_next_due "$provider" $(( reset_val + RUN_INTERVAL_SECONDS ))
-    else
-      # If no fresh valid reset obtained post-run, advance fallback deadline by 5h01m
-      prev_due="$(read_provider_next_due "$provider" || true)"
-      if [[ "$prev_due" =~ ^[0-9]+$ ]] && (( prev_due > now - RUN_INTERVAL_SECONDS )); then
-        write_provider_next_due "$provider" $(( prev_due + RUN_INTERVAL_SECONDS ))
-      else
-        write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+  if acquire_quota_lock_with_timeout; then
+    collect_effective_quotas
+    probe_now="$(/bin/date '+%s')"
+    for provider in "${attempted[@]}"; do
+      reset_val="$(valid_provider_reset_at "$provider" "$probe_now" || true)"
+      if [[ "$reset_val" =~ ^[0-9]+$ ]]; then
+        write_provider_last_window "$provider" "$reset_val"
+        sync_provider_deadline_from_quota "$provider" "$probe_now"
       fi
-    fi
-  done
+    done
+    release_quota_lock
+  fi
 
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
     dispatch_notification "$(task_notification_message "${attempted[@]}")"
@@ -2049,10 +2045,6 @@ run_selected_providers() {
   fi
 }
 
-run_once() {
-  run_selected_providers codex antigravity
-}
-
 run_and_reschedule_selected() {
   local targets=("$@")
   (( ${#targets[@]} > 0 )) || targets=(codex antigravity)
@@ -2061,29 +2053,32 @@ run_and_reschedule_selected() {
   release_run_lock
 }
 
-run_and_reschedule() {
-  run_and_reschedule_selected "$@"
-}
-
 send_usage_notification() {
-  local codex_quota antigravity_quota
-  acquire_quota_lock || return 0
+  local codex_quota antigravity_quota notification
+  acquire_quota_lock_with_timeout || die "Quota probe is busy; try /usage again shortly"
   prepare_quota_probe
   collect_effective_quotas
+
+  # /usage never runs a model and never touches last-task/last-window, but its
+  # already-fetched live quota is authoritative enough to refresh deadlines.
+  sync_provider_deadline_from_quota codex || true
+  sync_provider_deadline_from_quota antigravity || true
+
   codex_quota="$(codex_quota_message)" || true
   antigravity_quota="$(antigravity_quota_message)" || true
 
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
-    dispatch_notification "$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+    notification="$(usage_notification_message "$codex_quota" "$antigravity_quota")"
   else
     local card_payload
     if card_payload="$(build_feishu_v2_usage_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')")" && [[ -n "$card_payload" ]]; then
-      dispatch_notification "$card_payload"
+      notification="$card_payload"
     else
-      dispatch_notification "$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+      notification="$(usage_notification_message "$codex_quota" "$antigravity_quota")"
     fi
   fi
   release_quota_lock
+  dispatch_notification "$notification"
 }
 
 setup_mock_preview_quota() {
@@ -2144,7 +2139,14 @@ send_test_card() {
 check_schedule() {
   local due_providers=()
 
-  acquire_quota_lock || return 0
+  # Serialize the due decision and the subsequent model run. Without this,
+  # watchdog and precision-timer processes can both decide from the same stale
+  # deadline and run the provider twice after the first lock holder exits.
+  acquire_run_lock || return 0
+  if ! acquire_quota_lock; then
+    release_run_lock
+    return 0
+  fi
   prepare_quota_probe
   collect_effective_quotas
 
@@ -2157,10 +2159,10 @@ check_schedule() {
   release_quota_lock
 
   if (( ${#due_providers[@]} == 0 )); then
+    release_run_lock
     return 0
   fi
 
-  acquire_run_lock || return 0
   run_selected_providers "${due_providers[@]}"
   release_run_lock
 }
@@ -2171,6 +2173,7 @@ wait_schedule() {
     now="$(/bin/date '+%s')"
     if next_due="$(read_next_due)" && (( now < next_due )); then
       delay=$(( next_due - now ))
+      (( delay > TIMER_RECHECK_SECONDS )) && delay="$TIMER_RECHECK_SECONDS"
       "$SLEEP_BIN" "$delay"
       continue
     fi

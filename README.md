@@ -36,20 +36,30 @@ exactly `1`. Quota collection is reported independently.
 ## Quota Data Sources & Architecture
 
 1. **Codex Quota**:
-   - **Primary**: CodexBar CLI (`codexbar usage --provider codex --source cli` / `oauth`). Queries official Codex App Server RPC or OAuth endpoints directly. Zero prompt tokens, zero inference turns.
-   - **Fallback**: Pi provider response hook snapshot (`capture-codex-quota.ts`).
+   - **Primary**: Native Codex App Server RPC (`account/rateLimits/read`).
+   - **Fallbacks**: CodexBar Live (`cli`, then `oauth`), CodexBar cached
+     result, then the Pi provider response-hook snapshot.
 2. **Antigravity Quota**:
-   - **Primary**: CodexBar Antigravity CLI (`codexbar usage --provider antigravity --source cli`). Queries Antigravity local `agy` HTTPS service (`RetrieveUserQuotaSummary`). Zero prompt tokens.
-   - **Fallback**: Pi Antigravity API snapshot (`capture-antigravity-quota.ts`).
+   - **Primary**: Native local `agy` HTTPS service
+     (`RetrieveUserQuotaSummary`).
+   - **Fallbacks**: CodexBar Live, CodexBar cached result, then the Pi
+     Antigravity API snapshot.
+
+All live quota calls are metadata-only: they consume no prompt tokens and no
+inference turns.
 
 ## Feishu `/usage` Command & Long Connection Listener
 
 You can send `/usage` in Feishu bot private chat at any time. The bot connects
 via Feishu WebSocket long connection (长连接, no public IP or webhook required):
-- Fetches real-time structured quota via CodexBar / agy.
+- Fetches real-time structured quota through the four-tier hierarchy above.
 - Responds with the formatted quota card immediately in Feishu.
-- **Strictly read-only**: Does NOT invoke LLMs, does NOT run Pi agent tasks, and does NOT alter scheduler state (`last_task_at`, `last_triggered_window`, `next_due_at`).
+- Does **not** invoke LLMs or run Pi agent tasks. Fresh Native/CodexBar Live
+  results also synchronize `last_known_reset_at` and `next_due_at`; stale cache
+  and Pi snapshots remain display-only. `/usage` never changes `last_task_at`
+  or `last_triggered_window`.
 - Filtered against bot loops (ignores non-user messages) and deduplicated.
+- Accepts commands only from the configured recipient `user_id`.
 
 ## Feishu delivery
 
@@ -148,7 +158,10 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
    (Tagged as "Pi 快照（可能不是最新）", NEVER alters scheduler deadline)
 ```
 
-- **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ② (CodexBar Live) are marked as `FRESH` and eligible to calibrate `next_due_at = reset_at + 5h01m`. Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
+- **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ②
+  (CodexBar Live) are marked as `FRESH` and eligible to calibrate a provider's
+  deadline to the latest `reset_at + 4m`.
+  Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
 - **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
 
 ## Dynamic Reset Calibration & Fallback Scheduling
@@ -156,12 +169,23 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 - **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, and `last_task_at`.
 - **Dynamic Calibration from Quota Probes**:
   - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
-  - When fresh valid `reset_at` is obtained: `next_due_at` is immediately calibrated to `reset_at + 5h01m`.
-  - When probe fails or returns stale snapshot: `next_due_at` is **preserved unchanged** without shifting or drifting forward.
+  - Immediately after a real task starts, its provider is seeded with a
+    no-quota fallback of `last_task_at + 5h01m`.
+  - Every subsequent valid `FRESH` observation replaces that deadline with the
+    latest `reset_at + 4m`, whether this is earlier or later than the fallback.
+  - The 5h01 value is a degradation fallback, not a hard minimum between two
+    real tasks.
+  - `/usage` reuses the same fresh-only calibration after its live query but
+    does not execute a due task; the precision timer or watchdog performs it.
+  - When a probe fails or returns a stale snapshot, `next_due_at` is **preserved
+    unchanged**. Cache and Pi data never overwrite the last authoritative
+    Fresh deadline.
 - **Graceful Fallback & Degradation**:
   - When `now >= next_due_at`, the due provider executes.
-  - If post-run probes continue to fail, the fallback deadline advances by `+5h01m` (`next_due_at += 18060s`), smoothly degrading to a fixed 5h01m interval.
-  - Any subsequent successful probe immediately re-anchors `next_due_at` to the server's real `reset_at + 5h01m`.
+  - If all post-run probes fail, the fallback remains anchored to the actual
+    attempt time (`last_task_at + 5h01m`), including after sleep/wake delays.
+  - Any subsequent successful Fresh probe immediately replaces the fallback
+    with its `reset_at + 4m` deadline.
 - **Targeted Execution & Card Scoping**:
   - When only Antigravity reaches its deadline, only Gemini executes and only Gemini appears in the Feishu card (Codex is never marked as failed).
   - When only Codex reaches its deadline, only Luna executes and only Luna appears in the Feishu card.
