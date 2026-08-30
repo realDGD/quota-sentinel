@@ -227,12 +227,12 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 - **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ②
   (CodexBar Live) are marked as `FRESH` and eligible to calibrate a provider's
   deadline to the latest `reset_at + 4m` before its currently scheduled reset
-  occurs. Freshness is necessary but not sufficient: once a provider has a
-  successful `last_task_at`, a reset must also remain inside that task's
-  current-cycle horizon (`last_task_at + 5h + 5m` tolerance). A later Fresh
-  value remains visible in quota cards but cannot write scheduler state. Once
-  the scheduled reset occurs, the provider enters a scheduler-write block
-  until its task succeeds.
+  occurs. Freshness is necessary but not sufficient: each provider generation
+  keeps a fixed reset anchor. Earlier resets and later movement up to five
+  minutes from that anchor remain dynamic; a farther-later reset must remain
+  stable across an independent observation before it may replace the anchor.
+  Once the scheduled reset occurs, the provider enters a scheduler-write
+  block until its task succeeds.
   Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
 - **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
 
@@ -249,14 +249,15 @@ armed deadline with the following window and starve the current task.
 
 The same write seam also carries the reset trust gate, which removes the
 rolling-reset starvation mode: fresh data may move a deadline earlier, or
-within ±5 minutes of the current trusted reset, immediately — but a reset that
-jumps far beyond the trusted value is only a candidate until a second fresh
-probe at least 60 seconds later reports the same timestamp (±30s tolerance).
-Only then does it take over the deadline. A rolling value that advances with
-every probe never passes confirmation, so it can defer a task by at most one
-candidate cycle instead of starving it. The first fresh reset of a generation
-— or the first after a successful task — anchors immediately, and a successful
-task starts a new generation. Cache and Pi data still never write deadlines.
+within five minutes after the generation's fixed anchor, immediately — but the
+anchor itself does not follow those small movements. A reset farther beyond
+the anchor is only a candidate until a second fresh probe at least 60 seconds
+later reports the same timestamp (±30s tolerance). Only then does it take over
+and become the new anchor. A rolling value that advances with every probe,
+whether in large jumps or many individually small steps, cannot chase the
+deadline forever. The first fresh reset of a generation anchors immediately;
+a successful task clears the old candidate/anchor state for the next cycle.
+Cache and Pi data still never write deadlines.
 
 ## Failure Retry & Pending Debt
 
@@ -283,20 +284,20 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
 
 ## Dynamic Reset Calibration & Fallback Scheduling
 
-- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, `last_task_at` (successful tasks only), `last_attempt_at`, and `retry_pending`.
+- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, a fixed per-generation reset anchor, `next_due_at`, `last_task_at` (successful tasks only), `last_attempt_at`, and `retry_pending`.
 - **Dynamic Calibration from Quota Probes**:
   - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
   - Immediately after a real task starts, its provider is seeded with a
     no-quota fallback of `last_task_at + 5h01m`.
   - Before the scheduled reset, every subsequent valid `FRESH` observation
-    inside the current-cycle horizon replaces that deadline with the latest
-    `reset_at + 4m`, whether this is earlier or later than the fallback. The
-    five-minute horizon tolerance validates small reset timestamp movement; it
-    does not replace or alter either the `+1m` fallback grace or the `+4m`
-    observed-reset grace.
-  - A Fresh reset beyond `last_task_at + 5h + 5m` is treated as a future
-    generation or rolling observation: it remains available for display but
-    cannot overwrite `last_known_reset_at` or `next_due_at`.
+    that is earlier than, or no more than five minutes later than, the fixed
+    generation anchor replaces the deadline with `reset_at + 4m`. The anchor
+    does not move with ordinary jitter, so small movements cannot accumulate.
+    This validation does not replace or alter either the `+1m` fallback grace
+    or the `+4m` observed-reset grace.
+  - A farther-later Fresh reset remains available for display but cannot write
+    scheduler state until a second independent Fresh probe confirms that its
+    absolute reset timestamp is stable; promotion then replaces the anchor.
   - From the scheduled reset until successful execution, that Provider's
     scheduler calibration is paused. The 15-minute Watchdog and `/usage` cannot
     overwrite its armed deadline; success releases the block and the post-run

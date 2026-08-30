@@ -385,5 +385,30 @@ sync_provider_deadline_from_quota codex "$CYCLE_START"
 [[ "$(read_provider_next_due codex)" == "$(( EARLY_RESET + RESET_BUFFER_SECONDS ))" ]]
 print -r -- "  PASS: nearby later movement and earlier refresh both stayed dynamic"
 
+print -r -- "== P1-1S: cumulative near movement cannot chase either provider =="
+for provider in codex antigravity; do
+  reset_state
+  CYCLE_START="$T"
+  ANCHOR_RESET=$(( CYCLE_START + 18000 ))
+  FIRST_NEAR_RESET=$(( ANCHOR_RESET + 240 ))
+  write_provider_last_task "$provider" "$CYCLE_START"
+  write_provider_last_known_reset "$provider" "$ANCHOR_RESET"
+  write_provider_next_due "$provider" $(( ANCHOR_RESET + RESET_BUFFER_SECONDS ))
+
+  # Each individual observation is only +240s from the previously accepted
+  # reset, but the sequence drifts far beyond the original window. Comparing
+  # only with the last accepted value lets this chase forever at short probe
+  # intervals even though no fixed far reset was independently confirmed.
+  for step in {1..8}; do
+    PROBE_NOW=$(( CYCLE_START + step * 60 ))
+    set_fresh "$provider" $(( ANCHOR_RESET + step * 240 ))
+    sync_provider_deadline_from_quota "$provider" "$PROBE_NOW" || true
+  done
+
+  [[ "$(read_provider_last_known_reset "$provider")" == "$FIRST_NEAR_RESET" ]]
+  [[ "$(read_provider_next_due "$provider")" == "$(( FIRST_NEAR_RESET + RESET_BUFFER_SECONDS ))" ]]
+  print -r -- "  PASS: $provider kept the first-window bound under cumulative +240s drift"
+done
+
 cleanup
 print -r -- "p1 deadline regression: all cases passed"

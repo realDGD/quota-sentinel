@@ -182,6 +182,11 @@ provider_reset_candidate_file() {
   print -r -- "$STATE_DIR/${provider}-reset-candidate"
 }
 
+provider_reset_anchor_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-reset-anchor"
+}
+
 provider_last_window_file() {
   local provider="$1"
   print -r -- "$STATE_DIR/${provider}-last-triggered-window"
@@ -395,6 +400,31 @@ write_provider_reset_candidate() {
 clear_provider_reset_candidate() {
   local provider="$1" file
   file="$(provider_reset_candidate_file "$provider")"
+  rm -f -- "$file"
+}
+
+# The anchor is the independently trusted reset for this provider generation.
+# Unlike last-known-reset-at it does not follow accepted near-window jitter, so
+# many individually small later movements cannot accumulate into starvation.
+read_provider_reset_anchor() {
+  local provider="$1" file value
+  file="$(provider_reset_anchor_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  print -r -- "$value"
+}
+
+write_provider_reset_anchor() {
+  local provider="$1" reset="$2" file
+  [[ "$reset" =~ ^[0-9]+$ ]] || die "Invalid reset anchor timestamp: $reset"
+  file="$(provider_reset_anchor_file "$provider")"
+  atomic_write_state_file "$file" "$reset"
+}
+
+clear_provider_reset_anchor() {
+  local provider="$1" file
+  file="$(provider_reset_anchor_file "$provider")"
   rm -f -- "$file"
 }
 
@@ -2300,7 +2330,7 @@ provider_schedule_block_reason() {
 # writes are blocked; /usage may still display its newly fetched quota.
 sync_provider_deadline_from_quota() {
   local provider="$1" now="${2:-$(/bin/date '+%s')}"
-  local reset_at reset_due block_reason existing_reset existing_due trusted_reset
+  local reset_at reset_due block_reason existing_reset existing_due trusted_reset anchor_reset
   local candidate_record candidate_reset candidate_observed candidate_delta confirmed_reset
 
   reset_at="$(valid_provider_reset_at "$provider" "$now")" || return 1
@@ -2320,15 +2350,30 @@ sync_provider_deadline_from_quota() {
     # legitimately be much later than last_task+5h, as observed live when a
     # provider window remained fixed after a manual early task.
     clear_provider_reset_candidate "$provider"
+    clear_provider_reset_anchor "$provider"
     write_provider_last_known_reset "$provider" "$reset_at"
     write_provider_next_due "$provider" "$reset_due"
+    write_provider_reset_anchor "$provider" "$reset_at"
     log_info "sched $provider: fresh reset established generation anchor reset=$reset_at due=$reset_due"
     return 0
   fi
 
-  # Earlier resets and small movement around the current reset preserve the
-  # original dynamic policy. Only a large later jump needs confirmation.
-  if (( reset_at <= trusted_reset + RESET_NEAR_MOVEMENT_SECONDS )); then
+  # Upgrade an in-flight generation without changing its current deadline.
+  # Persisting the existing trusted reset (not the new observation) is what
+  # closes the cumulative-near-movement loophole on the very first probe after
+  # deployment.
+  anchor_reset="$(read_provider_reset_anchor "$provider" 2>/dev/null || true)"
+  if [[ ! "$anchor_reset" =~ ^[0-9]+$ ]]; then
+    anchor_reset="$trusted_reset"
+    write_provider_reset_anchor "$provider" "$anchor_reset"
+    log_info "sched $provider: reset anchor initialized from trusted reset=$anchor_reset"
+  fi
+
+  # Earlier resets and movement near the generation anchor preserve the
+  # original dynamic policy. The anchor deliberately does not move here:
+  # otherwise repeated +N-second observations could each remain under the
+  # tolerance while cumulatively pushing the deadline forever.
+  if (( reset_at <= anchor_reset + RESET_NEAR_MOVEMENT_SECONDS )); then
     clear_provider_reset_candidate "$provider"
     write_provider_last_known_reset "$provider" "$reset_at"
     write_provider_next_due "$provider" "$reset_due"
@@ -2350,6 +2395,7 @@ sync_provider_deadline_from_quota() {
       clear_provider_reset_candidate "$provider"
       write_provider_last_known_reset "$provider" "$confirmed_reset"
       write_provider_next_due "$provider" $(( confirmed_reset + RESET_BUFFER_SECONDS ))
+      write_provider_reset_anchor "$provider" "$confirmed_reset"
       log_info "sched $provider: far reset promoted after stable observations old_reset=$trusted_reset new_reset=$confirmed_reset first_seen=$candidate_observed confirmed_at=$now"
       return 0
     fi
@@ -2416,6 +2462,7 @@ commit_provider_success() {
   write_provider_last_task "$provider" "$success_at"
   write_provider_retry_pending "$provider" 0
   clear_provider_reset_candidate "$provider"
+  clear_provider_reset_anchor "$provider"
   write_provider_next_due "$provider" $(( success_at + RUN_INTERVAL_SECONDS ))
   case "$provider" in
     codex) CODEX_RUN_RESULT="发送成功" ;;
