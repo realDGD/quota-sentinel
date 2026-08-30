@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-class TestFeishuCardV2AndProgressChart(unittest.TestCase):
+class TestFeishuCardV2AndCircularProgressChart(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../quota-sentinel.sh"))
@@ -20,68 +20,124 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
         return res.stdout.strip()
 
     # -------------------------------------------------------------
-    # Case 1 & 2 & 3: Linear Progress Chart value mapping & clamping
+    # Case 1: Circular Progress Chart value mapping (5h=77, weekly=86)
     # -------------------------------------------------------------
     def test_case_1_chart_percentage_mapping(self):
-        out = self.run_zsh_fn('build_linear_progress_chart 77')
+        out = self.run_zsh_fn('build_circular_quota_chart 77 86')
         chart_obj = json.loads(out)
         self.assertEqual(chart_obj["tag"], "chart")
-        self.assertEqual(chart_obj["height"], "28px")
-        self.assertEqual(chart_obj["chart_spec"]["type"], "linearProgress")
-        self.assertEqual(chart_obj["chart_spec"]["data"]["values"][0]["value"], 0.77)
+        self.assertEqual(chart_obj["height"], "140px")
+        self.assertEqual(chart_obj["aspect_ratio"], "1:1")
+        self.assertEqual(chart_obj["chart_spec"]["type"], "circularProgress")
         self.assertFalse(chart_obj["preview"])
 
+        values = chart_obj["chart_spec"]["data"]["values"]
+        self.assertEqual(len(values), 2)
+        # Inner ring = Weekly (Index 0)
+        self.assertEqual(values[0]["type"], "周额度")
+        self.assertEqual(values[0]["value"], 0.86)
+        # Outer ring = 5-Hour (Index 1)
+        self.assertEqual(values[1]["type"], "5小时")
+        self.assertEqual(values[1]["value"], 0.77)
+
+    # -------------------------------------------------------------
+    # Case 2: Boundary value mapping (0% and 100%)
+    # -------------------------------------------------------------
     def test_case_2_boundary_mapping(self):
-        out_0 = self.run_zsh_fn('build_linear_progress_chart 0')
-        self.assertEqual(json.loads(out_0)["chart_spec"]["data"]["values"][0]["value"], 0)
+        out_0 = self.run_zsh_fn('build_circular_quota_chart 0 0')
+        vals_0 = json.loads(out_0)["chart_spec"]["data"]["values"]
+        self.assertEqual(vals_0[0]["value"], 0)
+        self.assertEqual(vals_0[1]["value"], 0)
 
-        out_100 = self.run_zsh_fn('build_linear_progress_chart 100')
-        self.assertEqual(json.loads(out_100)["chart_spec"]["data"]["values"][0]["value"], 1)
+        out_100 = self.run_zsh_fn('build_circular_quota_chart 100 100')
+        vals_100 = json.loads(out_100)["chart_spec"]["data"]["values"]
+        self.assertEqual(vals_100[0]["value"], 1)
+        self.assertEqual(vals_100[1]["value"], 1)
 
+    # -------------------------------------------------------------
+    # Case 3: Invalid values clamping and fallback
+    # -------------------------------------------------------------
     def test_case_3_invalid_values_clamping_and_fallback(self):
-        out_neg = self.run_zsh_fn('build_linear_progress_chart -5')
-        self.assertEqual(json.loads(out_neg)["chart_spec"]["data"]["values"][0]["value"], 0)
+        out_neg = self.run_zsh_fn('build_circular_quota_chart -10 -5')
+        vals_neg = json.loads(out_neg)["chart_spec"]["data"]["values"]
+        self.assertEqual(vals_neg[0]["value"], 0)
+        self.assertEqual(vals_neg[1]["value"], 0)
 
-        out_over = self.run_zsh_fn('build_linear_progress_chart 150')
-        self.assertEqual(json.loads(out_over)["chart_spec"]["data"]["values"][0]["value"], 1)
+        out_over = self.run_zsh_fn('build_circular_quota_chart 150 200')
+        vals_over = json.loads(out_over)["chart_spec"]["data"]["values"]
+        self.assertEqual(vals_over[0]["value"], 1)
+        self.assertEqual(vals_over[1]["value"], 1)
 
-        out_empty = self.run_zsh_fn('build_linear_progress_chart ""')
-        self.assertEqual(json.loads(out_empty)["chart_spec"]["data"]["values"][0]["value"], 1.0)
-
-        out_nan = self.run_zsh_fn('build_linear_progress_chart "invalid"')
-        self.assertEqual(json.loads(out_nan)["chart_spec"]["data"]["values"][0]["value"], 1.0)
+        out_invalid = self.run_zsh_fn('build_circular_quota_chart "" "abc"')
+        vals_invalid = json.loads(out_invalid)["chart_spec"]["data"]["values"]
+        self.assertEqual(vals_invalid[0]["value"], 1.0)
+        self.assertEqual(vals_invalid[1]["value"], 1.0)
 
     # -------------------------------------------------------------
-    # Case 4: Independent 5h and weekly linear progress charts
+    # Case 4: Element decomposition (Title, Source, Status, Chart, 5h, Divider, Weekly)
     # -------------------------------------------------------------
-    def test_case_4_column_elements_has_two_charts(self):
+    def test_case_4_provider_elements_structure(self):
         fixture_file = os.path.join(self.test_dir.name, "quota-test.json")
         with open(fixture_file, "w") as f:
             json.dump({
                 "source": "Native · codex app-server",
                 "fresh": True,
                 "capturedAt": 1788000000,
-                "fiveHour": {"remainingPercent": 65, "resetAt": 1788018000},
-                "weekly": {"remainingPercent": 92, "resetAt": 1788600000}
+                "fiveHour": {"remainingPercent": 100, "resetAt": 1788018000},
+                "weekly": {"remainingPercent": 84, "resetAt": 1788600000}
             }, f)
 
-        out = self.run_zsh_fn(f'build_provider_v2_column_elements "GPT-5.6 Luna" "发送成功" "{fixture_file}"')
+        out = self.run_zsh_fn(f'build_provider_v2_elements "GPT-5.6 Luna" "发送成功" "{fixture_file}"')
         elems = json.loads(out)
-        self.assertEqual(len(elems), 5)
+        self.assertEqual(len(elems), 7)
+        # Element 0: Title
         self.assertEqual(elems[0]["tag"], "markdown")
-        self.assertIn("65%", elems[0]["content"])
-        self.assertEqual(elems[1]["tag"], "chart")
-        self.assertEqual(elems[1]["chart_spec"]["data"]["values"][0]["value"], 0.65)
+        self.assertEqual(elems[0]["content"], "**GPT-5.6 Luna**")
+        # Element 1: Source
+        self.assertEqual(elems[1]["tag"], "markdown")
+        self.assertEqual(elems[1]["content"], "↳ 来源　Native · codex app-server")
+        # Element 2: Status
         self.assertEqual(elems[2]["tag"], "markdown")
-        self.assertIn("92%", elems[2]["content"])
+        self.assertEqual(elems[2]["content"], "🟢 **发送成功**")
+        # Element 3: Chart
         self.assertEqual(elems[3]["tag"], "chart")
-        self.assertEqual(elems[3]["chart_spec"]["data"]["values"][0]["value"], 0.92)
+        self.assertEqual(elems[3]["chart_spec"]["type"], "circularProgress")
+        # Element 4: 5h Details
         self.assertEqual(elems[4]["tag"], "markdown")
+        self.assertIn("100%", elems[4]["content"])
+        self.assertIn("距离重置：", elems[4]["content"])
+        # Element 5: Official Divider
+        self.assertEqual(elems[5]["tag"], "hr")
+        # Element 6: Weekly Details
+        self.assertEqual(elems[6]["tag"], "markdown")
+        self.assertIn("84%", elems[6]["content"])
+        self.assertIn("重置时间：", elems[6]["content"])
 
     # -------------------------------------------------------------
-    # Case 5 & 6: Single Provider Scope (no empty column)
+    # Case 5: Literal \n Prevention Check
     # -------------------------------------------------------------
-    def test_case_5_codex_only_single_column(self):
+    def test_case_5_no_literal_backslash_n_in_text(self):
+        out = self.run_zsh_fn('card_preview both')
+        payload = json.loads(out)
+        card = json.loads(payload["content"])
+
+        def check_text_nodes(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("content", "text") and isinstance(v, str):
+                        self.assertNotIn(r"\n", v, f"Literal \\n found in field '{k}': {repr(v)}")
+                    else:
+                        check_text_nodes(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    check_text_nodes(item)
+
+        check_text_nodes(card)
+
+    # -------------------------------------------------------------
+    # Case 6 & 7: Single Provider Scope (no empty column)
+    # -------------------------------------------------------------
+    def test_case_6_codex_only_single_column(self):
         fixture_file = os.path.join(self.test_dir.name, "codex-quota.json")
         with open(fixture_file, "w") as f:
             json.dump({
@@ -102,7 +158,7 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
         self.assertIn("GPT-5.6 Luna", card["body"]["elements"][0]["content"])
         self.assertNotIn("Gemini", json.dumps(card))
 
-    def test_case_6_antigravity_only_single_column(self):
+    def test_case_7_antigravity_only_single_column(self):
         fixture_file = os.path.join(self.test_dir.name, "antigravity-quota.json")
         with open(fixture_file, "w") as f:
             json.dump({
@@ -123,9 +179,9 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
         self.assertNotIn("Luna", json.dumps(card))
 
     # -------------------------------------------------------------
-    # Case 7: Dual Provider Responsive Columns
+    # Case 8: Dual Provider Responsive Columns
     # -------------------------------------------------------------
-    def test_case_7_dual_provider_responsive_columns(self):
+    def test_case_8_dual_provider_responsive_columns(self):
         f_codex = os.path.join(self.test_dir.name, "codex.json")
         f_anti = os.path.join(self.test_dir.name, "anti.json")
         with open(f_codex, "w") as f:
@@ -159,9 +215,9 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
         self.assertEqual(col_set["columns"][1]["weight"], 1)
 
     # -------------------------------------------------------------
-    # Case 8: /usage Dual Provider & No Status Lines
+    # Case 9: /usage Dual Provider & No Status Lines
     # -------------------------------------------------------------
-    def test_case_8_usage_card_structure(self):
+    def test_case_9_usage_card_structure(self):
         f_codex = os.path.join(self.test_dir.name, "codex.json")
         f_anti = os.path.join(self.test_dir.name, "anti.json")
         with open(f_codex, "w") as f:
@@ -192,9 +248,9 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
         self.assertNotIn("发送失败", card_str)
 
     # -------------------------------------------------------------
-    # Case 9 & 10: Cached & Pi Snapshot Warning Preservation
+    # Case 10: Cached & Pi Snapshot Warning Preservation
     # -------------------------------------------------------------
-    def test_case_9_and_10_stale_warning_preservation(self):
+    def test_case_10_stale_warning_preservation(self):
         f_cached = os.path.join(self.test_dir.name, "cached.json")
         f_snapshot = os.path.join(self.test_dir.name, "snapshot.json")
         with open(f_cached, "w") as f:
@@ -216,19 +272,22 @@ class TestFeishuCardV2AndProgressChart(unittest.TestCase):
                 "weekly": {"remainingPercent": 60, "resetAt": 1788600000}
             }, f)
 
-        out_c = self.run_zsh_fn(f'build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "发送成功" "{f_cached}"')
+        out_c = self.run_zsh_fn(f'build_provider_v2_elements "Gemini 3.7 Flash · Low" "发送成功" "{f_cached}"')
         self.assertIn("CodexBar · cached（可能不是最新）", out_c)
 
-        out_s = self.run_zsh_fn(f'build_provider_v2_column_elements "GPT-5.6 Luna" "发送成功" "{f_snapshot}"')
+        out_s = self.run_zsh_fn(f'build_provider_v2_elements "GPT-5.6 Luna" "发送成功" "{f_snapshot}"')
         self.assertIn("Pi 快照（可能不是最新）", out_s)
 
     # -------------------------------------------------------------
-    # Case 11 & 12: Unicode quota_bar fallback & Full JSON parseability
+    # Case 11: Unicode quota_bar fallback preservation
     # -------------------------------------------------------------
     def test_case_11_unicode_fallback_preservation(self):
         out_bar = self.run_zsh_fn('quota_bar 77')
         self.assertEqual(out_bar, "■■■■■■■■□□")
 
+    # -------------------------------------------------------------
+    # Case 12: Full JSON Parseability
+    # -------------------------------------------------------------
     def test_case_12_json_parseability(self):
         out = self.run_zsh_fn('card_preview both')
         payload = json.loads(out)

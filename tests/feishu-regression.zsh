@@ -92,16 +92,24 @@ src_count="$(print -r -- "$c_task" | grep -c '↳ 来源' || true)"
 [[ "$u_task" != *'（剩余'* ]]
 
 # -------------------------------------------------------------
-# Case 8: Card JSON 2.0 & Chart Linear Progress Builders
+# Case 8: Card JSON 2.0 & Circular Progress Chart Builders
 # -------------------------------------------------------------
-chart_77="$(build_linear_progress_chart 77)"
-print -r -- "$chart_77" | "$JQ_BIN" -e '.tag == "chart" and .height == "28px" and .chart_spec.type == "linearProgress" and .chart_spec.data.values[0].value == 0.77' >/dev/null
+chart_dual="$(build_circular_quota_chart 77 86)"
+print -r -- "$chart_dual" | "$JQ_BIN" -e '
+  .tag == "chart" and
+  .height == "140px" and
+  .chart_spec.type == "circularProgress" and
+  .chart_spec.data.values[0].type == "周额度" and
+  .chart_spec.data.values[0].value == 0.86 and
+  .chart_spec.data.values[1].type == "5小时" and
+  .chart_spec.data.values[1].value == 0.77
+' >/dev/null
 
-chart_clamp="$(build_linear_progress_chart 120)"
-print -r -- "$chart_clamp" | "$JQ_BIN" -e '.chart_spec.data.values[0].value == 1' >/dev/null
-
-chart_neg="$(build_linear_progress_chart -10)"
-print -r -- "$chart_neg" | "$JQ_BIN" -e '.chart_spec.data.values[0].value == 0' >/dev/null
+chart_clamp="$(build_circular_quota_chart 120 -10)"
+print -r -- "$chart_clamp" | "$JQ_BIN" -e '
+  .chart_spec.data.values[0].value == 0 and
+  .chart_spec.data.values[1].value == 1
+' >/dev/null
 
 preview_both="$(card_preview both)"
 print -r -- "$preview_both" | "$JQ_BIN" -e '

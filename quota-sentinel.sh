@@ -562,53 +562,71 @@ send_feishu_message() {
   fi
 }
 
-build_linear_progress_chart() {
-  local percent="$1"
-  local val="1.0"
+build_circular_quota_chart() {
+  local five_percent="$1" weekly_percent="$2"
+  local five_val="1.0" weekly_val="1.0"
 
-  if [[ "$percent" =~ ^-?[0-9]+$ ]]; then
-    (( percent < 0 )) && percent=0
-    (( percent > 100 )) && percent=100
-    val="$("$JQ_BIN" -n --argjson p "$percent" '$p / 100.0')"
+  if [[ "$five_percent" =~ ^-?[0-9]+$ ]]; then
+    (( five_percent < 0 )) && five_percent=0
+    (( five_percent > 100 )) && five_percent=100
+    five_val="$("$JQ_BIN" -n --argjson p "$five_percent" '$p / 100.0')"
   else
-    val="1.0"
+    five_val="1.0"
   fi
 
+  if [[ "$weekly_percent" =~ ^-?[0-9]+$ ]]; then
+    (( weekly_percent < 0 )) && weekly_percent=0
+    (( weekly_percent > 100 )) && weekly_percent=100
+    weekly_val="$("$JQ_BIN" -n --argjson p "$weekly_percent" '$p / 100.0')"
+  else
+    weekly_val="1.0"
+  fi
+
+  # In VChart circularProgress, categoryField bands start at innerRadius and expand to radius:
+  # Index 0: Weekly (Inner ring)
+  # Index 1: 5-Hour (Outer ring)
   "$JQ_BIN" -n \
-    --argjson val "$val" \
+    --argjson five_val "$five_val" \
+    --argjson weekly_val "$weekly_val" \
     '{
       tag: "chart",
-      aspect_ratio: "16:9",
-      height: "28px",
-      color_theme: "brand",
+      aspect_ratio: "1:1",
+      height: "140px",
       preview: false,
       chart_spec: {
-        type: "linearProgress",
+        type: "circularProgress",
         data: {
           values: [
             {
-              type: "quota",
-              value: $val
+              type: "周额度",
+              value: $weekly_val
+            },
+            {
+              type: "5小时",
+              value: $five_val
             }
           ]
         },
-        direction: "horizontal",
-        xField: "value",
-        yField: "type",
+        valueField: "value",
+        categoryField: "type",
         seriesField: "type",
-        axes: [
-          { orient: "left", visible: false, domainLine: { visible: false } },
-          { orient: "bottom", visible: false, domainLine: { visible: false } }
-        ],
-        legends: { visible: false },
-        tooltip: { visible: false },
-        padding: { top: 0, bottom: 0, left: 0, right: 0 },
-        media: []
+        radius: 0.85,
+        innerRadius: 0.45,
+        cornerRadius: 10,
+        progress: {
+          style: {
+            innerPadding: 3,
+            outerPadding: 3
+          }
+        },
+        legends: {
+          visible: false
+        }
       }
     }'
 }
 
-build_provider_v2_column_elements() {
+build_provider_v2_elements() {
   local title="$1" result="$2" quota_file="$3"
   local five_remaining="0" five_reset="0" weekly_remaining="0" weekly_reset="0" source="未知"
   local five_duration="未知" weekly_duration="未知" five_reset_time="未知" weekly_reset_time="未知"
@@ -642,35 +660,47 @@ build_provider_v2_column_elements() {
     weekly_reset_time="$(format_reset_time "$weekly_reset")"
   fi
 
-  local header_md="**${title}**\n↳ 来源　${source}"
+  local title_md="**${title}**"
+  local source_md="↳ 来源　${source}"
+  local status_md=""
   if [[ -n "$result" ]]; then
     if [[ "$result" == "发送成功" ]]; then
-      header_md+=$'\n🟢 **发送成功**'
+      status_md="🟢 **发送成功**"
     else
-      header_md+=$'\n🔴 **发送失败**'
+      status_md="🔴 **发送失败**"
     fi
   fi
-  header_md+=$'\n\n'"**5 小时**　剩余 ${five_remaining}%"
 
-  local chart_5h chart_weekly
-  chart_5h="$(build_linear_progress_chart "$five_remaining")" || return 1
-  chart_weekly="$(build_linear_progress_chart "$weekly_remaining")" || return 1
-
-  local reset_5h_md="↳ 距离重置：${five_duration}\n↳ 重置时间：${five_reset_time}\n\n**周额度**　剩余 ${weekly_remaining}%"
-  local reset_weekly_md="↳ 距离重置：${weekly_duration}\n↳ 重置时间：${weekly_reset_time}"
+  local chart_json
+  chart_json="$(build_circular_quota_chart "$five_remaining" "$weekly_remaining")" || return 1
 
   "$JQ_BIN" -n \
-    --arg header_md "$header_md" \
-    --argjson chart_5h "$chart_5h" \
-    --arg reset_5h_md "$reset_5h_md" \
-    --argjson chart_weekly "$chart_weekly" \
-    --arg reset_weekly_md "$reset_weekly_md" \
+    --arg title "$title_md" \
+    --arg src "$source_md" \
+    --arg stat "$status_md" \
+    --argjson chart "$chart_json" \
+    --arg f_rem "$five_remaining" \
+    --arg f_dur "$five_duration" \
+    --arg f_res "$five_reset_time" \
+    --arg w_rem "$weekly_remaining" \
+    --arg w_dur "$weekly_duration" \
+    --arg w_res "$weekly_reset_time" \
     '[
-      { tag: "markdown", content: $header_md },
-      $chart_5h,
-      { tag: "markdown", content: $reset_5h_md },
-      $chart_weekly,
-      { tag: "markdown", content: $reset_weekly_md }
+      { tag: "markdown", content: $title },
+      { tag: "markdown", content: $src }
+    ] +
+    (if $stat != "" then [{ tag: "markdown", content: $stat }] else [] end) +
+    [
+      $chart,
+      {
+        tag: "markdown",
+        content: ("**5 小时**　剩余 " + $f_rem + "%\n↳ 距离重置：" + $f_dur + "\n↳ 重置时间：" + $f_res)
+      },
+      { tag: "hr" },
+      {
+        tag: "markdown",
+        content: ("**周额度**　剩余 " + $w_rem + "%\n↳ 距离重置：" + $w_dur + "\n↳ 重置时间：" + $w_res)
+      }
     ]'
 }
 
@@ -700,10 +730,10 @@ build_feishu_v2_task_payload() {
     local provider_elements
     case "$provider" in
       codex)
-        provider_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+        provider_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
         ;;
       antigravity)
-        provider_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+        provider_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
         ;;
     esac
 
@@ -715,8 +745,8 @@ build_feishu_v2_task_payload() {
       ]')"
   elif (( ${#attempted[@]} >= 2 )); then
     local luna_elements gemini_elements
-    luna_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
-    gemini_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+    luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "${CODEX_RUN_RESULT:-发送成功}" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+    gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
 
     body_elements_json="$("$JQ_BIN" -n \
       --argjson luna "$luna_elements" \
@@ -784,8 +814,8 @@ build_feishu_v2_usage_payload() {
   local request_uuid="$2"
   local luna_elements gemini_elements
 
-  luna_elements="$(build_provider_v2_column_elements "GPT-5.6 Luna" "" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
-  gemini_elements="$(build_provider_v2_column_elements "Gemini 3.7 Flash · Low" "" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
+  luna_elements="$(build_provider_v2_elements "GPT-5.6 Luna" "" "$CODEX_QUOTA_NORMALIZED_FILE")" || return 1
+  gemini_elements="$(build_provider_v2_elements "Gemini 3.7 Flash · Low" "" "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE")" || return 1
 
   local body_elements_json
   body_elements_json="$("$JQ_BIN" -n \
