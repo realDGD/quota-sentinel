@@ -732,9 +732,12 @@ quota_failure_message() {
   printf '%s\n' \
     "来源：不可用" \
     "5 小时：□□□□□□□□□□ 获取失败" \
-    "重置：未知" \
+    "距离重置：未知" \
+    "重置时间：未知" \
+    "" \
     "周额度：□□□□□□□□□□ 获取失败" \
-    "重置：未知"
+    "距离重置：未知" \
+    "重置时间：未知"
 }
 
 format_quota_message() {
@@ -752,9 +755,12 @@ format_quota_message() {
   printf '%s\n' \
     "来源：$source" \
     "5 小时：$(quota_bar "$five_remaining") 剩余 ${five_remaining}%" \
-    "重置：$(format_reset_time "$five_reset")（剩余 $five_duration）" \
+    "距离重置：$five_duration" \
+    "重置时间：$(format_reset_time "$five_reset")" \
+    "" \
     "周额度：$(quota_bar "$weekly_remaining") 剩余 ${weekly_remaining}%" \
-    "重置：$(format_reset_time "$weekly_reset")（剩余 $weekly_duration）"
+    "距离重置：$weekly_duration" \
+    "重置时间：$(format_reset_time "$weekly_reset")"
 }
 
 normalize_pi_codex_quota() {
@@ -1283,7 +1289,8 @@ format_provider_card_section() {
 
   quota_message="${quota_message//5 小时：/**5 小时**　}"
   quota_message="${quota_message//周额度：/**周额度**　}"
-  quota_message="${quota_message//重置：/↳ 重置　}"
+  quota_message="${quota_message//距离重置：/↳ 距离重置：}"
+  quota_message="${quota_message//重置时间：/↳ 重置时间：}"
   quota_message="${quota_message//来源：/↳ 来源　}"
 
   local lines=("${(@f)quota_message}")
@@ -1305,6 +1312,7 @@ format_provider_card_section() {
   if [[ -n "$formatted_result" ]]; then
     out_lines+=("$formatted_result")
   fi
+  out_lines+=("")
   out_lines+=("${quota_body[@]}")
 
   printf '%s\n' "${out_lines[@]}"
