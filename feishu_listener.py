@@ -14,6 +14,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 
 import lark_oapi as lark
 
@@ -29,7 +30,13 @@ APP_ID_SERVICE = "com.example.quota-sentinel.feishu-app-id"
 APP_SECRET_SERVICE = "com.example.quota-sentinel.feishu-app-secret"
 USER_ID_SERVICE = "com.example.quota-sentinel.feishu-user-id"
 SCRIPT_PATH = "/Users/__USER__/code/quota-sentinel/quota-sentinel.sh"
+LOG_DIR = Path(SCRIPT_PATH).parent / "logs"
 AUTHORIZED_USER_ID: str | None = None
+
+# Outer bound for one /usage subprocess. Must stay above the shell-side
+# worst case (quota.lock wait 20s + Native ~15s + CodexBar live 2x20s + agy
+# ports + CodexBar ag 20s ≈ 100s) plus a safety margin.
+USAGE_COMMAND_TIMEOUT_SECONDS = 120
 
 
 def read_keychain(service: str) -> str:
@@ -124,11 +131,30 @@ def terminate_process_group(process: subprocess.Popen[str]) -> None:
     process.wait()
 
 
+def setup_file_logging() -> None:
+    """Mirror listener logs into the project logs/ directory next to the
+    shell run logs. Best-effort: stdout/stderr logging keeps working."""
+    try:
+        LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        handler = logging.FileHandler(LOG_DIR / "listener.log")
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
+    except OSError as exc:
+        logger.warning(f"File logging disabled: {exc}")
+
+
 def handle_usage_command(sender_id: str, message_id: str) -> None:
     logger.info(
         f"Triggering usage query for sender {sender_id} (message_id={message_id})"
     )
     process: subprocess.Popen[str] | None = None
+    started = time.monotonic()
+    elapsed = lambda: f"{time.monotonic() - started:.1f}s"
     try:
         process = subprocess.Popen(
             ["/bin/zsh", SCRIPT_PATH, "usage"],
@@ -137,17 +163,22 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
             text=True,
             start_new_session=True,
         )
-        _stdout, stderr = process.communicate(timeout=60)
+        _stdout, stderr = process.communicate(timeout=USAGE_COMMAND_TIMEOUT_SECONDS)
         if process.returncode == 0:
             logger.info(
                 f"Successfully sent /usage notification for message_id={message_id}"
+                f" (elapsed={elapsed()})"
             )
         else:
             logger.error(
-                f"Usage command returned {process.returncode}: {stderr.strip()}"
+                f"Usage command returned {process.returncode} after {elapsed()}:"
+                f" {stderr.strip()}"
             )
     except subprocess.TimeoutExpired:
-        logger.error(f"Usage command timed out for message_id={message_id}")
+        logger.error(
+            f"Usage command timed out for message_id={message_id} after"
+            f" {USAGE_COMMAND_TIMEOUT_SECONDS}s (elapsed={elapsed()})"
+        )
     except Exception as e:
         logger.error(f"Error executing usage command: {e}")
     finally:
@@ -233,6 +264,7 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
 
 def main() -> None:
     logger.info("Starting Feishu WebSocket listener...")
+    setup_file_logging()
     app_id, app_secret = get_credentials()
     if not get_authorized_user_id():
         logger.critical("Authorized Feishu user ID is missing!")

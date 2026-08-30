@@ -58,6 +58,9 @@ via Feishu WebSocket long connection (长连接, no public IP or webhook require
   results also synchronize `last_known_reset_at` and `next_due_at`; stale cache
   and Pi snapshots remain display-only. `/usage` never changes `last_task_at`
   or `last_triggered_window`.
+- If the quota probe is busy, replies with a lightweight
+  “⏳ 配额正在刷新，请稍后再试” card instead of staying silent. The busy reply
+  performs no quota fetch, no model call, and no scheduler write.
 - Filtered against bot loops (ignores non-user messages) and deduplicated.
 - Accepts commands only from the configured recipient `user_id`.
 
@@ -135,6 +138,35 @@ an Authorization header supplied to curl over stdin.
 - `usage`: Instant quota check sent to Feishu for both providers without triggering model tasks.
 - `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
 - `wait`: Precise sleep timer waking at the earliest due deadline (`min(codex, antigravity)`).
+
+## Execution Bounds & Process Hygiene
+
+Every external process is bounded so a hang can never hold the scheduler:
+
+| Operation | Bound | After the bound |
+| --- | --- | --- |
+| Model task (`run_codex` / `run_antigravity`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
+| CodexBar Live query | `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (default 20s) + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
+| Feishu WebSocket listener outer bound | 120s | Subprocess group terminated (`/usage` worst case ≈ 100s) |
+
+Timeouts run through `run_with_timeout.py`: the child gets its own session,
+SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
+period, and reaps the group so no orphans remain. Exit code 124 marks a
+timeout; the child's own exit code is otherwise propagated unchanged.
+
+## Run Log (`logs/`)
+
+Every command, operation, and result is logged with elapsed time to
+`logs/YYYY-MM-DD.log` (the WebSocket listener additionally writes
+`logs/listener.log`). The directory is created on demand with mode 0700, log
+files are 0600, and logging is best-effort — it can never break a command.
+
+Recorded events include: command start/finish with duration, quota tier
+attempts per provider (`native` / `codexbar-live` / `codexbar-cache` /
+`pi-snapshot`) with outcomes and elapsed seconds, timeout warnings, model task
+results, scheduler state changes (`state: codex next_due_at X -> Y`),
+notification deliveries, and `/usage` busy replies. Logs contain no tokens or
+secrets. Set `QUOTA_SENTINEL_LOG_DIR` to redirect the run log (the test suites do).
 
 ## Quota Acquisition Hierarchy & Freshness Model
 

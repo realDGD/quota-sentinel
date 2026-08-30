@@ -9,6 +9,7 @@ __pycache__/
 .coverage
 htmlcov/
 *.log
+logs/
 node_modules/
 dist/
 build/

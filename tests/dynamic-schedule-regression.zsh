@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly TEST_TEMP_DIR="$(mktemp -d /private/tmp/quota-sentinel.XXXXXX)"
 export QUOTA_SENTINEL_STATE_DIR="$TEST_TEMP_DIR/state"
+export QUOTA_SENTINEL_LOG_DIR="$TEST_TEMP_DIR/logs"
 export PI_SOURCE_ONLY=1
 export FEISHU_APP_ID="test-app"
 export FEISHU_APP_SECRET="test-secret"

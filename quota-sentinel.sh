@@ -2,17 +2,19 @@
 
 set -euo pipefail
 
-readonly PI_BIN="/opt/homebrew/bin/pi"
+# Binary paths are env-overridable so the regression suite can exercise the
+# real run/fetch paths against mock commands without editing this file.
+readonly PI_BIN="${QUOTA_SENTINEL_PI_BIN:-/opt/homebrew/bin/pi}"
 readonly CODEX_BIN="/opt/homebrew/bin/codex"
 readonly AGY_BIN="/opt/homebrew/bin/agy"
-readonly CODEXBAR_BIN="/opt/homebrew/bin/codexbar"
+readonly CODEXBAR_BIN="${QUOTA_SENTINEL_CODEXBAR_BIN:-/opt/homebrew/bin/codexbar}"
 readonly PYTHON3_BIN="/usr/bin/python3"
 readonly CURL_BIN="/usr/bin/curl"
 readonly JQ_BIN="/opt/homebrew/bin/jq"
 readonly SECURITY_BIN="/usr/bin/security"
 readonly SHLOCK_BIN="/usr/bin/shlock"
 readonly SLEEP_BIN="/bin/sleep"
-readonly PI_AUTH_FILE="/Users/__USER__/.pi/agent/auth.json"
+readonly PI_AUTH_FILE="${QUOTA_SENTINEL_PI_AUTH_FILE:-/Users/__USER__/.pi/agent/auth.json}"
 readonly SCRIPT_DIR="${0:A:h}"
 readonly SCRIPT_NAME="${0:t}"
 readonly CODEX_QUOTA_EXTENSION="$SCRIPT_DIR/capture-codex-quota.ts"
@@ -35,8 +37,19 @@ readonly RESET_BUFFER_SECONDS=240        # 4 minutes after reset
 readonly MAX_WINDOW_FUTURE_SECONDS=21600 # 6 hours
 readonly QUOTA_LOCK_WAIT_SECONDS=20
 readonly TIMER_RECHECK_SECONDS=60
+# Hard execution bounds: a hung model task or quota probe must never hold the
+# run/quota locks forever. Worst-case /usage collect ≈ lock 20s + Native ~15s +
+# CodexBar live 2×20s (cli+oauth) + agy ports ~4s + CodexBar ag 20s ≈ 100s,
+# which is why the listener's outer timeout is 120s.
+readonly MODEL_TASK_TIMEOUT_SECONDS="${QUOTA_SENTINEL_MODEL_TIMEOUT:-300}"
+readonly MODEL_TASK_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_MODEL_KILL_GRACE:-10}"
+readonly CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_CODEXBAR_TIMEOUT:-20}"
+readonly CODEXBAR_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_CODEXBAR_KILL_GRACE:-10}"
+readonly RUN_WITH_TIMEOUT_HELPER="$SCRIPT_DIR/run_with_timeout.py"
+readonly LOG_DIR="${QUOTA_SENTINEL_LOG_DIR:-$SCRIPT_DIR/logs}"
 
 typeset -g LAST_TEMP_DIR=""
+typeset -gi MAIN_T0=0
 typeset -g CODEX_AGENT_DIR=""
 typeset -g CODEX_STDOUT_FILE=""
 typeset -g CODEX_STDERR_FILE=""
@@ -61,13 +74,41 @@ usage() {
 }
 
 die() {
+  log_error "fatal: $*"
   print -u2 -r -- "Error: $*"
   exit 1
 }
 
+# Append-only run log with timing, one file per day under LOG_DIR. Logging is
+# best-effort: it must never break the command it observes. Lines carry the
+# PID so concurrent watchdog/timer/usage writers stay attributable. No tokens
+# or secrets are ever passed to these functions.
+log_line() {
+  local level="$1" file
+  shift
+  file="$LOG_DIR/$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d').log"
+  mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+  chmod 700 "$LOG_DIR" 2>/dev/null || true
+  printf '[%s] [%s] [%d] %s\n' \
+    "$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d %H:%M:%S')" "$level" "$$" "$*" \
+    >>"$file" 2>/dev/null || return 0
+  chmod 600 "$file" 2>/dev/null || true
+}
+
+log_info() { log_line INFO "$*"; }
+log_warn() { log_line WARN "$*"; }
+log_error() { log_line ERROR "$*"; }
+
+# Durations use whole seconds via /bin/date; every timed operation logs
+# "what / outcome / elapsed". now_epoch is a tiny readability helper.
+now_epoch() { /bin/date '+%s'; }
+
 cleanup() {
   release_run_lock
   release_quota_lock
+  if (( MAIN_T0 > 0 )); then
+    log_info "command: finished ($(( $(now_epoch) - MAIN_T0 ))s)"
+  fi
   if [[ -n "$LAST_TEMP_DIR" ]] &&
     [[ "$LAST_TEMP_DIR" == /private/tmp/quota-sentinel.* ]] &&
     [[ -d "$LAST_TEMP_DIR" ]]; then
@@ -78,6 +119,9 @@ cleanup() {
 ensure_temp_dir() {
   if [[ -z "$LAST_TEMP_DIR" ]]; then
     LAST_TEMP_DIR="$(mktemp -d /private/tmp/quota-sentinel.XXXXXX)"
+    # mktemp -d already yields 0700; make the invariant explicit because this
+    # directory receives a copy of the Pi auth credential during model runs.
+    chmod 700 "$LAST_TEMP_DIR"
   fi
   CODEXBAR_CODEX_RAW_FILE="$LAST_TEMP_DIR/codexbar-codex.json"
   CODEXBAR_ANTIGRAVITY_RAW_FILE="$LAST_TEMP_DIR/codexbar-antigravity.json"
@@ -109,18 +153,17 @@ migrate_legacy_state() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  # Migrate last-task-at
+  # Migrate last-task-at. Writes go through the shared atomic writer so a
+  # crash mid-migration can never leave a truncated state file behind.
   if [[ -r "$STATE_DIR/last-task-at" ]]; then
     local legacy_task
     legacy_task="$(<"$STATE_DIR/last-task-at")"
     if [[ "$legacy_task" =~ ^[0-9]+$ ]]; then
       if [[ ! -r "$STATE_DIR/codex-last-task-at" ]]; then
-        print -r -- "$legacy_task" >"$STATE_DIR/codex-last-task-at"
-        chmod 600 "$STATE_DIR/codex-last-task-at"
+        atomic_write_state_file "$STATE_DIR/codex-last-task-at" "$legacy_task"
       fi
       if [[ ! -r "$STATE_DIR/antigravity-last-task-at" ]]; then
-        print -r -- "$legacy_task" >"$STATE_DIR/antigravity-last-task-at"
-        chmod 600 "$STATE_DIR/antigravity-last-task-at"
+        atomic_write_state_file "$STATE_DIR/antigravity-last-task-at" "$legacy_task"
       fi
     fi
   fi
@@ -131,12 +174,10 @@ migrate_legacy_state() {
     legacy_due="$(<"$STATE_DIR/next-due-at")"
     if [[ "$legacy_due" =~ ^[0-9]+$ ]]; then
       if [[ ! -r "$STATE_DIR/codex-next-due-at" ]]; then
-        print -r -- "$legacy_due" >"$STATE_DIR/codex-next-due-at"
-        chmod 600 "$STATE_DIR/codex-next-due-at"
+        atomic_write_state_file "$STATE_DIR/codex-next-due-at" "$legacy_due"
       fi
       if [[ ! -r "$STATE_DIR/antigravity-next-due-at" ]]; then
-        print -r -- "$legacy_due" >"$STATE_DIR/antigravity-next-due-at"
-        chmod 600 "$STATE_DIR/antigravity-next-due-at"
+        atomic_write_state_file "$STATE_DIR/antigravity-next-due-at" "$legacy_due"
       fi
     fi
   fi
@@ -149,20 +190,16 @@ migrate_legacy_state() {
       local c_win="${legacy_window%%:*}"
       local a_win="${legacy_window##*:}"
       if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-triggered-window" ]]; then
-        print -r -- "$c_win" >"$STATE_DIR/codex-last-triggered-window"
-        chmod 600 "$STATE_DIR/codex-last-triggered-window"
+        atomic_write_state_file "$STATE_DIR/codex-last-triggered-window" "$c_win"
       fi
       if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-triggered-window" ]]; then
-        print -r -- "$a_win" >"$STATE_DIR/antigravity-last-triggered-window"
-        chmod 600 "$STATE_DIR/antigravity-last-triggered-window"
+        atomic_write_state_file "$STATE_DIR/antigravity-last-triggered-window" "$a_win"
       fi
       if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-known-reset-at" ]]; then
-        print -r -- "$c_win" >"$STATE_DIR/codex-last-known-reset-at"
-        chmod 600 "$STATE_DIR/codex-last-known-reset-at"
+        atomic_write_state_file "$STATE_DIR/codex-last-known-reset-at" "$c_win"
       fi
       if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-known-reset-at" ]]; then
-        print -r -- "$a_win" >"$STATE_DIR/antigravity-last-known-reset-at"
-        chmod 600 "$STATE_DIR/antigravity-last-known-reset-at"
+        atomic_write_state_file "$STATE_DIR/antigravity-last-known-reset-at" "$a_win"
       fi
     fi
   fi
@@ -178,16 +215,27 @@ read_provider_next_due() {
   print -r -- "$value"
 }
 
-write_provider_next_due() {
-  local provider="$1" epoch="$2" file temp_file
-  [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid next-run timestamp: $epoch"
+# Single atomic writer for scheduler state: readers must only ever observe the
+# complete old or complete new value. Every state write funnels through here.
+atomic_write_state_file() {
+  local file="$1" value="$2" temp_file
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
-  file="$(provider_next_due_file "$provider")"
   temp_file="${file}.tmp.$$"
-  print -r -- "$epoch" >"$temp_file"
+  print -r -- "$value" >"$temp_file"
   chmod 600 "$temp_file"
   mv -f "$temp_file" "$file"
+}
+
+write_provider_next_due() {
+  local provider="$1" epoch="$2" file old=""
+  [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid next-run timestamp: $epoch"
+  file="$(provider_next_due_file "$provider")"
+  old="$(read_provider_next_due "$provider" 2>/dev/null || true)"
+  atomic_write_state_file "$file" "$epoch"
+  if [[ "$old" != "$epoch" ]]; then
+    log_info "state: $provider next_due_at ${old:-<unset>} -> $epoch"
+  fi
 }
 
 read_provider_last_task() {
@@ -201,15 +249,10 @@ read_provider_last_task() {
 }
 
 write_provider_last_task() {
-  local provider="$1" epoch="$2" file temp_file
+  local provider="$1" epoch="$2" file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-task timestamp: $epoch"
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
   file="$(provider_last_task_file "$provider")"
-  temp_file="${file}.tmp.$$"
-  print -r -- "$epoch" >"$temp_file"
-  chmod 600 "$temp_file"
-  mv -f "$temp_file" "$file"
+  atomic_write_state_file "$file" "$epoch"
 }
 
 read_provider_last_known_reset() {
@@ -223,15 +266,10 @@ read_provider_last_known_reset() {
 }
 
 write_provider_last_known_reset() {
-  local provider="$1" epoch="$2" file temp_file
+  local provider="$1" epoch="$2" file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-known-reset timestamp: $epoch"
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
   file="$(provider_last_known_reset_file "$provider")"
-  temp_file="${file}.tmp.$$"
-  print -r -- "$epoch" >"$temp_file"
-  chmod 600 "$temp_file"
-  mv -f "$temp_file" "$file"
+  atomic_write_state_file "$file" "$epoch"
 }
 
 read_provider_last_window() {
@@ -245,15 +283,10 @@ read_provider_last_window() {
 }
 
 write_provider_last_window() {
-  local provider="$1" window_id="$2" file temp_file
+  local provider="$1" window_id="$2" file
   [[ -n "$window_id" ]] || return 1
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
   file="$(provider_last_window_file "$provider")"
-  temp_file="${file}.tmp.$$"
-  print -r -- "$window_id" >"$temp_file"
-  chmod 600 "$temp_file"
-  mv -f "$temp_file" "$file"
+  atomic_write_state_file "$file" "$window_id"
 }
 
 read_next_due() {
@@ -479,14 +512,16 @@ send_feishu_message() {
   local app_secret="$2"
   local user_id="$3"
   local message_or_payload="$4"
-  local token payload response
+  local token payload response t0
 
   if [[ "${FEISHU_DRY_RUN:-0}" == "1" ]]; then
+    log_info "notify: dry-run (${#message_or_payload} bytes)"
     print -r -- "$message_or_payload"
     return 0
   fi
 
-  token="$(feishu_tenant_token "$app_id" "$app_secret")" || return 1
+  t0="$(now_epoch)"
+  token="$(feishu_tenant_token "$app_id" "$app_secret")" || { log_error "notify: token request failed"; return 1; }
 
   if [[ "$message_or_payload" =~ '^[[:space:]]*\{' ]] && print -r -- "$message_or_payload" | "$JQ_BIN" -e '.receive_id and .msg_type' >/dev/null 2>&1; then
     payload="$message_or_payload"
@@ -496,14 +531,17 @@ send_feishu_message() {
 
   if ! response="$(feishu_api "$token" "im/v1/messages?receive_id_type=user_id" \
     --data-binary "$payload")"; then
+    log_error "notify: send failed ($(( $(now_epoch) - t0 ))s)"
     print -u2 -r -- "Feishu message request failed: $(feishu_error_detail "$response")"
     return 1
   fi
 
   if ! print -r -- "$response" | "$JQ_BIN" -e '.code == 0' >/dev/null; then
+    log_error "notify: rejected ($(( $(now_epoch) - t0 ))s)"
     print -u2 -r -- "Feishu rejected the message: $(feishu_error_detail "$response")"
     return 1
   fi
+  log_info "notify: sent ($(( $(now_epoch) - t0 ))s, ${#payload} bytes)"
 }
 
 build_linear_progress_chart() {
@@ -1048,13 +1086,18 @@ prepare_quota_probe() {
 }
 
 run_codex() {
-  local output exit_code=0
+  local output exit_code=0 t0
+  t0="$(now_epoch)"
   (
     cd /private/tmp
     PI_CODING_AGENT_DIR="$CODEX_AGENT_DIR" \
     PI_CODEX_QUOTA_FILE="$CODEX_QUOTA_FILE" \
     PI_OFFLINE=1 \
-    "$PI_BIN" \
+    "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$MODEL_TASK_TIMEOUT_SECONDS" \
+      --kill-grace "$MODEL_TASK_KILL_GRACE_SECONDS" \
+      -- \
+      "$PI_BIN" \
       --provider openai-codex \
       --model gpt-5.6-luna \
       --thinking off \
@@ -1074,19 +1117,33 @@ run_codex() {
       -- "不用思考，只回复我 1"
   ) >"$CODEX_STDOUT_FILE" 2>>"$CODEX_STDERR_FILE" || exit_code=$?
 
+  local elapsed=$(( $(now_epoch) - t0 ))
+  if (( exit_code == 124 )); then
+    log_warn "run codex: TIMEOUT after ${MODEL_TASK_TIMEOUT_SECONDS}s (grace ${MODEL_TASK_KILL_GRACE_SECONDS}s)"
+  fi
   output="$(<"$CODEX_STDOUT_FILE")"
-  (( exit_code == 0 )) && [[ "$output" == "1" ]]
+  if (( exit_code == 0 )) && [[ "$output" == "1" ]]; then
+    log_info "run codex: success (${elapsed}s)"
+    return 0
+  fi
+  log_error "run codex: failed exit=$exit_code (${elapsed}s)"
+  return 1
 }
 
 run_antigravity() {
-  local output exit_code=0
+  local output exit_code=0 t0
+  t0="$(now_epoch)"
   (
     cd /private/tmp
     PI_CODING_AGENT_DIR="$ANTIGRAVITY_AGENT_DIR" \
     PI_ANTIGRAVITY_QUOTA_FILE="$ANTIGRAVITY_QUOTA_FILE" \
     PI_OFFLINE=1 \
     ANTIGRAVITY_NO_PREWARM=1 \
-    "$PI_BIN" \
+    "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$MODEL_TASK_TIMEOUT_SECONDS" \
+      --kill-grace "$MODEL_TASK_KILL_GRACE_SECONDS" \
+      -- \
+      "$PI_BIN" \
       --provider antigravity \
       --model gemini-3.7-flash \
       --thinking low \
@@ -1107,8 +1164,17 @@ run_antigravity() {
       -- "不用思考，只回复我 1"
   ) >"$ANTIGRAVITY_STDOUT_FILE" 2>>"$ANTIGRAVITY_STDERR_FILE" || exit_code=$?
 
+  local elapsed=$(( $(now_epoch) - t0 ))
+  if (( exit_code == 124 )); then
+    log_warn "run antigravity: TIMEOUT after ${MODEL_TASK_TIMEOUT_SECONDS}s (grace ${MODEL_TASK_KILL_GRACE_SECONDS}s)"
+  fi
   output="$(<"$ANTIGRAVITY_STDOUT_FILE")"
-  (( exit_code == 0 )) && [[ "$output" == "1" ]]
+  if (( exit_code == 0 )) && [[ "$output" == "1" ]]; then
+    log_info "run antigravity: success (${elapsed}s)"
+    return 0
+  fi
+  log_error "run antigravity: failed exit=$exit_code (${elapsed}s)"
+  return 1
 }
 
 format_reset_time() {
@@ -1181,10 +1247,20 @@ format_quota_message() {
     "重置时间：$(format_reset_time "$weekly_reset")"
 }
 
+# Shared jq preamble (kept inline per call site to avoid quoting hazards):
+# normalize a capturedAt value into a Unix epoch integer. Numbers pass
+# through, ISO-8601 strings (with optional fractional seconds) convert,
+# anything missing/unparseable becomes null — never "now", so a stale
+# snapshot can never be made to look freshly captured. Idempotent.
+
 normalize_pi_codex_quota() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
   "$JQ_BIN" -e '
+    def epoch_ts:
+      if type == "number" then floor
+      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      else null end;
     .headers as $h |
     ($h["x-codex-primary-used-percent"] | tonumber) as $primary_used |
     ($h["x-codex-primary-window-minutes"] | tonumber) as $primary_window |
@@ -1199,7 +1275,7 @@ normalize_pi_codex_quota() {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
       cached: true,
-      capturedAt: (.capturedAt // (now | floor)),
+      capturedAt: ((.capturedAt // null) | epoch_ts),
       fiveHour: {remainingPercent: (100 - $primary_used), resetAt: $primary_reset},
       weekly: {remainingPercent: (100 - $secondary_used), resetAt: $secondary_reset}
     }
@@ -1210,6 +1286,10 @@ normalize_pi_antigravity_quota() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
   "$JQ_BIN" -e '
+    def epoch_ts:
+      if type == "number" then floor
+      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      else null end;
     (.fiveHour.remainingPercent | tonumber) as $five_remaining |
     (.fiveHour.resetAt | tonumber) as $five_reset |
     (.weekly.remainingPercent | tonumber) as $weekly_remaining |
@@ -1220,7 +1300,7 @@ normalize_pi_antigravity_quota() {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
       cached: true,
-      capturedAt: (.capturedAt // (now | floor)),
+      capturedAt: ((.capturedAt // null) | epoch_ts),
       fiveHour: {remainingPercent: $five_remaining, resetAt: $five_reset},
       weekly: {remainingPercent: $weekly_remaining, resetAt: $weekly_reset}
     }
@@ -1438,7 +1518,7 @@ def get_antigravity_native():
                     if p:
                         ports.append(p)
 
-    ports = list(dict.fromkeys(ports))
+    ports = list(dict.fromkeys(ports))[:3]
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -1545,32 +1625,59 @@ save_codexbar_cache() {
   mv -f "$temp_cache" "$cache_file"
 }
 
+# CodexBar runs under the shared process-group timeout: a hung `codexbar
+# usage` (it may spawn its own codex/agy children) must not stall quota
+# collection while the quota lock is held. rc=124 means the timeout fired.
 fetch_codexbar_codex_quota() {
-  local output="$1"
+  local output="$1" rc=0
   [[ -x "$CODEXBAR_BIN" ]] || return 1
-  if "$CODEXBAR_BIN" usage --provider codex --source cli --format json --json-only --no-color \
-    >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
-    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
-    save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
-    return 0
+  if "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$CODEXBAR_TIMEOUT_SECONDS" \
+      --kill-grace "$CODEXBAR_KILL_GRACE_SECONDS" \
+      -- \
+      "$CODEXBAR_BIN" usage --provider codex --source cli --format json --json-only --no-color \
+      >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr"; then
+    if normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
+      save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
+      return 0
+    fi
+  else
+    rc=$?
+    (( rc == 124 )) && log_warn "quota codex: codexbar-live TIMEOUT after ${CODEXBAR_TIMEOUT_SECONDS}s (source cli)"
   fi
-  if "$CODEXBAR_BIN" usage --provider codex --source oauth --format json --json-only --no-color \
-    >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr" &&
-    normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
-    save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
-    return 0
+  if "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$CODEXBAR_TIMEOUT_SECONDS" \
+      --kill-grace "$CODEXBAR_KILL_GRACE_SECONDS" \
+      -- \
+      "$CODEXBAR_BIN" usage --provider codex --source oauth --format json --json-only --no-color \
+      >"$CODEXBAR_CODEX_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-codex.stderr"; then
+    if normalize_codexbar_codex_quota "$CODEXBAR_CODEX_RAW_FILE" "$output"; then
+      save_codexbar_cache "$output" "$CODEXBAR_CODEX_CACHE_FILE" || true
+      return 0
+    fi
+  else
+    rc=$?
+    (( rc == 124 )) && log_warn "quota codex: codexbar-live TIMEOUT after ${CODEXBAR_TIMEOUT_SECONDS}s (source oauth)"
   fi
   return 1
 }
 
 fetch_codexbar_antigravity_quota() {
-  local output="$1"
+  local output="$1" rc=0
   [[ -x "$CODEXBAR_BIN" ]] || return 1
-  if "$CODEXBAR_BIN" usage --provider antigravity --source cli --format json --json-only --no-color \
-    >"$CODEXBAR_ANTIGRAVITY_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-antigravity.stderr" &&
-    normalize_codexbar_antigravity_quota "$CODEXBAR_ANTIGRAVITY_RAW_FILE" "$output"; then
-    save_codexbar_cache "$output" "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" || true
-    return 0
+  if "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$CODEXBAR_TIMEOUT_SECONDS" \
+      --kill-grace "$CODEXBAR_KILL_GRACE_SECONDS" \
+      -- \
+      "$CODEXBAR_BIN" usage --provider antigravity --source cli --format json --json-only --no-color \
+      >"$CODEXBAR_ANTIGRAVITY_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-antigravity.stderr"; then
+    if normalize_codexbar_antigravity_quota "$CODEXBAR_ANTIGRAVITY_RAW_FILE" "$output"; then
+      save_codexbar_cache "$output" "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" || true
+      return 0
+    fi
+  else
+    rc=$?
+    (( rc == 124 )) && log_warn "quota antigravity: codexbar-live TIMEOUT after ${CODEXBAR_TIMEOUT_SECONDS}s"
   fi
   return 1
 }
@@ -1579,11 +1686,16 @@ use_codexbar_cached_codex() {
   local output="$1"
   [[ -s "$CODEXBAR_CODEX_CACHE_FILE" ]] || return 1
   "$JQ_BIN" -e '
+    def epoch_ts:
+      if type == "number" then floor
+      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      else null end;
     select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
       fresh: false,
-      cached: true
+      cached: true,
+      capturedAt: ((.capturedAt // null) | epoch_ts)
     }
   ' "$CODEXBAR_CODEX_CACHE_FILE" >"$output" 2>/dev/null || return 1
   [[ -s "$output" ]] || return 1
@@ -1593,11 +1705,16 @@ use_codexbar_cached_antigravity() {
   local output="$1"
   [[ -s "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" ]] || return 1
   "$JQ_BIN" -e '
+    def epoch_ts:
+      if type == "number" then floor
+      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      else null end;
     select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
       fresh: false,
-      cached: true
+      cached: true,
+      capturedAt: ((.capturedAt // null) | epoch_ts)
     }
   ' "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" >"$output" 2>/dev/null || return 1
   [[ -s "$output" ]] || return 1
@@ -1623,6 +1740,23 @@ save_pi_quota_snapshots() {
   fi
 }
 
+# Read a stale quota file from disk through the normalized-schema boundary:
+# validates the shape and rewrites capturedAt to the epoch-integer/null
+# contract, so historical ISO-string files cannot leak into effective quota.
+renormalise_quota_file() {
+  local input="$1" output="$2"
+  [[ -s "$input" ]] || return 1
+  "$JQ_BIN" -e '
+    def epoch_ts:
+      if type == "number" then floor
+      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      else null end;
+    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
+    . + {capturedAt: ((.capturedAt // null) | epoch_ts)}
+  ' "$input" >"$output" 2>/dev/null || return 1
+  [[ -s "$output" ]] || return 1
+}
+
 use_pi_snapshot_codex() {
   local output="$1"
   local normalized="$LAST_TEMP_DIR/codex-pi-normalized.json"
@@ -1630,8 +1764,7 @@ use_pi_snapshot_codex() {
     cp -p "$normalized" "$output"
     return 0
   fi
-  [[ -s "$PI_CODEX_SNAPSHOT_FILE" ]] || return 1
-  cp -p "$PI_CODEX_SNAPSHOT_FILE" "$output"
+  renormalise_quota_file "$PI_CODEX_SNAPSHOT_FILE" "$output"
 }
 
 use_pi_snapshot_antigravity() {
@@ -1641,8 +1774,7 @@ use_pi_snapshot_antigravity() {
     cp -p "$normalized" "$output"
     return 0
   fi
-  [[ -s "$PI_ANTIGRAVITY_SNAPSHOT_FILE" ]] || return 1
-  cp -p "$PI_ANTIGRAVITY_SNAPSHOT_FILE" "$output"
+  renormalise_quota_file "$PI_ANTIGRAVITY_SNAPSHOT_FILE" "$output"
 }
 
 use_pi_or_saved_codex_fallback() {
@@ -1653,33 +1785,51 @@ use_pi_or_saved_antigravity_fallback() {
   use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
 }
 
+quota_tier() {
+  local provider="$1" tier="$2" t0 rc=0 elapsed
+  shift 2
+  t0="$(now_epoch)"
+  "$@" || rc=$?
+  elapsed=$(( $(now_epoch) - t0 ))
+  if (( rc == 0 )); then
+    log_info "quota $provider: $tier ok (${elapsed}s)"
+  elif (( rc == 124 )); then
+    log_warn "quota $provider: $tier TIMEOUT (${elapsed}s)"
+  else
+    log_warn "quota $provider: $tier fail rc=$rc (${elapsed}s)"
+  fi
+  return $rc
+}
+
 collect_effective_quotas() {
   prepare_quota_probe
 
   # Codex 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
-  if fetch_native_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
+  if quota_tier codex native fetch_native_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
     CODEX_QUOTA_IS_FRESH=1
-  elif fetch_codexbar_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier codex codexbar-live fetch_codexbar_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
     CODEX_QUOTA_IS_FRESH=1
-  elif use_codexbar_cached_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier codex codexbar-cache use_codexbar_cached_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
     CODEX_QUOTA_IS_FRESH=0
-  elif use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier codex pi-snapshot use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
     CODEX_QUOTA_IS_FRESH=0
   else
     CODEX_QUOTA_IS_FRESH=0
+    log_error "quota codex: all tiers unavailable"
   fi
 
   # Antigravity 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
-  if fetch_native_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+  if quota_tier antigravity native fetch_native_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
     ANTIGRAVITY_QUOTA_IS_FRESH=1
-  elif fetch_codexbar_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier antigravity codexbar-live fetch_codexbar_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
     ANTIGRAVITY_QUOTA_IS_FRESH=1
-  elif use_codexbar_cached_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier antigravity codexbar-cache use_codexbar_cached_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
     ANTIGRAVITY_QUOTA_IS_FRESH=0
-  elif use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
+  elif quota_tier antigravity pi-snapshot use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
     ANTIGRAVITY_QUOTA_IS_FRESH=0
   else
     ANTIGRAVITY_QUOTA_IS_FRESH=0
+    log_error "quota antigravity: all tiers unavailable"
   fi
 }
 
@@ -2000,6 +2150,7 @@ run_selected_providers() {
     # Seed the durable no-quota fallback before the model starts. A later
     # successful fresh probe replaces this with reset + four minutes.
     write_provider_next_due "$provider" $(( attempt_at + RUN_INTERVAL_SECONDS ))
+    log_info "run: attempt $provider (last_task=$attempt_at, fallback_due=$(( attempt_at + RUN_INTERVAL_SECONDS )))"
     case "$provider" in
       codex)
         run_codex &
@@ -2028,9 +2179,14 @@ run_selected_providers() {
       if [[ "$reset_val" =~ ^[0-9]+$ ]]; then
         write_provider_last_window "$provider" "$reset_val"
         sync_provider_deadline_from_quota "$provider" "$probe_now"
+        log_info "run: post-run sync $provider fresh_reset=$reset_val due=$(( reset_val + RESET_BUFFER_SECONDS ))"
+      else
+        log_info "run: post-run sync $provider no valid fresh reset (fallback stands)"
       fi
     done
     release_quota_lock
+  else
+    log_warn "run: post-run quota.lock busy after ${QUOTA_LOCK_WAIT_SECONDS}s; fallback deadline stands"
   fi
 
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
@@ -2053,9 +2209,26 @@ run_and_reschedule_selected() {
   release_run_lock
 }
 
+usage_busy_message() {
+  # Deliberately vague: no lock names, PIDs, or timeout internals reach the
+  # user. The busy path runs zero probes and never touches scheduler state.
+  feishu_message_payload "$(feishu_user_id)" \
+    "⏳ 配额正在刷新，请稍后再试" \
+    "quota-sentinel-busy-$(now_epoch)"
+}
+
 send_usage_notification() {
-  local codex_quota antigravity_quota notification
-  acquire_quota_lock_with_timeout || die "Quota probe is busy; try /usage again shortly"
+  local codex_quota antigravity_quota notification t0
+  t0="$(now_epoch)"
+  log_info "usage: requested"
+
+  if ! acquire_quota_lock_with_timeout; then
+    log_warn "usage: quota busy after ${QUOTA_LOCK_WAIT_SECONDS}s; replying busy"
+    dispatch_notification "$(usage_busy_message)"
+    log_info "usage: busy reply delivered ($(( $(now_epoch) - t0 ))s)"
+    return 0
+  fi
+
   prepare_quota_probe
   collect_effective_quotas
 
@@ -2079,6 +2252,7 @@ send_usage_notification() {
   fi
   release_quota_lock
   dispatch_notification "$notification"
+  log_info "usage: completed ($(( $(now_epoch) - t0 ))s)"
 }
 
 setup_mock_preview_quota() {
@@ -2137,14 +2311,16 @@ send_test_card() {
 }
 
 check_schedule() {
-  local due_providers=()
+  local due_providers=() t0 elapsed c_due a_due
 
   # Serialize the due decision and the subsequent model run. Without this,
   # watchdog and precision-timer processes can both decide from the same stale
   # deadline and run the provider twice after the first lock holder exits.
-  acquire_run_lock || return 0
+  t0="$(now_epoch)"
+  acquire_run_lock || { log_info "check: run.lock busy, skipped"; return 0; }
   if ! acquire_quota_lock; then
     release_run_lock
+    log_info "check: quota.lock busy, skipped"
     return 0
   fi
   prepare_quota_probe
@@ -2158,17 +2334,23 @@ check_schedule() {
   fi
   release_quota_lock
 
+  elapsed=$(( $(now_epoch) - t0 ))
   if (( ${#due_providers[@]} == 0 )); then
+    c_due="$(read_provider_next_due codex 2>/dev/null || true)"
+    a_due="$(read_provider_next_due antigravity 2>/dev/null || true)"
+    log_info "check: nothing due (codex next $(format_reset_time "$c_due" 2>/dev/null || echo unset), antigravity next $(format_reset_time "$a_due" 2>/dev/null || echo unset)) (${elapsed}s)"
     release_run_lock
     return 0
   fi
 
+  log_info "check: due providers: ${due_providers[*]} (${elapsed}s)"
   run_selected_providers "${due_providers[@]}"
   release_run_lock
 }
 
 wait_schedule() {
   local now next_due delay
+  log_info "timer: watching deadlines (recheck every ${TIMER_RECHECK_SECONDS}s)"
   while true; do
     now="$(/bin/date '+%s')"
     if next_due="$(read_next_due)" && (( now < next_due )); then
@@ -2185,6 +2367,8 @@ wait_schedule() {
 
 main() {
   local command="${1:-run}"
+  MAIN_T0="$(now_epoch)"
+  log_info "command: $command ${2:-} (pid $$)"
 
   case "$command" in
     check)
