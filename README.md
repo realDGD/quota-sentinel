@@ -196,6 +196,16 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
   Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
 - **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
 
+## Matured Deadlines & Fresh Calibration (P1-1)
+
+Fresh quota may recalibrate a deadline only while the existing deadline has
+not yet matured. Once `now >= next_due_at`, that task debt is committed: the
+due decision wins, fresh data is ignored for this round (logged as
+`matured debt ... ignored`), and the task must be attempted (Pending /
+Initial Burst) before a newer quota reset may move the next cycle. Without
+this rule a quota probe taken at the due moment re-anchors the window and
+starves the task indefinitely (observed live 2026-08-30).
+
 ## Failure Retry & Pending Debt
 
 A provider's `last_task_at` records the last **successful** model task only.

@@ -2227,14 +2227,30 @@ sync_provider_deadline_from_quota() {
 }
 
 evaluate_provider() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}" next_due fallback_due
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" next_due fallback_due fresh_candidate
 
-  # Fresh quota may move the deadline. Stale cache/snapshots never write it.
+  # A matured deadline is a committed debt: this cycle's fresh quota may not
+  # cancel it (P1-1 starvation, reproduced live 2026-08-30 18:11 — a probe at
+  # due time re-anchored the window and pushed 18:11:35 to 23:15:38). Decide
+  # BEFORE any fresh sync and leave next_due_at untouched on this path.
+  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
+  if [[ "$next_due" =~ ^[0-9]+$ ]] && (( now >= next_due )); then
+    fresh_candidate="$(five_hour_reset_at "$(provider_normalized_quota_file "$provider")" 2>/dev/null || true)"
+    if [[ "$fresh_candidate" =~ ^[0-9]+$ ]]; then
+      log_info "sched $provider: matured debt due=$next_due; fresh candidate reset=$fresh_candidate ignored this round"
+    else
+      log_info "sched $provider: matured debt due=$next_due; no valid fresh data"
+    fi
+    return 0
+  fi
+
+  # Not matured: fresh quota may recalibrate the deadline, earlier or later.
+  # Stale cache/snapshots never write it.
   sync_provider_deadline_from_quota "$provider" "$now" || true
 
   # With no usable deadline, seed the no-quota fallback from the last real task.
   # An existing deadline is preserved exactly when the current probe is stale.
-  next_due="$(read_provider_next_due "$provider" || true)"
+  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
   if [[ ! "$next_due" =~ ^[0-9]+$ ]]; then
     fallback_due="$(provider_fallback_due "$provider" "$now")"
     next_due="$fallback_due"
