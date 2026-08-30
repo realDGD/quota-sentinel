@@ -45,6 +45,16 @@ readonly MODEL_TASK_TIMEOUT_SECONDS="${QUOTA_SENTINEL_MODEL_TIMEOUT:-300}"
 readonly MODEL_TASK_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_MODEL_KILL_GRACE:-10}"
 readonly CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_CODEXBAR_TIMEOUT:-20}"
 readonly CODEXBAR_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_CODEXBAR_KILL_GRACE:-10}"
+# Retry policy: a model task only counts when it truly succeeds. A due task is
+# marked retry_pending BEFORE its first attempt and repaid by bursts — the
+# initial burst makes at most INITIAL_ATTEMPT_LIMIT total attempts, later
+# watchdog bursts at most WATCHDOG_ATTEMPT_LIMIT total attempts, with a fixed
+# interval between attempts. WATCHDOG_RETRY_GAP_SECONDS spaces watchdog bursts
+# apart (780s < the 15-min launchd grid, so no grid point is ever skipped).
+readonly RETRY_INTERVAL_SECONDS="${QUOTA_SENTINEL_RETRY_INTERVAL:-30}"
+readonly INITIAL_ATTEMPT_LIMIT="${QUOTA_SENTINEL_INITIAL_ATTEMPTS:-3}"
+readonly WATCHDOG_ATTEMPT_LIMIT="${QUOTA_SENTINEL_WATCHDOG_ATTEMPTS:-2}"
+readonly WATCHDOG_RETRY_GAP_SECONDS="${QUOTA_SENTINEL_WATCHDOG_RETRY_GAP:-780}"
 readonly RUN_WITH_TIMEOUT_HELPER="$SCRIPT_DIR/run_with_timeout.py"
 readonly LOG_DIR="${QUOTA_SENTINEL_LOG_DIR:-$SCRIPT_DIR/logs}"
 
@@ -103,6 +113,16 @@ log_error() { log_line ERROR "$*"; }
 # "what / outcome / elapsed". now_epoch is a tiny readability helper.
 now_epoch() { /bin/date '+%s'; }
 
+# Retry-policy sanity: refuse configs that would never attempt or would spin.
+[[ "$RETRY_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+  die "QUOTA_SENTINEL_RETRY_INTERVAL must be a positive integer"
+[[ "$INITIAL_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
+  die "QUOTA_SENTINEL_INITIAL_ATTEMPTS must be a positive integer"
+[[ "$WATCHDOG_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
+  die "QUOTA_SENTINEL_WATCHDOG_ATTEMPTS must be a positive integer"
+[[ "$WATCHDOG_RETRY_GAP_SECONDS" =~ ^[0-9]+$ ]] ||
+  die "QUOTA_SENTINEL_WATCHDOG_RETRY_GAP must be a non-negative integer"
+
 cleanup() {
   release_run_lock
   release_quota_lock
@@ -137,6 +157,16 @@ provider_next_due_file() {
 provider_last_task_file() {
   local provider="$1"
   print -r -- "$STATE_DIR/${provider}-last-task-at"
+}
+
+provider_last_attempt_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-last-attempt-at"
+}
+
+provider_retry_pending_file() {
+  local provider="$1"
+  print -r -- "$STATE_DIR/${provider}-retry-pending"
 }
 
 provider_last_known_reset_file() {
@@ -203,6 +233,21 @@ migrate_legacy_state() {
       fi
     fi
   fi
+
+  # Seed last-attempt-at for upgrades: the pre-retry-era last_task_at recorded
+  # the most recent attempt, so it is the best conservative initial value.
+  # retry_pending deliberately starts at 0 (missing file) — there is no
+  # reliable evidence of an outstanding debt from before this version.
+  local m_provider m_task
+  for m_provider in codex antigravity; do
+    if [[ ! -r "$STATE_DIR/${m_provider}-last-attempt-at" ]] &&
+      [[ -r "$STATE_DIR/${m_provider}-last-task-at" ]]; then
+      m_task="$(<"$STATE_DIR/${m_provider}-last-task-at")"
+      if [[ "$m_task" =~ ^[0-9]+$ ]]; then
+        atomic_write_state_file "$STATE_DIR/${m_provider}-last-attempt-at" "$m_task"
+      fi
+    fi
+  done
 }
 
 read_provider_next_due() {
@@ -255,6 +300,51 @@ write_provider_last_task() {
   atomic_write_state_file "$file" "$epoch"
 }
 
+read_provider_last_attempt() {
+  local provider="$1" file value
+  migrate_legacy_state
+  file="$(provider_last_attempt_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  print -r -- "$value"
+}
+
+write_provider_last_attempt() {
+  local provider="$1" epoch="$2" file old=""
+  [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-attempt timestamp: $epoch"
+  file="$(provider_last_attempt_file "$provider")"
+  old="$(read_provider_last_attempt "$provider" 2>/dev/null || true)"
+  atomic_write_state_file "$file" "$epoch"
+  if [[ "$old" != "$epoch" ]]; then
+    log_info "state: $provider last_attempt_at ${old:-<unset>} -> $epoch"
+  fi
+}
+
+# retry_pending=1 means "this provider owes one due-but-unsucceeded task".
+# A missing file reads as 0, so the state only exists once a debt is recorded.
+read_provider_retry_pending() {
+  local provider="$1" file value
+  file="$(provider_retry_pending_file "$provider")"
+  [[ -r "$file" ]] || return 1
+  value="$(<"$file")"
+  [[ "$value" == "1" ]] || return 1
+  print -r -- "1"
+}
+
+write_provider_retry_pending() {
+  local provider="$1" value="$2" file old="0"
+  [[ "$value" == "0" || "$value" == "1" ]] || die "Invalid retry-pending value: $value"
+  file="$(provider_retry_pending_file "$provider")"
+  if [[ "$(read_provider_retry_pending "$provider" 2>/dev/null || true)" == "1" ]]; then
+    old="1"
+  fi
+  atomic_write_state_file "$file" "$value"
+  if [[ "$old" != "$value" ]]; then
+    log_info "state: $provider retry_pending $old -> $value"
+  fi
+}
+
 read_provider_last_known_reset() {
   local provider="$1" file value
   migrate_legacy_state
@@ -291,8 +381,15 @@ write_provider_last_window() {
 
 read_next_due() {
   local c_due a_due min_due=""
-  c_due="$(read_provider_next_due "codex" || true)"
-  a_due="$(read_provider_next_due "antigravity" || true)"
+  # Providers with an unpaid debt (retry_pending=1) are deliberately excluded:
+  # their stale past deadline would spin the precision timer once per second.
+  # Debt repayment is driven by the watchdog retry phase instead.
+  if ! provider_is_pending codex; then
+    c_due="$(read_provider_next_due "codex" || true)"
+  fi
+  if ! provider_is_pending antigravity; then
+    a_due="$(read_provider_next_due "antigravity" || true)"
+  fi
 
   if [[ "$c_due" =~ ^[0-9]+$ ]] && [[ "$a_due" =~ ^[0-9]+$ ]]; then
     min_due=$(( c_due < a_due ? c_due : a_due ))
@@ -1085,8 +1182,22 @@ prepare_quota_probe() {
   ANTIGRAVITY_QUOTA_IS_FRESH=0
 }
 
+# Masked, truncated tail of a provider's stderr for the run log. The full
+# stderr stays in its 0600 temp file; the log only ever sees a redacted
+# summary (no tokens, no Authorization headers, no auth.json contents).
+safe_error_summary() {
+  local file="$1" summary
+  [[ -s "$file" ]] || { print -r -- "(no stderr output)"; return 0; }
+  summary="$(tail -n 3 "$file" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)"
+  summary="$(print -r -- "$summary" |
+    perl -pe 's/(token|secret|authorization|bearer|password|api[_-]?key|sk-)\S*(\s+\S+)?/\1***/gi' 2>/dev/null)"
+  [[ -n "$summary" ]] || summary="(empty stderr)"
+  print -r -- "$summary"
+}
+
 run_codex() {
-  local output exit_code=0 t0
+  local phase="${1:-initial}" attempt="${2:-1}" limit="${3:-1}"
+  local output exit_code=0 t0 elapsed
   t0="$(now_epoch)"
   (
     cd /private/tmp
@@ -1117,21 +1228,24 @@ run_codex() {
       -- "不用思考，只回复我 1"
   ) >"$CODEX_STDOUT_FILE" 2>>"$CODEX_STDERR_FILE" || exit_code=$?
 
-  local elapsed=$(( $(now_epoch) - t0 ))
-  if (( exit_code == 124 )); then
-    log_warn "run codex: TIMEOUT after ${MODEL_TASK_TIMEOUT_SECONDS}s (grace ${MODEL_TASK_KILL_GRACE_SECONDS}s)"
-  fi
+  elapsed=$(( $(now_epoch) - t0 ))
   output="$(<"$CODEX_STDOUT_FILE")"
   if (( exit_code == 0 )) && [[ "$output" == "1" ]]; then
-    log_info "run codex: success (${elapsed}s)"
+    log_info "model codex phase=$phase attempt=$attempt/$limit result=success elapsed=${elapsed}s"
     return 0
   fi
-  log_error "run codex: failed exit=$exit_code (${elapsed}s)"
+  if (( exit_code == 124 )); then
+    log_warn "model codex phase=$phase attempt=$attempt/$limit result=timeout rc=124 elapsed=${elapsed}s"
+  else
+    log_warn "model codex phase=$phase attempt=$attempt/$limit result=failed rc=$exit_code elapsed=${elapsed}s"
+  fi
+  log_warn "model codex attempt=$attempt error: $(safe_error_summary "$CODEX_STDERR_FILE")"
   return 1
 }
 
 run_antigravity() {
-  local output exit_code=0 t0
+  local phase="${1:-initial}" attempt="${2:-1}" limit="${3:-1}"
+  local output exit_code=0 t0 elapsed
   t0="$(now_epoch)"
   (
     cd /private/tmp
@@ -1164,16 +1278,18 @@ run_antigravity() {
       -- "不用思考，只回复我 1"
   ) >"$ANTIGRAVITY_STDOUT_FILE" 2>>"$ANTIGRAVITY_STDERR_FILE" || exit_code=$?
 
-  local elapsed=$(( $(now_epoch) - t0 ))
-  if (( exit_code == 124 )); then
-    log_warn "run antigravity: TIMEOUT after ${MODEL_TASK_TIMEOUT_SECONDS}s (grace ${MODEL_TASK_KILL_GRACE_SECONDS}s)"
-  fi
+  elapsed=$(( $(now_epoch) - t0 ))
   output="$(<"$ANTIGRAVITY_STDOUT_FILE")"
   if (( exit_code == 0 )) && [[ "$output" == "1" ]]; then
-    log_info "run antigravity: success (${elapsed}s)"
+    log_info "model antigravity phase=$phase attempt=$attempt/$limit result=success elapsed=${elapsed}s"
     return 0
   fi
-  log_error "run antigravity: failed exit=$exit_code (${elapsed}s)"
+  if (( exit_code == 124 )); then
+    log_warn "model antigravity phase=$phase attempt=$attempt/$limit result=timeout rc=124 elapsed=${elapsed}s"
+  else
+    log_warn "model antigravity phase=$phase attempt=$attempt/$limit result=failed rc=$exit_code elapsed=${elapsed}s"
+  fi
+  log_warn "model antigravity attempt=$attempt error: $(safe_error_summary "$ANTIGRAVITY_STDERR_FILE")"
   return 1
 }
 
@@ -1247,20 +1363,17 @@ format_quota_message() {
     "重置时间：$(format_reset_time "$weekly_reset")"
 }
 
-# Shared jq preamble (kept inline per call site to avoid quoting hazards):
-# normalize a capturedAt value into a Unix epoch integer. Numbers pass
-# through, ISO-8601 strings (with optional fractional seconds) convert,
-# anything missing/unparseable becomes null — never "now", so a stale
-# snapshot can never be made to look freshly captured. Idempotent.
+# Shared capturedAt convention (kept inline per call site to avoid quoting
+# hazards): normalized producers pass capturedAt through raw; the read-side
+# renormalise_quota_file is the single boundary that converts it to an
+# epoch-integer/null before anything enters effective quota. Invalid and
+# missing values become null there — never "now" — and the conversion is
+# idempotent.
 
 normalize_pi_codex_quota() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
   "$JQ_BIN" -e '
-    def epoch_ts:
-      if type == "number" then floor
-      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
-      else null end;
     .headers as $h |
     ($h["x-codex-primary-used-percent"] | tonumber) as $primary_used |
     ($h["x-codex-primary-window-minutes"] | tonumber) as $primary_window |
@@ -1275,7 +1388,7 @@ normalize_pi_codex_quota() {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
       cached: true,
-      capturedAt: ((.capturedAt // null) | epoch_ts),
+      capturedAt: (.capturedAt // null),
       fiveHour: {remainingPercent: (100 - $primary_used), resetAt: $primary_reset},
       weekly: {remainingPercent: (100 - $secondary_used), resetAt: $secondary_reset}
     }
@@ -1286,10 +1399,6 @@ normalize_pi_antigravity_quota() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
   "$JQ_BIN" -e '
-    def epoch_ts:
-      if type == "number" then floor
-      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
-      else null end;
     (.fiveHour.remainingPercent | tonumber) as $five_remaining |
     (.fiveHour.resetAt | tonumber) as $five_reset |
     (.weekly.remainingPercent | tonumber) as $weekly_remaining |
@@ -1300,7 +1409,7 @@ normalize_pi_antigravity_quota() {
       source: "Pi 快照（可能不是最新）",
       fresh: false,
       cached: true,
-      capturedAt: ((.capturedAt // null) | epoch_ts),
+      capturedAt: (.capturedAt // null),
       fiveHour: {remainingPercent: $five_remaining, resetAt: $five_reset},
       weekly: {remainingPercent: $weekly_remaining, resetAt: $weekly_reset}
     }
@@ -1685,38 +1794,32 @@ fetch_codexbar_antigravity_quota() {
 use_codexbar_cached_codex() {
   local output="$1"
   [[ -s "$CODEXBAR_CODEX_CACHE_FILE" ]] || return 1
+  local staged="$output.staged"
+  renormalise_quota_file "$CODEXBAR_CODEX_CACHE_FILE" "$staged" || return 1
   "$JQ_BIN" -e '
-    def epoch_ts:
-      if type == "number" then floor
-      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
-      else null end;
-    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
       fresh: false,
-      cached: true,
-      capturedAt: ((.capturedAt // null) | epoch_ts)
+      cached: true
     }
-  ' "$CODEXBAR_CODEX_CACHE_FILE" >"$output" 2>/dev/null || return 1
+  ' "$staged" >"$output" 2>/dev/null || { rm -f "$staged"; return 1; }
+  rm -f "$staged"
   [[ -s "$output" ]] || return 1
 }
 
 use_codexbar_cached_antigravity() {
   local output="$1"
   [[ -s "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" ]] || return 1
+  local staged="$output.staged"
+  renormalise_quota_file "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" "$staged" || return 1
   "$JQ_BIN" -e '
-    def epoch_ts:
-      if type == "number" then floor
-      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
-      else null end;
-    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {
       source: "CodexBar · cached（可能不是最新）",
       fresh: false,
-      cached: true,
-      capturedAt: ((.capturedAt // null) | epoch_ts)
+      cached: true
     }
-  ' "$CODEXBAR_ANTIGRAVITY_CACHE_FILE" >"$output" 2>/dev/null || return 1
+  ' "$staged" >"$output" 2>/dev/null || { rm -f "$staged"; return 1; }
+  rm -f "$staged"
   [[ -s "$output" ]] || return 1
 }
 
@@ -1742,14 +1845,25 @@ save_pi_quota_snapshots() {
 
 # Read a stale quota file from disk through the normalized-schema boundary:
 # validates the shape and rewrites capturedAt to the epoch-integer/null
-# contract, so historical ISO-string files cannot leak into effective quota.
+# contract, so historical files cannot leak ISO strings into effective quota.
+# This is the SINGLE home of the epoch_ts definition; every read path that
+# feeds effective quota goes through here. Accepts epoch integers, ISO-8601
+# with optional fractional seconds, "Z" or numeric timezone offsets; invalid
+# and missing values become null — never "now". Idempotent.
 renormalise_quota_file() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
   "$JQ_BIN" -e '
     def epoch_ts:
       if type == "number" then floor
-      elif type == "string" then (try ((sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch null)
+      elif type == "string" then
+        (try
+          (if test("[+-][0-9]{2}:?[0-9]{2}$") then
+            capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?<sign>[+-])(?<hh>[0-9]{2}):?(?<mm>[0-9]{2})$") as $m |
+            (($m.d + "Z") | fromdateiso8601) -
+              (if $m.sign == "-" then -1 else 1 end) * (($m.hh | tonumber) * 3600 + (($m.mm | tonumber) * 60))
+          else (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) end)
+         catch null)
       else null end;
     select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
     . + {capturedAt: ((.capturedAt // null) | epoch_ts)}
@@ -1760,8 +1874,8 @@ renormalise_quota_file() {
 use_pi_snapshot_codex() {
   local output="$1"
   local normalized="$LAST_TEMP_DIR/codex-pi-normalized.json"
-  if normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$normalized"; then
-    cp -p "$normalized" "$output"
+  if normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$normalized" &&
+    renormalise_quota_file "$normalized" "$output"; then
     return 0
   fi
   renormalise_quota_file "$PI_CODEX_SNAPSHOT_FILE" "$output"
@@ -1770,8 +1884,8 @@ use_pi_snapshot_codex() {
 use_pi_snapshot_antigravity() {
   local output="$1"
   local normalized="$LAST_TEMP_DIR/antigravity-pi-normalized.json"
-  if normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$normalized"; then
-    cp -p "$normalized" "$output"
+  if normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$normalized" &&
+    renormalise_quota_file "$normalized" "$output"; then
     return 0
   fi
   renormalise_quota_file "$PI_ANTIGRAVITY_SNAPSHOT_FILE" "$output"
@@ -2130,65 +2244,94 @@ evaluate_provider() {
   (( now >= next_due ))
 }
 
-run_selected_providers() {
+# The single success-commit path: only a verified model success may run this.
+# It is the ONLY production caller of write_provider_last_task.
+provider_final_result() {
+  case "$1" in
+    codex) print -r -- "${CODEX_RUN_RESULT:-}" ;;
+    antigravity) print -r -- "${ANTIGRAVITY_RUN_RESULT:-}" ;;
+  esac
+}
+
+commit_provider_success() {
+  local provider="$1" success_at="$2"
+  write_provider_last_attempt "$provider" "$success_at"
+  write_provider_last_task "$provider" "$success_at"
+  write_provider_retry_pending "$provider" 0
+  write_provider_next_due "$provider" $(( success_at + RUN_INTERVAL_SECONDS ))
+  case "$provider" in
+    codex) CODEX_RUN_RESULT="发送成功" ;;
+    antigravity) ANTIGRAVITY_RUN_RESULT="发送成功" ;;
+  esac
+  log_info "success commit $provider: last_task=$success_at fallback_due=$(( success_at + RUN_INTERVAL_SECONDS )) retry_pending=0"
+}
+
+# One retry burst for the given providers: parallel rounds, fixed interval
+# between rounds, stop as soon as every provider has succeeded. Requires the
+# run lock. Each provider is marked retry_pending=1 BEFORE its first attempt
+# so a crash mid-burst still records the debt. Returns 0 only when every
+# provider succeeded; failures leave retry_pending=1 and scheduler state
+# (last_task_at / next_due_at) completely untouched.
+run_retry_burst() {
+  local phase="$1" limit="$2"
+  shift 2
   local attempted=("$@")
-  local provider codex_pid=0 antigravity_pid=0 attempt_at probe_now reset_val
   (( ${#attempted[@]} > 0 )) || return 0
+  local provider round widx
+  local remain=("${attempted[@]}") pids=() round_providers=() still=()
 
-  validate_run_requirements "${attempted[@]}"
-  ensure_temp_dir
-
-  # Finish all fallible preparation before recording any attempt or starting a
-  # provider. This avoids marking provider A as run if provider B setup fails.
   for provider in "${attempted[@]}"; do
+    # Prepare the agent env here so BOTH entry points (initial burst via
+    # run_selected_providers and watchdog repayment via check_schedule) get
+    # valid stdout/stderr targets before the first attempt launches.
     prepare_provider_env "$provider"
-  done
-
-  for provider in "${attempted[@]}"; do
-    attempt_at="$(/bin/date '+%s')"
-    write_provider_last_task "$provider" "$attempt_at"
-    # Seed the durable no-quota fallback before the model starts. A later
-    # successful fresh probe replaces this with reset + four minutes.
-    write_provider_next_due "$provider" $(( attempt_at + RUN_INTERVAL_SECONDS ))
-    log_info "run: attempt $provider (last_task=$attempt_at, fallback_due=$(( attempt_at + RUN_INTERVAL_SECONDS )))"
+    write_provider_retry_pending "$provider" 1
     case "$provider" in
-      codex)
-        run_codex &
-        codex_pid=$!
-        ;;
-      antigravity)
-        run_antigravity &
-        antigravity_pid=$!
-        ;;
+      codex) CODEX_RUN_RESULT="发送失败" ;;
+      antigravity) ANTIGRAVITY_RUN_RESULT="发送失败" ;;
     esac
   done
 
-  if (( codex_pid > 0 )); then
-    if wait "$codex_pid"; then CODEX_RUN_RESULT="发送成功"; else CODEX_RUN_RESULT="发送失败"; fi
-  fi
-  if (( antigravity_pid > 0 )); then
-    if wait "$antigravity_pid"; then ANTIGRAVITY_RUN_RESULT="发送成功"; else ANTIGRAVITY_RUN_RESULT="发送失败"; fi
-  fi
-
-  save_pi_quota_snapshots
-  if acquire_quota_lock_with_timeout; then
-    collect_effective_quotas
-    probe_now="$(/bin/date '+%s')"
-    for provider in "${attempted[@]}"; do
-      reset_val="$(valid_provider_reset_at "$provider" "$probe_now" || true)"
-      if [[ "$reset_val" =~ ^[0-9]+$ ]]; then
-        write_provider_last_window "$provider" "$reset_val"
-        sync_provider_deadline_from_quota "$provider" "$probe_now"
-        log_info "run: post-run sync $provider fresh_reset=$reset_val due=$(( reset_val + RESET_BUFFER_SECONDS ))"
-      else
-        log_info "run: post-run sync $provider no valid fresh reset (fallback stands)"
-      fi
+  for (( round = 1; ${#remain[@]} > 0 && round <= limit; round++ )); do
+    round_providers=("${remain[@]}")
+    pids=()
+    for provider in "${round_providers[@]}"; do
+      write_provider_last_attempt "$provider" "$(now_epoch)"
+      log_info "run: attempt $provider phase=$phase round=$round/$limit"
+      case "$provider" in
+        codex) run_codex "$phase" "$round" "$limit" & pids+=($!) ;;
+        antigravity) run_antigravity "$phase" "$round" "$limit" & pids+=($!) ;;
+      esac
     done
-    release_quota_lock
-  else
-    log_warn "run: post-run quota.lock busy after ${QUOTA_LOCK_WAIT_SECONDS}s; fallback deadline stands"
-  fi
 
+    still=()
+    widx=1
+    for provider in "${round_providers[@]}"; do
+      if wait "${pids[$widx]}"; then
+        commit_provider_success "$provider" "$(now_epoch)"
+      else
+        still+=("$provider")
+      fi
+      (( widx += 1 ))
+    done
+    remain=("${still[@]}")
+
+    if (( ${#remain[@]} > 0 && round < limit )); then
+      log_info "retry $phase: ${remain[*]} failed round $round/$limit; retrying in ${RETRY_INTERVAL_SECONDS}s"
+      "$SLEEP_BIN" "$RETRY_INTERVAL_SECONDS"
+    fi
+  done
+
+  if (( ${#remain[@]} > 0 )); then
+    log_warn "retry $phase: ${remain[*]} exhausted $limit attempts; retry_pending stays 1"
+    return 1
+  fi
+  return 0
+}
+
+dispatch_task_notification() {
+  local attempted=("$@")
+  (( ${#attempted[@]} > 0 )) || return 0
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
     dispatch_notification "$(task_notification_message "${attempted[@]}")"
   else
@@ -2199,6 +2342,46 @@ run_selected_providers() {
       dispatch_notification "$(task_notification_message "${attempted[@]}")"
     fi
   fi
+}
+
+run_selected_providers() {
+  local attempted=("$@")
+  local provider reset_val probe_now
+  (( ${#attempted[@]} > 0 )) || return 0
+
+  validate_run_requirements "${attempted[@]}"
+  ensure_temp_dir
+
+  # || true: exhaustion is expected and leaves the debt pending; per-provider
+  # outcomes are read from the *_RUN_RESULT globals below.
+  run_retry_burst "initial" "$INITIAL_ATTEMPT_LIMIT" "${attempted[@]}" || true
+
+  save_pi_quota_snapshots
+  if acquire_quota_lock_with_timeout; then
+    collect_effective_quotas
+    probe_now="$(/bin/date '+%s')"
+    for provider in "${attempted[@]}"; do
+      if [[ "$(provider_final_result "$provider")" == "发送成功" ]]; then
+        reset_val="$(valid_provider_reset_at "$provider" "$probe_now" || true)"
+        if [[ "$reset_val" =~ ^[0-9]+$ ]]; then
+          write_provider_last_window "$provider" "$reset_val"
+          sync_provider_deadline_from_quota "$provider" "$probe_now"
+          log_info "run: post-run sync $provider fresh_reset=$reset_val due=$(( reset_val + RESET_BUFFER_SECONDS ))"
+        else
+          log_info "run: post-run sync $provider no valid fresh reset (fallback stands)"
+        fi
+      else
+        # Failure never re-seeds the 5h01 fallback and never advances
+        # last_task_at: the debt stays retry_pending=1 for the watchdog.
+        log_info "run: $provider still pending after $INITIAL_ATTEMPT_LIMIT attempts; scheduler state untouched"
+      fi
+    done
+    release_quota_lock
+  else
+    log_warn "run: post-run quota.lock busy after ${QUOTA_LOCK_WAIT_SECONDS}s; fallback deadline stands"
+  fi
+
+  dispatch_task_notification "${attempted[@]}"
 }
 
 run_and_reschedule_selected() {
@@ -2310,14 +2493,47 @@ send_test_card() {
   print -r -- "Test card sent successfully (mode: $mode)"
 }
 
+provider_is_pending() {
+  [[ "$(read_provider_retry_pending "$1" 2>/dev/null || true)" == "1" ]]
+}
+
+# A pending debt is repaid by watchdog bursts, spaced at least
+# WATCHDOG_RETRY_GAP_SECONDS apart (measured from the last real attempt) so
+# the launchd 15-min grid and the precision timer never double-burst.
+provider_retry_due() {
+  provider_is_pending "$1" || return 1
+  local last_attempt
+  last_attempt="$(read_provider_last_attempt "$1" 2>/dev/null || true)"
+  [[ "$last_attempt" =~ ^[0-9]+$ ]] || return 0
+  (( $(now_epoch) - last_attempt >= WATCHDOG_RETRY_GAP_SECONDS ))
+}
+
 check_schedule() {
-  local due_providers=() t0 elapsed c_due a_due
+  local due_providers=() retry_pending_list=() recovered=()
+  local t0 elapsed c_due a_due p
 
   # Serialize the due decision and the subsequent model run. Without this,
   # watchdog and precision-timer processes can both decide from the same stale
   # deadline and run the provider twice after the first lock holder exits.
   t0="$(now_epoch)"
   acquire_run_lock || { log_info "check: run.lock busy, skipped"; return 0; }
+
+  # Phase A — repay pending debts first: a fresh probe must never push a
+  # due-but-unsucceeded task into the future. No quota lock is held here, so
+  # 30s retry sleeps and model timeouts never block /usage.
+  for p in codex antigravity; do
+    provider_retry_due "$p" && retry_pending_list+=("$p")
+  done
+  if (( ${#retry_pending_list[@]} > 0 )); then
+    log_info "check: pending debt on ${retry_pending_list[*]}; watchdog retry burst first"
+    # || true: burst exhaustion (rc=1) is an expected outcome — the debt
+    # simply stays pending. The outcome is read via the retry-pending state.
+    run_retry_burst "watchdog-retry" "$WATCHDOG_ATTEMPT_LIMIT" "${retry_pending_list[@]}" || true
+    save_pi_quota_snapshots
+  fi
+
+  # Phase B — normal quota acquisition (also serves freshly recovered
+  # providers: their success cycle starts with this probe).
   if ! acquire_quota_lock; then
     release_run_lock
     log_info "check: quota.lock busy, skipped"
@@ -2326,15 +2542,30 @@ check_schedule() {
   prepare_quota_probe
   collect_effective_quotas
 
-  if evaluate_provider "codex"; then
-    due_providers+=(codex)
-  fi
-  if evaluate_provider "antigravity"; then
-    due_providers+=(antigravity)
-  fi
+  # Phase C — evaluate only providers without a pending debt. A provider that
+  # already went through this round's watchdog burst (success OR failure) is
+  # never re-evaluated as due in the same check.
+  for p in codex antigravity; do
+    if provider_is_pending "$p"; then
+      log_info "check: $p pending (debt unpaid); normal due evaluation skipped"
+      continue
+    fi
+    if evaluate_provider "$p"; then
+      due_providers+=("$p")
+    fi
+  done
   release_quota_lock
 
   elapsed=$(( $(now_epoch) - t0 ))
+  for p in "${retry_pending_list[@]}"; do
+    [[ "$(provider_final_result "$p")" == "发送成功" ]] && recovered+=("$p")
+  done
+  if (( ${#recovered[@]} > 0 )); then
+    # Recovery is worth one card; continued failure stays log-only so a long
+    # outage never spams a card every 15 minutes.
+    dispatch_task_notification "${recovered[@]}"
+  fi
+
   if (( ${#due_providers[@]} == 0 )); then
     c_due="$(read_provider_next_due codex 2>/dev/null || true)"
     a_due="$(read_provider_next_due antigravity 2>/dev/null || true)"
@@ -2360,8 +2591,14 @@ wait_schedule() {
       continue
     fi
     check_schedule
-    # Avoid a tight loop if the watchdog currently owns the run lock.
-    "$SLEEP_BIN" 1
+    # Avoid a tight loop: when nothing is schedulable right now (for example
+    # every provider is still repaying a pending debt), back off instead of
+    # re-checking once per second.
+    if next_due="$(read_next_due)" && (( $(/bin/date '+%s') < next_due )); then
+      "$SLEEP_BIN" 1
+    else
+      "$SLEEP_BIN" "$TIMER_RECHECK_SECONDS"
+    fi
   done
 }
 

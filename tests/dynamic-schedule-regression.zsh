@@ -52,8 +52,12 @@ run_selected_providers() {
   local now provider reset_at
   now="$(/bin/date '+%s')"
   for provider in "$@"; do
-    write_provider_last_task "$provider" "$now"
-    write_provider_next_due "$provider" $(( now + RUN_INTERVAL_SECONDS ))
+    # Mirror the production burst for a successful attempt: the debt is
+    # marked, the attempt recorded, and only commit_provider_success writes
+    # last_task_at / re-seeds next_due.
+    write_provider_retry_pending "$provider" 1
+    write_provider_last_attempt "$provider" "$now"
+    commit_provider_success "$provider" "$now"
     if reset_at="$(valid_provider_reset_at "$provider" "$now" 2>/dev/null)"; then
       write_provider_last_window "$provider" "$reset_at"
       sync_provider_deadline_from_quota "$provider" "$now"

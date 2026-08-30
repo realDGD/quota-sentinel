@@ -196,9 +196,32 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
   Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
 - **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
 
+## Failure Retry & Pending Debt
+
+A provider's `last_task_at` records the last **successful** model task only.
+Failures and timeouts never advance it and never re-seed the 5h01 fallback.
+
+- A task that reaches its deadline is marked `retry_pending` (per provider,
+  persisted) **before** its first attempt, then repaid by a retry burst:
+  - **Initial burst** (from a due decision or a manual `run`): at most 3
+    total attempts, 30s between attempts, providers run in parallel rounds.
+  - **Watchdog bursts** (every 15-min check, before any quota acquisition):
+    at most 2 total attempts, 30s apart. Bursts are spaced at least 13 minutes
+    from the last attempt, so at most one burst per provider per watchdog.
+- Any attempt that exits with the model replying exactly `1` commits success:
+  `last_attempt_at`/`last_task_at` = success time, `retry_pending` cleared,
+  `next_due_at` = success + 5h01m as the initial fallback, then normal Fresh
+  calibration (`reset_at + 4min`) takes over.
+- If every attempt in a burst fails, the debt stays pending: the deadline and
+  success fields remain untouched, and the next watchdog repays again.
+  Fresh data observed while a debt is pending (e.g. via `/usage`) never
+  cancels the pending priority.
+- One burst sends at most one card (success or failure). Watchdog bursts send
+  a card only on recovery; continued failures stay in `logs/`.
+
 ## Dynamic Reset Calibration & Fallback Scheduling
 
-- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, and `last_task_at`.
+- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, `next_due_at`, `last_task_at` (successful tasks only), `last_attempt_at`, and `retry_pending`.
 - **Dynamic Calibration from Quota Probes**:
   - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
   - Immediately after a real task starts, its provider is seeded with a

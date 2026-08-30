@@ -20,6 +20,10 @@ export QUOTA_SENTINEL_MODEL_TIMEOUT=2
 export QUOTA_SENTINEL_MODEL_KILL_GRACE=1
 export QUOTA_SENTINEL_CODEXBAR_TIMEOUT=1
 export QUOTA_SENTINEL_CODEXBAR_KILL_GRACE=1
+export QUOTA_SENTINEL_RETRY_INTERVAL=1
+export QUOTA_SENTINEL_INITIAL_ATTEMPTS=1
+export QUOTA_SENTINEL_WATCHDOG_ATTEMPTS=1
+export QUOTA_SENTINEL_WATCHDOG_RETRY_GAP=0
 
 BIN_DIR="$TEST_TEMP_DIR/bin"
 mkdir -p "$BIN_DIR"
@@ -131,7 +135,7 @@ if kill -0 "$gc_pid" 2>/dev/null; then
 fi
 print -r -- "  PASS: grandchild $gc_pid gone after process-group kill"
 
-print -r -- "== R3: codex task timeout + antigravity success (M6, whole run path) =="
+print -r -- "== R3: codex task timeout -> failure debt; antigravity success (M6, whole run path) =="
 reset_state
 t0="$(now_epoch)"
 run_and_reschedule_selected codex antigravity
@@ -139,16 +143,22 @@ elapsed=$(( $(now_epoch) - t0 ))
 (( elapsed < 15 )) || { print -u2 "FAIL: run took ${elapsed}s, timeout did not bound it"; exit 1; }
 [[ "${CODEX_RUN_RESULT:-}" == "发送失败" ]]
 [[ "${ANTIGRAVITY_RUN_RESULT:-}" == "发送成功" ]]
-[[ -s "$QUOTA_SENTINEL_STATE_DIR/codex-last-task-at" ]]
+# New attempt semantics: failure must NOT advance last_task_at and must leave
+# the debt recorded; success commits normally.
+[[ ! -e "$QUOTA_SENTINEL_STATE_DIR/codex-last-task-at" ]]
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-retry-pending")" == "1" ]]
+[[ -s "$QUOTA_SENTINEL_STATE_DIR/codex-last-attempt-at" ]]
 [[ -s "$QUOTA_SENTINEL_STATE_DIR/antigravity-last-task-at" ]]
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/antigravity-retry-pending")" == "0" ]]
 [[ ! -e "$RUN_LOCK_FILE" ]]
 [[ ! -e "$QUOTA_LOCK_FILE" ]]
 last_msg="${CAPTURED_MESSAGES[-1]}"
 [[ "$last_msg" == *"GPT-5.6 Luna"* && "$last_msg" == *"🔴"* ]]
 [[ "$last_msg" == *"Gemini 3.7 Flash"* && "$last_msg" == *"🟢"* ]]
-assert_log_contains "run codex: TIMEOUT after 2s"
-assert_log_contains "run antigravity: success"
-print -r -- "  PASS: run finished in ${elapsed}s; codex=失败 antigravity=成功; locks released"
+assert_log_contains "model codex phase=initial attempt=1/1 result=timeout"
+assert_log_contains "model antigravity phase=initial attempt=1/1 result=success"
+assert_log_contains "state: codex retry_pending 0 -> 1"
+print -r -- "  PASS: run finished in ${elapsed}s; codex=失败+pending antigravity=成功; locks released"
 
 print -r -- "== R4: /usage busy reply, then recovery =="
 reset_state
@@ -176,39 +186,40 @@ send_usage_notification
 assert_log_contains "usage: completed"
 print -r -- "  PASS: /usage recovered normally after the lock freed"
 
-print -r -- "== R5: capturedAt unified to epoch-integer/null at every boundary =="
+print -r -- "== R5: capturedAt unified via the renormalise boundary =="
 reset_state
 ensure_temp_dir
 ts_expected="$(/bin/date -u -j -f '%Y-%m-%dT%H:%M:%S' '2026-08-30T07:15:57' '+%s')"
-mk_headers_fixture() {
-  print -r -- '{"capturedAt":'"$1"',"status":"ok","headers":{"x-codex-primary-used-percent":"20","x-codex-primary-window-minutes":"300","x-codex-primary-reset-at":"1790000000","x-codex-secondary-used-percent":"10","x-codex-secondary-window-minutes":"10080","x-codex-secondary-reset-at":"1791000000"}}'
+mk_snapshot_fixture() {
+  print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"cached":true,"capturedAt":'"$1"',"fiveHour":{"remainingPercent":50,"resetAt":1790000000},"weekly":{"remainingPercent":60,"resetAt":1791000000}}'
 }
 fx="$TEST_TEMP_DIR/cap.json"
 out="$TEST_TEMP_DIR/cap-out.json"
-
-mk_headers_fixture '"2026-08-30T07:15:57.123Z"' >"$fx"
-normalize_pi_codex_quota "$fx" "$out"
-[[ "$(jq -r '.capturedAt' "$out")" == "$ts_expected" ]]
-
-mk_headers_fixture '"not-a-date"' >"$fx"
-normalize_pi_codex_quota "$fx" "$out"
+check_cap() {  # $1=json literal, $2=expected value, $3=label
+  mk_snapshot_fixture "$1" >"$fx"
+  renormalise_quota_file "$fx" "$out"
+  local got; got="$(jq -r '.capturedAt' "$out")"
+  [[ "$got" == "$2" ]] || { print -u2 "FAIL $3: expected $2, got $got"; exit 1; }
+}
+check_cap '1788074157' '1788074157' 'epoch passthrough'
+check_cap '"2026-08-30T07:15:57Z"' "$ts_expected" 'ISO Z'
+check_cap '"2026-08-30T07:15:57.123Z"' "$ts_expected" 'ISO Z milliseconds'
+check_cap '"2026-08-30T15:15:57+08:00"' "$ts_expected" 'ISO +08:00 offset'
+check_cap '"2026-08-30T15:15:57.5+0800"' "$ts_expected" 'ISO +0800 no-colon offset'
+check_cap '"2026-08-29T23:15:57-08:00"' "$ts_expected" 'ISO -08:00 offset'
+check_cap '"not-a-date"' 'null' 'invalid -> null'
+check_cap 'null' 'null' 'null -> null'
+print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"cached":true,"fiveHour":{"remainingPercent":50,"resetAt":1790000000},"weekly":{"remainingPercent":60,"resetAt":1791000000}}' >"$fx"
+renormalise_quota_file "$fx" "$out"
 [[ "$(jq -r '.capturedAt' "$out")" == "null" ]]
-
-mk_headers_fixture 'null' >"$fx"
-normalize_pi_codex_quota "$fx" "$out"
-[[ "$(jq -r '.capturedAt' "$out")" == "null" ]]
-
-mk_headers_fixture '1788000000' >"$fx"
-normalize_pi_codex_quota "$fx" "$out"
-[[ "$(jq -r '.capturedAt' "$out")" == "1788000000" ]]
 [[ "$(jq -r '.fresh' "$out")" == "false" ]]
 
 # Disk snapshot with a legacy ISO capturedAt must be renormalised on read.
-print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"cached":true,"capturedAt":"2026-08-30T07:15:57.123Z","fiveHour":{"remainingPercent":50,"resetAt":1790000000},"weekly":{"remainingPercent":60,"resetAt":1791000000}}' >"$PI_CODEX_SNAPSHOT_FILE"
+mk_snapshot_fixture '"2026-08-30T07:15:57.123Z"' >"$PI_CODEX_SNAPSHOT_FILE"
 use_pi_snapshot_codex "$out"
 [[ "$(jq -r '.capturedAt' "$out")" == "$ts_expected" ]]
 [[ "$(jq -r '.fresh' "$out")" == "false" ]]
-print -r -- "  PASS: ISO+ms -> epoch; invalid/missing -> null (never now); snapshot read path normalised"
+print -r -- "  PASS: epoch/Z/ms/offsets -> same epoch; invalid/missing -> null (never now); snapshot read path normalised"
 
 # Cache capturedAt must not drift across repeated reads.
 print -r -- "== R6: cache capturedAt stable; atomic writer leaves no debris =="
@@ -232,6 +243,10 @@ print -r -- "100000:200000" >"$QUOTA_SENTINEL_STATE_DIR/last-triggered-window"
 [[ "$(read_provider_next_due codex)" == "876543" ]]
 [[ "$(read_provider_last_known_reset codex)" == "100000" ]]
 [[ "$(read_provider_last_known_reset antigravity)" == "200000" ]]
+# Upgrade seeding: last_attempt_at starts from the historical last_task_at.
+[[ "$(read_provider_last_attempt codex)" == "987654" ]]
+[[ "$(read_provider_last_attempt antigravity)" == "987654" ]]
+[[ ! -e "$QUOTA_SENTINEL_STATE_DIR/codex-retry-pending" ]]
 for f in "$QUOTA_SENTINEL_STATE_DIR"/codex-*; do
   [[ "$(stat -f '%Lp' "$f")" == "600" ]]
 done

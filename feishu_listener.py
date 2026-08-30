@@ -136,7 +136,8 @@ def setup_file_logging() -> None:
     shell run logs. Best-effort: stdout/stderr logging keeps working."""
     try:
         LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        handler = logging.FileHandler(LOG_DIR / "listener.log")
+        log_path = LOG_DIR / "listener.log"
+        handler = logging.FileHandler(log_path)
         handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",
@@ -144,6 +145,7 @@ def setup_file_logging() -> None:
             )
         )
         logger.addHandler(handler)
+        os.chmod(log_path, 0o600)  # FileHandler follows umask; match shell logs
     except OSError as exc:
         logger.warning(f"File logging disabled: {exc}")
 
