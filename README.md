@@ -247,13 +247,16 @@ fallback, releasing the block, and the post-run Fresh probe then calibrates the
 next cycle. Without this rule, a probe during the reset buffer can replace the
 armed deadline with the following window and starve the current task.
 
-The same write seam also prevents pre-reset rolling starvation. The current
-cycle is anchored by that provider's last successful task: reset timestamps may
-move earlier or fluctuate up to five minutes later than the nominal five-hour
-window, but they cannot recede indefinitely with every 15-minute probe. A
-deadline already persisted by an older version beyond this horizon converges
-inward to the horizon plus the unchanged four-minute post-reset buffer. This
-repair never extends a deadline and does not promote Cache or Pi data to Fresh.
+The same write seam also carries the reset trust gate, which removes the
+rolling-reset starvation mode: fresh data may move a deadline earlier, or
+within ±5 minutes of the current trusted reset, immediately — but a reset that
+jumps far beyond the trusted value is only a candidate until a second fresh
+probe at least 60 seconds later reports the same timestamp (±30s tolerance).
+Only then does it take over the deadline. A rolling value that advances with
+every probe never passes confirmation, so it can defer a task by at most one
+candidate cycle instead of starving it. The first fresh reset of a generation
+— or the first after a successful task — anchors immediately, and a successful
+task starts a new generation. Cache and Pi data still never write deadlines.
 
 ## Failure Retry & Pending Debt
 
