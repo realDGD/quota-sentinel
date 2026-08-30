@@ -562,73 +562,68 @@ send_feishu_message() {
   fi
 }
 
-build_circular_quota_chart() {
-  local five_percent="$1" weekly_percent="$2"
-  local five_val="1.0" weekly_val="1.0"
+build_linear_progress_chart() {
+  local percent="$1"
+  local color_hex="${2:-#57D0FB}"
+  local val="1.0"
 
-  if [[ "$five_percent" =~ ^-?[0-9]+$ ]]; then
-    (( five_percent < 0 )) && five_percent=0
-    (( five_percent > 100 )) && five_percent=100
-    five_val="$("$JQ_BIN" -n --argjson p "$five_percent" '$p / 100.0')"
+  if [[ "$percent" =~ ^-?[0-9]+$ ]]; then
+    (( percent < 0 )) && percent=0
+    (( percent > 100 )) && percent=100
+    val="$("$JQ_BIN" -n --argjson p "$percent" '$p / 100.0')"
   else
-    five_val="1.0"
+    val="1.0"
   fi
 
-  if [[ "$weekly_percent" =~ ^-?[0-9]+$ ]]; then
-    (( weekly_percent < 0 )) && weekly_percent=0
-    (( weekly_percent > 100 )) && weekly_percent=100
-    weekly_val="$("$JQ_BIN" -n --argjson p "$weekly_percent" '$p / 100.0')"
-  else
-    weekly_val="1.0"
-  fi
-
-  # In VChart circularProgress, categoryField bands start at innerRadius and expand to radius:
-  # Index 0: Weekly (Inner ring)
-  # Index 1: 5-Hour (Outer ring)
   "$JQ_BIN" -n \
-    --argjson five_val "$five_val" \
-    --argjson weekly_val "$weekly_val" \
+    --argjson val "$val" \
+    --arg color "$color_hex" \
     '{
       tag: "chart",
-      aspect_ratio: "1:1",
-      height: "140px",
+      aspect_ratio: "16:9",
+      height: "26px",
       preview: false,
       chart_spec: {
-        type: "circularProgress",
+        type: "linearProgress",
         data: {
           values: [
             {
-              type: "周额度",
-              value: $weekly_val
-            },
-            {
-              type: "5小时",
-              value: $five_val
+              type: "quota",
+              value: $val
             }
           ]
         },
-        valueField: "value",
-        categoryField: "type",
+        direction: "horizontal",
+        xField: "value",
+        yField: "type",
         seriesField: "type",
-        radius: 0.85,
-        innerRadius: 0.45,
-        cornerRadius: 10,
+        color: [$color],
         progress: {
           style: {
-            innerPadding: 3,
-            outerPadding: 3
+            fill: $color,
+            cornerRadius: 4
           }
         },
-        legends: {
-          visible: false
-        }
+        track: {
+          style: {
+            cornerRadius: 4
+          }
+        },
+        bandWidth: 10,
+        axes: [
+          { orient: "left", visible: false },
+          { orient: "bottom", visible: false }
+        ],
+        legends: { visible: false },
+        tooltip: { visible: false },
+        padding: { top: 0, bottom: 0, left: 0, right: 0 }
       }
     }'
 }
 
 build_provider_v2_elements() {
   local title="$1" result="$2" quota_file="$3"
-  local five_remaining="0" five_reset="0" weekly_remaining="0" weekly_reset="0" source="未知"
+  local five_remaining="0" five_reset="0" weekly_remaining="0" weekly_reset="0" raw_source="未知"
   local five_duration="未知" weekly_duration="未知" five_reset_time="未知" weekly_reset_time="未知"
   local now="${CURRENT_FORMAT_TIME:-$(/bin/date '+%s')}"
 
@@ -637,7 +632,7 @@ build_provider_v2_elements() {
     five_reset="$("$JQ_BIN" -r '.fiveHour.resetAt // empty' "$quota_file")"
     weekly_remaining="$("$JQ_BIN" -r '.weekly.remainingPercent // empty' "$quota_file")"
     weekly_reset="$("$JQ_BIN" -r '.weekly.resetAt // empty' "$quota_file")"
-    source="$("$JQ_BIN" -r '.source // "未知"' "$quota_file")"
+    raw_source="$("$JQ_BIN" -r '.source // "未知"' "$quota_file")"
   fi
 
   if [[ ! "$five_remaining" =~ ^[0-9]+$ ]] ||
@@ -648,7 +643,7 @@ build_provider_v2_elements() {
     five_reset=0
     weekly_remaining=0
     weekly_reset=0
-    source="不可用"
+    raw_source="不可用"
     five_duration="未知"
     five_reset_time="未知"
     weekly_duration="未知"
@@ -661,7 +656,15 @@ build_provider_v2_elements() {
   fi
 
   local title_md="**${title}**"
-  local source_md="↳ 来源　${source}"
+  local source_md=""
+  if [[ "$raw_source" == *"cached"* ]]; then
+    source_md="来源　CodexBar · cached\n⚠️ 可能不是最新"
+  elif [[ "$raw_source" == *"快照"* ]]; then
+    source_md="来源　Pi 快照\n⚠️ 可能不是最新"
+  else
+    source_md="来源　${raw_source}"
+  fi
+
   local status_md=""
   if [[ -n "$result" ]]; then
     if [[ "$result" == "发送成功" ]]; then
@@ -671,18 +674,20 @@ build_provider_v2_elements() {
     fi
   fi
 
-  local chart_json
-  chart_json="$(build_circular_quota_chart "$five_remaining" "$weekly_remaining")" || return 1
+  local chart_5h chart_weekly
+  chart_5h="$(build_linear_progress_chart "$five_remaining" "#57D0FB")" || return 1
+  chart_weekly="$(build_linear_progress_chart "$weekly_remaining" "#54A6FD")" || return 1
 
   "$JQ_BIN" -n \
     --arg title "$title_md" \
     --arg src "$source_md" \
     --arg stat "$status_md" \
-    --argjson chart "$chart_json" \
     --arg f_rem "$five_remaining" \
+    --argjson chart_5h "$chart_5h" \
     --arg f_dur "$five_duration" \
     --arg f_res "$five_reset_time" \
     --arg w_rem "$weekly_remaining" \
+    --argjson chart_weekly "$chart_weekly" \
     --arg w_dur "$weekly_duration" \
     --arg w_res "$weekly_reset_time" \
     '[
@@ -691,15 +696,18 @@ build_provider_v2_elements() {
     ] +
     (if $stat != "" then [{ tag: "markdown", content: $stat }] else [] end) +
     [
-      $chart,
+      { tag: "markdown", content: ("**5 小时**　剩余 " + $f_rem + "%") },
+      $chart_5h,
       {
         tag: "markdown",
-        content: ("**5 小时**　剩余 " + $f_rem + "%\n↳ 距离重置：" + $f_dur + "\n↳ 重置时间：" + $f_res)
+        content: ("距离重置　" + $f_dur + "\n重置时间　" + $f_res)
       },
       { tag: "hr" },
+      { tag: "markdown", content: ("**周额度**　剩余 " + $w_rem + "%") },
+      $chart_weekly,
       {
         tag: "markdown",
-        content: ("**周额度**　剩余 " + $w_rem + "%\n↳ 距离重置：" + $w_dur + "\n↳ 重置时间：" + $w_res)
+        content: ("距离重置　" + $w_dur + "\n重置时间　" + $w_res)
       }
     ]'
 }
@@ -791,7 +799,7 @@ build_feishu_v2_task_payload() {
       content: ({
         schema: "2.0",
         config: {
-          width_mode: "fill"
+          width_mode: "default"
         },
         header: {
           template: $template,
@@ -861,7 +869,7 @@ build_feishu_v2_usage_payload() {
       content: ({
         schema: "2.0",
         config: {
-          width_mode: "fill"
+          width_mode: "default"
         },
         header: {
           template: "green",
@@ -1609,9 +1617,9 @@ format_provider_card_section() {
 
   quota_message="${quota_message//5 小时：/**5 小时**　}"
   quota_message="${quota_message//周额度：/**周额度**　}"
-  quota_message="${quota_message//距离重置：/↳ 距离重置：}"
-  quota_message="${quota_message//重置时间：/↳ 重置时间：}"
-  quota_message="${quota_message//来源：/↳ 来源　}"
+  quota_message="${quota_message//距离重置：/距离重置　}"
+  quota_message="${quota_message//重置时间：/重置时间　}"
+  quota_message="${quota_message//来源：/来源　}"
 
   local lines=("${(@f)quota_message}")
   local out_lines=("$title")
@@ -1619,8 +1627,14 @@ format_provider_card_section() {
   local src=""
 
   for line in "${lines[@]}"; do
-    if [[ "$line" == "↳ 来源"* ]]; then
-      src="$line"
+    if [[ "$line" == "来源"* ]]; then
+      if [[ "$line" == *"cached"* ]]; then
+        src=$'来源　CodexBar · cached\n⚠️ 可能不是最新'
+      elif [[ "$line" == *"快照"* ]]; then
+        src=$'来源　Pi 快照\n⚠️ 可能不是最新'
+      else
+        src="$line"
+      fi
     else
       quota_body+=("$line")
     fi

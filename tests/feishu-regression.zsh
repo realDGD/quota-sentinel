@@ -39,29 +39,30 @@ card_message="$(notification_message \
 [[ "$card_message" == *'🔴 **发送失败**'* ]]
 [[ "$card_message" == *'**5 小时**'* ]]
 [[ "$card_message" == *'**周额度**'* ]]
-[[ "$card_message" == *'↳ 距离重置：'* ]]
-[[ "$card_message" == *'↳ 重置时间：'* ]]
+[[ "$card_message" == *'距离重置　'* ]]
+[[ "$card_message" == *'重置时间　'* ]]
+[[ "$card_message" != *'↳'* ]]
 [[ "$card_message" != *'（剩余'* ]]
 
 # -------------------------------------------------------------
 # Case 1: Codex Auto Task Order
 # -------------------------------------------------------------
 c_task="$(format_provider_card_section "**GPT-5.6 Luna**" "发送成功" $'来源：Native · codex app-server\n5 小时：■■■■■■■■■■ 剩余 100%\n距离重置：4小时 58分\n重置时间：2026-08-30 17:32:52 CST\n\n周额度：■■■■■■■■□□ 剩余 84%\n距离重置：6天 21小时 30分\n重置时间：2026-09-06 07:32:52 CST')"
-c_expected=$'**GPT-5.6 Luna**\n↳ 来源　Native · codex app-server\n🟢 **发送成功**\n\n**5 小时**　■■■■■■■■■■ 剩余 100%\n↳ 距离重置：4小时 58分\n↳ 重置时间：2026-08-30 17:32:52 CST\n\n**周额度**　■■■■■■■■□□ 剩余 84%\n↳ 距离重置：6天 21小时 30分\n↳ 重置时间：2026-09-06 07:32:52 CST'
+c_expected=$'**GPT-5.6 Luna**\n来源　Native · codex app-server\n🟢 **发送成功**\n\n**5 小时**　■■■■■■■■■■ 剩余 100%\n距离重置　4小时 58分\n重置时间　2026-08-30 17:32:52 CST\n\n**周额度**　■■■■■■■■□□ 剩余 84%\n距离重置　6天 21小时 30分\n重置时间　2026-09-06 07:32:52 CST'
 [[ "$c_task" == "$c_expected" ]]
 
 # -------------------------------------------------------------
 # Case 2: Antigravity Auto Task Order
 # -------------------------------------------------------------
 a_task="$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "发送成功" $'来源：Native · agy local service\n5 小时：■■■■■■■■□□ 剩余 77%\n距离重置：4小时 55分\n重置时间：2026-08-30 18:56:55 CST\n\n周额度：■■■■■■■■■□ 剩余 86%\n距离重置：4天 06小时 41分\n重置时间：2026-09-03 16:41:58 CST')"
-a_expected=$'**Gemini 3.7 Flash · Low**\n↳ 来源　Native · agy local service\n🟢 **发送成功**\n\n**5 小时**　■■■■■■■■□□ 剩余 77%\n↳ 距离重置：4小时 55分\n↳ 重置时间：2026-08-30 18:56:55 CST\n\n**周额度**　■■■■■■■■■□ 剩余 86%\n↳ 距离重置：4天 06小时 41分\n↳ 重置时间：2026-09-03 16:41:58 CST'
+a_expected=$'**Gemini 3.7 Flash · Low**\n来源　Native · agy local service\n🟢 **发送成功**\n\n**5 小时**　■■■■■■■■□□ 剩余 77%\n距离重置　4小时 55分\n重置时间　2026-08-30 18:56:55 CST\n\n**周额度**　■■■■■■■■■□ 剩余 86%\n距离重置　4天 06小时 41分\n重置时间　2026-09-03 16:41:58 CST'
 [[ "$a_task" == "$a_expected" ]]
 
 # -------------------------------------------------------------
 # Case 3: /usage Order (No status line)
 # -------------------------------------------------------------
 u_task="$(format_provider_card_section "**GPT-5.6 Luna**" "" $'来源：Native · codex app-server\n5 小时：■■■■■■■■■■ 剩余 100%\n距离重置：4小时 58分\n重置时间：2026-08-30 17:32:52 CST\n\n周额度：■■■■■■■■□□ 剩余 84%\n距离重置：6天 21小时 30分\n重置时间：2026-09-06 07:32:52 CST')"
-u_expected=$'**GPT-5.6 Luna**\n↳ 来源　Native · codex app-server\n\n**5 小时**　■■■■■■■■■■ 剩余 100%\n↳ 距离重置：4小时 58分\n↳ 重置时间：2026-08-30 17:32:52 CST\n\n**周额度**　■■■■■■■■□□ 剩余 84%\n↳ 距离重置：6天 21小时 30分\n↳ 重置时间：2026-09-06 07:32:52 CST'
+u_expected=$'**GPT-5.6 Luna**\n来源　Native · codex app-server\n\n**5 小时**　■■■■■■■■■■ 剩余 100%\n距离重置　4小时 58分\n重置时间　2026-08-30 17:32:52 CST\n\n**周额度**　■■■■■■■■□□ 剩余 84%\n距离重置　6天 21小时 30分\n重置时间　2026-09-06 07:32:52 CST'
 [[ "$u_task" == "$u_expected" ]]
 [[ "$u_task" != *"发送成功"* ]]
 [[ "$u_task" != *"发送失败"* ]]
@@ -70,63 +71,80 @@ u_expected=$'**GPT-5.6 Luna**\n↳ 来源　Native · codex app-server\n\n**5 �
 # Case 4: Cached Warning Preserved
 # -------------------------------------------------------------
 cached_sec="$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "" $'来源：CodexBar · cached（可能不是最新）\n5 小时：■■■■■■■■□□ 剩余 77%\n距离重置：4小时 55分\n重置时间：2026-08-30 18:56:55 CST\n\n周额度：■■■■■■■■■□ 剩余 86%\n距离重置：4天 06小时 41分\n重置时间：2026-09-03 16:41:58 CST')"
-[[ "$cached_sec" == *'↳ 来源　CodexBar · cached（可能不是最新）'* ]]
+[[ "$cached_sec" == *'来源　CodexBar · cached'* ]]
+[[ "$cached_sec" == *'⚠️ 可能不是最新'* ]]
 
 # -------------------------------------------------------------
 # Case 5: Pi Snapshot Warning Preserved
 # -------------------------------------------------------------
 pi_sec="$(format_provider_card_section "**GPT-5.6 Luna**" "发送成功" $'来源：Pi 快照（可能不是最新）\n5 小时：■■■■■■■■■■ 剩余 100%\n距离重置：4小时 58分\n重置时间：2026-08-30 17:32:52 CST\n\n周额度：■■■■■■■■□□ 剩余 84%\n距离重置：6天 21小时 30分\n重置时间：2026-09-06 07:32:52 CST')"
-[[ "$pi_sec" == *'↳ 来源　Pi 快照（可能不是最新）'* ]]
+[[ "$pi_sec" == *'来源　Pi 快照'* ]]
+[[ "$pi_sec" == *'⚠️ 可能不是最新'* ]]
 
 # -------------------------------------------------------------
 # Case 6: Source appears strictly once
 # -------------------------------------------------------------
-src_count="$(print -r -- "$c_task" | grep -c '↳ 来源' || true)"
+src_count="$(print -r -- "$c_task" | grep -c '来源　' || true)"
 [[ "$src_count" -eq 1 ]]
 
 # -------------------------------------------------------------
-# Case 7: Absolute absence of old bracketed format
+# Case 7: Absolute absence of old bracketed format & arrows
 # -------------------------------------------------------------
 [[ "$c_task" != *'（剩余'* ]]
 [[ "$a_task" != *'（剩余'* ]]
 [[ "$u_task" != *'（剩余'* ]]
+[[ "$c_task" != *'↳'* ]]
+[[ "$a_task" != *'↳'* ]]
+[[ "$u_task" != *'↳'* ]]
 
 # -------------------------------------------------------------
-# Case 8: Card JSON 2.0 & Circular Progress Chart Builders
+# Case 8: Card JSON 2.0 & Linear Progress Chart Builders
 # -------------------------------------------------------------
-chart_dual="$(build_circular_quota_chart 77 86)"
-print -r -- "$chart_dual" | "$JQ_BIN" -e '
+chart_5h="$(build_linear_progress_chart 77 "#57D0FB")"
+print -r -- "$chart_5h" | "$JQ_BIN" -e '
   .tag == "chart" and
-  .height == "140px" and
-  .chart_spec.type == "circularProgress" and
-  .chart_spec.data.values[0].type == "周额度" and
-  .chart_spec.data.values[0].value == 0.86 and
-  .chart_spec.data.values[1].type == "5小时" and
-  .chart_spec.data.values[1].value == 0.77
+  .height == "26px" and
+  .chart_spec.type == "linearProgress" and
+  .chart_spec.color == ["#57D0FB"] and
+  .chart_spec.data.values[0].value == 0.77
 ' >/dev/null
 
-chart_clamp="$(build_circular_quota_chart 120 -10)"
-print -r -- "$chart_clamp" | "$JQ_BIN" -e '
-  .chart_spec.data.values[0].value == 0 and
-  .chart_spec.data.values[1].value == 1
+chart_w="$(build_linear_progress_chart 86 "#54A6FD")"
+print -r -- "$chart_w" | "$JQ_BIN" -e '
+  .chart_spec.type == "linearProgress" and
+  .chart_spec.color == ["#54A6FD"] and
+  .chart_spec.data.values[0].value == 0.86
 ' >/dev/null
+
+chart_clamp="$(build_linear_progress_chart 120 "#57D0FB")"
+print -r -- "$chart_clamp" | "$JQ_BIN" -e '.chart_spec.data.values[0].value == 1' >/dev/null
 
 preview_both="$(card_preview both)"
 print -r -- "$preview_both" | "$JQ_BIN" -e '
   .msg_type == "interactive" and
-  (.content | fromjson | .schema == "2.0" and .body.elements[0].tag == "column_set" and .body.elements[0].flex_mode == "stretch")
+  ((.content | fromjson) as $card |
+    $card.schema == "2.0" and
+    $card.config.width_mode == "default" and
+    $card.body.elements[0].tag == "column_set" and
+    $card.body.elements[0].flex_mode == "stretch")
 ' >/dev/null
 
 preview_single="$(card_preview single)"
 print -r -- "$preview_single" | "$JQ_BIN" -e '
   .msg_type == "interactive" and
-  (.content | fromjson | .schema == "2.0" and .body.elements[0].tag == "markdown")
+  ((.content | fromjson) as $card |
+    $card.schema == "2.0" and
+    $card.config.width_mode == "default" and
+    $card.body.elements[0].tag == "markdown")
 ' >/dev/null
 
 preview_usage="$(card_preview usage)"
 print -r -- "$preview_usage" | "$JQ_BIN" -e '
   .msg_type == "interactive" and
-  ((.content | fromjson) as $card | $card.schema == "2.0" and ($card.body.elements[0].content | contains("即时配额查询")))
+  ((.content | fromjson) as $card |
+    $card.schema == "2.0" and
+    $card.config.width_mode == "default" and
+    ($card.body.elements[0].content | contains("即时配额查询")))
 ' >/dev/null
 
 [[ "$(feishu_lookup_payload "user@example.com")" == '{"emails":["user@example.com"]}' ]]
