@@ -27,6 +27,8 @@
   <string>/private/tmp</string>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>/Users/__USER__/Library/Logs/quota-sentinel/feishu-listener.out.log</string>
   <key>StandardErrorPath</key>

@@ -152,6 +152,8 @@ control loop while leaving all deadline policy inside `quota-sentinel.sh`:
   Mac wakes with an overdue deadline;
 - re-reads external state at most 60 seconds later, matching the legacy
   precision timer's compatibility polling;
+- excludes providers with `retry_pending=1` from the precision deadline wake;
+  their debt remains owned by the 15-minute watchdog retry phase;
 - coalesces a deadline and watchdog that become ready together into one
   `check`; and
 - applies the existing 60-second due retry backoff after a check.
@@ -166,7 +168,9 @@ Task executions and post-run deadline snapshots are stored in
 using SQLite WAL mode. An interrupted `running` row is marked `interrupted` on
 restart. Feishu `/usage` is recorded in the same history and wakes the control
 loop to notice any Fresh calibration, but it still runs only the `usage`
-command and never triggers a model task.
+command and never triggers a model task. Each history operation uses a short
+transaction whose SQLite connection is explicitly closed, preventing DB/WAL
+file descriptors from accumulating in the long-lived listener process.
 
 ## Execution Bounds & Process Hygiene
 
@@ -177,6 +181,7 @@ Every external process is bounded so a hang can never hold the scheduler:
 | Model task (`run_codex` / `run_antigravity`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
 | CodexBar Live query | `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (default 20s) + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
 | Feishu WebSocket listener outer bound | 120s | Subprocess group terminated (`/usage` worst case ≈ 100s) |
+| Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The shell and every nested detached process group are terminated |
 
 Timeouts run through `run_with_timeout.py`: the child gets its own session,
 SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
@@ -189,6 +194,8 @@ Every command, operation, and result is logged with elapsed time to
 `logs/YYYY-MM-DD.log` (the WebSocket listener additionally writes
 `logs/listener.log`). The directory is created on demand with mode 0700, log
 files are 0600, and logging is best-effort — it can never break a command.
+The active listener LaunchAgent also uses umask 0077, so its stdout/stderr
+capture files are private from creation.
 
 Recorded events include: command start/finish with duration, quota tier
 attempts per provider (`native` / `codexbar-live` / `codexbar-cache` /

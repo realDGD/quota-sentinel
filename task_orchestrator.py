@@ -17,9 +17,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 
 
 logger = logging.getLogger("task_orchestrator")
@@ -41,7 +42,10 @@ DEADLINE_BACKOFF_SECONDS = 60
 EXTERNAL_STATE_RECHECK_SECONDS = 60
 LOOP_ERROR_BACKOFF_SECONDS = 60
 CHECK_COMMAND_TIMEOUT_SECONDS = float(
-    os.environ.get("QUOTA_SENTINEL_CHECK_TIMEOUT", "1200")
+    # One check may first repay a two-attempt pending debt and then run the
+    # other provider's three-attempt initial burst, with two quota-collection
+    # phases. 2100s stays above that legal worst case while remaining finite.
+    os.environ.get("QUOTA_SENTINEL_CHECK_TIMEOUT", "2100")
 )
 
 T = TypeVar("T")
@@ -62,23 +66,101 @@ class SubprocessRunner:
         self._active: subprocess.Popen[bytes] | None = None
 
     @staticmethod
-    def _terminate_group(process: subprocess.Popen[bytes]) -> None:
+    def _process_groups_for_tree(root_pid: int) -> set[int]:
+        """Snapshot every process group in root_pid's descendant tree.
+
+        The shell uses nested timeout helpers whose children intentionally
+        start independent sessions. Killing only the shell's group therefore
+        misses those grandchildren. A process-tree snapshot lets the outer
+        timeout terminate each isolated group without changing inner timeout
+        semantics.
+        """
+        groups = {root_pid}
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid=,pgid="],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return groups
+
+        children: dict[int, list[int]] = {}
+        pgids: dict[int, int] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3:
+                continue
+            try:
+                pid, ppid, pgid = map(int, fields)
+            except ValueError:
+                continue
+            children.setdefault(ppid, []).append(pid)
+            pgids[pid] = pgid
+
+        stack = [root_pid]
+        descendants: set[int] = set()
+        while stack:
+            parent = stack.pop()
+            for child in children.get(parent, []):
+                if child in descendants:
+                    continue
+                descendants.add(child)
+                stack.append(child)
+
+        own_group = os.getpgrp()
+        groups.update(
+            pgids[pid]
+            for pid in descendants
+            if pgids.get(pid, 0) > 0 and pgids[pid] != own_group
+        )
+        groups.discard(own_group)
+        return groups
+
+    @staticmethod
+    def _signal_groups(groups: set[int], sig: signal.Signals) -> None:
+        for pgid in groups:
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    @staticmethod
+    def _living_groups(groups: set[int]) -> set[int]:
+        living: set[int] = set()
+        for pgid in groups:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                continue
+            living.add(pgid)
+        return living
+
+    @classmethod
+    def _terminate_group(cls, process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
+        groups = cls._process_groups_for_tree(process.pid)
+        cls._signal_groups(groups, signal.SIGTERM)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not cls._living_groups(groups):
+                break
+            time.sleep(0.05)
+
+        living = cls._living_groups(groups)
+        if living:
+            cls._signal_groups(living, signal.SIGKILL)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=5)
-            return
+            process.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+            # The root group was already included above; this is a final
+            # defensive reap for an unexpected process-state race.
+            cls._signal_groups({process.pid}, signal.SIGKILL)
+            process.wait()
 
     def run(self, args: tuple[str, ...], timeout: float) -> CommandResult:
         started = time.monotonic()
@@ -136,8 +218,20 @@ class ScheduleState:
     def snapshot(self) -> dict[str, int | None]:
         return {provider: self._read_epoch(provider) for provider in self.providers}
 
+    def _is_pending(self, provider: str) -> bool:
+        try:
+            return (
+                self.state_dir / f"{provider}-retry-pending"
+            ).read_text().strip() == "1"
+        except OSError:
+            return False
+
     def next_due(self) -> int | None:
-        values = [value for value in self.snapshot().values() if value is not None]
+        values = [
+            value
+            for provider, value in self.snapshot().items()
+            if value is not None and not self._is_pending(provider)
+        ]
         return min(values) if values else None
 
 
@@ -159,6 +253,16 @@ class TaskStore:
         connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Commit/rollback one short transaction and always release its FDs."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _secure_files(self) -> None:
         for path in (
             self.db_path,
@@ -171,7 +275,7 @@ class TaskStore:
                 pass
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS task_runs (
@@ -206,7 +310,7 @@ class TaskStore:
 
     def _recover_interrupted(self) -> None:
         recovered_at = int(time.time())
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE task_runs
@@ -225,7 +329,7 @@ class TaskStore:
         scheduled_for: int | None,
         started_at: int,
     ) -> int:
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO task_runs(
@@ -249,7 +353,7 @@ class TaskStore:
         elapsed: float | None = None,
         detail: str | None = None,
     ) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE task_runs
@@ -279,7 +383,7 @@ class TaskStore:
             (run_id, provider, next_due, captured_at)
             for provider, next_due in snapshot.items()
         ]
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executemany(
                 """
                 INSERT INTO schedule_snapshots(
@@ -291,7 +395,7 @@ class TaskStore:
         self._secure_files()
 
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM task_runs ORDER BY id DESC LIMIT ?
