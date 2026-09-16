@@ -40,8 +40,8 @@ exactly `1`. Quota collection is reported independently.
    - **Fallbacks**: CodexBar Live (`cli`, then `oauth`), CodexBar cached
      result, then the Pi provider response-hook snapshot.
 2. **Antigravity Quota**:
-   - **Primary**: Native local `agy` HTTPS service
-     (`RetrieveUserQuotaSummary`).
+   - **Primary**: Native built-in `agy -p /usage --output-format json`
+     (agy >= 1.1.11, structured metadata only; no model prompt).
    - **Fallbacks**: CodexBar Live, CodexBar cached result, then the Pi
      Antigravity API snapshot.
 
@@ -179,11 +179,12 @@ Every external process is bounded so a hang can never hold the scheduler:
 | Operation | Bound | After the bound |
 | --- | --- | --- |
 | Model task (`run_codex` / `run_antigravity`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
-| CodexBar Live query | `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (default 20s) + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
-| Feishu WebSocket listener outer bound | 120s | Subprocess group terminated (`/usage` worst case ≈ 100s) |
+| Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
+| CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
+| Feishu WebSocket listener outer bound | 360s | Subprocess group terminated (default quota acquisition ≈ 161s + existing Feishu auth/send retries ≈ 183s + margin) |
 | Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The shell and every nested detached process group are terminated |
 
-Timeouts run through `run_with_timeout.py`: the child gets its own session,
+Model and CodexBar timeouts run through `run_with_timeout.py`: the child gets its own session,
 SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
 period, and reaps the group so no orphans remain. Exit code 124 marks a
 timeout; the child's own exit code is otherwise propagated unchanged.
@@ -216,7 +217,7 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 ```text
 ① Native Direct (FRESH)
    Codex: codex app-server JSON-RPC (account/rateLimits/read)
-   Antigravity: agy localhost HTTPS (RetrieveUserQuotaSummary)
+   Antigravity: built-in agy -p /usage --output-format json (via uv)
    ↓ (fail)
 ② CodexBar Live (FRESH)
    codexbar usage --provider <codex|antigravity> --source cli
@@ -241,7 +242,7 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
   Once the scheduled reset occurs, the provider enters a scheduler-write
   block until its task succeeds.
   Tier ③ and Tier ④ are strictly `STALE` and used for UI display only.
-- **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / localhost RPC / CodexBar) are zero-cost metadata inspections and do not consume any inference tokens or model turns.
+- **Zero LLM Token Guarantee**: All quota probe tiers (Native JSON-RPC / built-in agy `/usage` / CodexBar) are metadata inspections and do not consume inference tokens or model turns. Antigravity Native requires agy >= 1.1.11 and accepts only a successful `command.name=usage` report with zero model turns/tokens and both known, enabled Gemini windows. It uses a private empty cwd, caps output at 1 MiB, bounds execution and cleans up only its own process group. Older binaries or malformed reports fall through to CodexBar; cached/Pi data remains STALE and cannot calibrate deadlines. The agy quota account is the agy CLI's account (unchanged from the previous local agy probe); it is not automatically shared with Pi OAuth.
 
 ## Armed Deadlines & Fresh Calibration (P1-1)
 

@@ -6,7 +6,8 @@ set -euo pipefail
 # real run/fetch paths against mock commands without editing this file.
 readonly PI_BIN="${QUOTA_SENTINEL_PI_BIN:-/opt/homebrew/bin/pi}"
 readonly CODEX_BIN="/opt/homebrew/bin/codex"
-readonly AGY_BIN="/opt/homebrew/bin/agy"
+readonly AGY_BIN="${QUOTA_SENTINEL_AGY_BIN:-/opt/homebrew/bin/agy}"
+readonly UV_BIN="${QUOTA_SENTINEL_UV_BIN:-/opt/homebrew/bin/uv}"
 readonly CODEXBAR_BIN="${QUOTA_SENTINEL_CODEXBAR_BIN:-/opt/homebrew/bin/codexbar}"
 readonly PYTHON3_BIN="/usr/bin/python3"
 readonly CURL_BIN="/usr/bin/curl"
@@ -41,12 +42,16 @@ readonly MAX_WINDOW_FUTURE_SECONDS=21600         # 6 hours
 readonly QUOTA_LOCK_WAIT_SECONDS=20
 readonly TIMER_RECHECK_SECONDS=60
 # Hard execution bounds: a hung model task or quota probe must never hold the
-# run/quota locks forever. Worst-case /usage collect ≈ lock 20s + Native ~15s +
-# CodexBar live 2×20s (cli+oauth) + agy ports ~4s + CodexBar ag 20s ≈ 100s,
-# which is why the listener's outer timeout is 120s.
+# run/quota locks forever. Include kill grace when budgeting /usage: lock 20s
+# + Native Codex ~15s + CodexBar Codex 2×(20+10)s + Native agy ~21s
+# + CodexBar agy (35+10)s ≈ 161s, before Feishu delivery. The listener's
+# outer timeout is 360s, including Feishu auth/send retries (up to ~183s).
+# Provider-specific query bounds do not change cadence.
 readonly MODEL_TASK_TIMEOUT_SECONDS="${QUOTA_SENTINEL_MODEL_TIMEOUT:-300}"
 readonly MODEL_TASK_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_MODEL_KILL_GRACE:-10}"
 readonly CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_CODEXBAR_TIMEOUT:-20}"
+readonly ANTIGRAVITY_CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT:-35}"
+readonly ANTIGRAVITY_NATIVE_TIMEOUT_SECONDS="${QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT:-20}"
 readonly CODEXBAR_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_CODEXBAR_KILL_GRACE:-10}"
 # Retry policy: a model task only counts when it truly succeeds. A due task is
 # marked retry_pending BEFORE its first attempt and repaid by bursts — the
@@ -59,6 +64,7 @@ readonly INITIAL_ATTEMPT_LIMIT="${QUOTA_SENTINEL_INITIAL_ATTEMPTS:-3}"
 readonly WATCHDOG_ATTEMPT_LIMIT="${QUOTA_SENTINEL_WATCHDOG_ATTEMPTS:-2}"
 readonly WATCHDOG_RETRY_GAP_SECONDS="${QUOTA_SENTINEL_WATCHDOG_RETRY_GAP:-780}"
 readonly RUN_WITH_TIMEOUT_HELPER="$SCRIPT_DIR/run_with_timeout.py"
+readonly ANTIGRAVITY_USAGE_HELPER="$SCRIPT_DIR/antigravity_usage.py"
 readonly LOG_DIR="${QUOTA_SENTINEL_LOG_DIR:-$SCRIPT_DIR/logs}"
 
 typeset -g LAST_TEMP_DIR=""
@@ -1629,153 +1635,21 @@ sys.exit(1)
 }
 
 fetch_native_antigravity_quota() {
-  local output="$1"
-  require_executable "$PYTHON3_BIN"
-  "$PYTHON3_BIN" -c '
-import json, subprocess, time, ssl, urllib.request, urllib.parse, datetime, os, sys
-
-ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "*", "0.0.0.0", "::"}
-
-def validate_port(val):
-    try:
-        p = int(val)
-        if 1 <= p <= 65535:
-            return p
-    except (ValueError, TypeError):
-        pass
-    return None
-
-def extract_safe_port_from_listen_addr(addr_str):
-    addr_str = str(addr_str).strip()
-    if ":" not in addr_str:
-        return None
-    host_part = addr_str.rsplit(":", 1)[0].strip("[]")
-    port_part = addr_str.rsplit(":", 1)[1]
-    if host_part not in ALLOWED_LOCAL_HOSTS:
-        return None
-    return validate_port(port_part)
-
-def build_loopback_endpoint(port):
-    p = validate_port(port)
-    if not p:
-        return None
-    url = f"https://127.0.0.1:{p}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme != "https" or parts.hostname != "127.0.0.1" or parts.port != p:
-        raise ValueError(f"Endpoint invariant violated: {url}")
-    return url
-
-def get_antigravity_native():
-    ports = []
-    agy_session_file = os.path.expanduser("~/.codexbar/antigravity/agy-session.json")
-    if os.path.exists(agy_session_file):
-        try:
-            with open(agy_session_file, "r") as f:
-                sess = json.load(f)
-                pid = sess[0].get("pid")
-                if pid and isinstance(pid, int) and pid > 0:
-                    res = subprocess.run(["lsof", "-Pan", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True)
-                    for line in res.stdout.splitlines():
-                        if "LISTEN" in line:
-                            for part in line.split():
-                                p = extract_safe_port_from_listen_addr(part)
-                                if p:
-                                    ports.append(p)
-        except Exception:
-            pass
-
-    if not ports:
-        res = subprocess.run(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
-        for line in res.stdout.splitlines():
-            if "agy" in line or "language_server" in line:
-                for part in line.split():
-                    p = extract_safe_port_from_listen_addr(part)
-                    if p:
-                        ports.append(p)
-
-    ports = list(dict.fromkeys(ports))[:3]
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    data = None
-    for port in ports:
-        try:
-            url = build_loopback_endpoint(port)
-            if not url:
-                continue
-            req = urllib.request.Request(
-                url,
-                data=b"{}",
-                headers={"Content-Type": "application/json", "Connect-Protocol-Version": "1"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, context=ctx, timeout=1.5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                break
-        except Exception:
-            continue
-
-    if not data:
-        return None
-
-    gemini_group = None
-    for g in data.get("response", {}).get("groups", []):
-        if "gemini" in g.get("displayName", "").lower():
-            gemini_group = g
-            break
-    if not gemini_group and data.get("response", {}).get("groups"):
-        gemini_group = data["response"]["groups"][0]
-
-    if not gemini_group:
-        return None
-
-    five_h_bucket = None
-    weekly_bucket = None
-    for b in gemini_group.get("buckets", []):
-        if b.get("window") == "5h" or "5-hour" in b.get("displayName", "").lower() or "5h" in b.get("bucketId", "").lower():
-            five_h_bucket = b
-        elif b.get("window") == "weekly" or "weekly" in b.get("displayName", "").lower() or "weekly" in b.get("bucketId", "").lower():
-            weekly_bucket = b
-
-    if not five_h_bucket or not weekly_bucket:
-        return None
-
-    def iso_to_epoch(iso_str):
-        if not iso_str: return None
-        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-
-    now = int(time.time())
-    five_h_rem = round(five_h_bucket.get("remainingFraction", 0) * 100)
-    weekly_rem = round(weekly_bucket.get("remainingFraction", 0) * 100)
-
-    five_reset = iso_to_epoch(five_h_bucket.get("resetTime"))
-    weekly_reset = iso_to_epoch(weekly_bucket.get("resetTime"))
-    if not five_reset or not weekly_reset:
-        return None
-
-    return {
-        "source": "Native · agy local service",
-        "fresh": True,
-        "capturedAt": now,
-        "fiveHour": {
-            "remainingPercent": five_h_rem,
-            "resetAt": five_reset
-        },
-        "weekly": {
-            "remainingPercent": weekly_rem,
-            "resetAt": weekly_reset
-        }
-    }
-
-res = get_antigravity_native()
-if res and res.get("fiveHour", {}).get("resetAt") and res.get("weekly", {}).get("resetAt"):
-    print(json.dumps(res))
-    sys.exit(0)
-sys.exit(1)
-' >"$output" 2>/dev/null || return 1
-  [[ -s "$output" ]] || return 1
+  local output="$1" reason=""
+  [[ -x "$AGY_BIN" && -x "$UV_BIN" ]] || return 1
+  # agy >= 1.1.11 owns this built-in metadata command. Older local HTTPS
+  # endpoints now reject tokenless probes; never send /usage as an LLM prompt.
+  if "$UV_BIN" run --offline --no-project --no-config python -B "$ANTIGRAVITY_USAGE_HELPER" \
+      --agy "$AGY_BIN" --timeout "$ANTIGRAVITY_NATIVE_TIMEOUT_SECONDS" \
+      >"$output" 2>"${output}.stderr"; then
+    [[ -s "$output" ]] || return 1
+    return 0
+  fi
+  # Only the helper's fixed reason code may enter the run log, not raw CLI
+  # stderr, OAuth credentials, CSRF tokens or the textual quota response.
+  reason="$(/usr/bin/sed -n 's/^antigravity_usage: \([a-z_]*\)$/\1/p' "${output}.stderr")"
+  log_warn "quota antigravity: native /usage failed (${reason:-runtime_unavailable})"
+  return 1
 }
 
 save_codexbar_cache() {
@@ -1841,7 +1715,7 @@ fetch_codexbar_antigravity_quota() {
   local output="$1" rc=0
   [[ -x "$CODEXBAR_BIN" ]] || return 1
   if "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
-      --timeout "$CODEXBAR_TIMEOUT_SECONDS" \
+      --timeout "$ANTIGRAVITY_CODEXBAR_TIMEOUT_SECONDS" \
       --kill-grace "$CODEXBAR_KILL_GRACE_SECONDS" \
       -- \
       "$CODEXBAR_BIN" usage --provider antigravity --source cli --format json --json-only --no-color \
@@ -1852,7 +1726,7 @@ fetch_codexbar_antigravity_quota() {
     fi
   else
     rc=$?
-    (( rc == 124 )) && log_warn "quota antigravity: codexbar-live TIMEOUT after ${CODEXBAR_TIMEOUT_SECONDS}s"
+    (( rc == 124 )) && log_warn "quota antigravity: codexbar-live TIMEOUT after ${ANTIGRAVITY_CODEXBAR_TIMEOUT_SECONDS}s"
   fi
   return 1
 }
