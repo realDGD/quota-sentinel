@@ -110,6 +110,13 @@ regression case.**
 Reads (`read_provider_*`) are pure: no lazy migration, no repair writes. The
 legacy upgrade runs once at command entry (#7).
 
+> Note (Phase 2): shadow JSON document creation (`python3 -m
+> quota_sentinel migrate`) is deliberately NOT in this registry — it does
+> not write authoritative state. It needs no lock because it is
+> seed-if-absent only: it can create a missing shadow document and can
+> never overwrite any document, authoritative or otherwise. If/when JSON
+> becomes authoritative, its writer paths join this table.
+
 ## Python state store (strangler Phase 1)
 
 `quota_sentinel.state` provides the first Python-side view of scheduler
@@ -168,9 +175,73 @@ state:
   `ScheduleStateContractSpecTests`; wiring changes wait for their own
   phase.
 
-Future phases (JSON backend, scheduler decisions, quota adapters) grow out
-of this seam one boundary at a time — see the migration order in the
-project log, never a big-bang rewrite.
+## JSON document backend (Phase 2 — shadow representation)
+
+`quota_sentinel.state.schema` + `json_store` + `migration` add a second
+durable representation: one `<provider>-state.json` per provider.
+
+**Ownership during Phase 2 (explicit):** the shell's per-slot files remain
+the AUTHORITATIVE runtime state — every scheduler write, read and decision
+uses them. JSON documents are SHADOW snapshots created only by the
+explicit bootstrap `python3 -m quota_sentinel migrate` (library:
+`migration.migrate_all`). They are NOT re-synced when the shell writes
+after seeding: a shadow document freezes the legacy state at migration
+time (later drift is expected and harmless because nothing authoritative
+reads the shadow yet). Declaring JSON authoritative requires moving
+writer ownership — a later phase, registered in the write-path table at
+that moment. `status` still reads slot files via `FileStateStore`.
+
+Schema v1 (`schema.py`):
+
+* flat document, `schema_version: 1` plus all eight slot keys ALWAYS
+  materialized;
+* explicit `null` = business unset; **missing key = corruption**;
+  **unknown key = corruption**; unsupported/absent version = refusal,
+  never guessing;
+* strict types matching the persistence boundary: plain non-negative ints
+  (bool excluded), plain bool `retry_pending`, single-line non-empty
+  window string or null, `reset_candidate` null or exactly
+  `{reset_at, observed_at}`;
+* deterministic bytes (sorted keys, fixed layout, strict UTF-8) so
+  serialize is reproducible and unrepresentable text fails pre-filesystem.
+
+`JsonStateStore`:
+
+* `load` pure and LOUD: absent document → `MissingStateDocumentError`
+  (absence is bootstrap state, never defaulted); corrupt bytes/JSON →
+  `DocumentCorruptError`; schema violation → `SchemaError`. A whole
+  authoritative document is never silently read as all-unset, and nothing
+  is auto-repaired;
+* `commit` = whole-document transaction: defensive stale check (NOT a
+  CAS — same rule as the file store: production writers must run inside
+  `run.lock`), full validation + final-bytes serialization before any
+  filesystem operation, then ONE temp/fsync/atomic-replace publish.
+  Business-value failure ⇒ old document byte-identical; crash or
+  filesystem failure ⇒ readers see old-complete or new-complete, never
+  half JSON. That single-unit atomicity is precisely what the per-slot
+  file backend could not offer;
+* write-side directory ownership identical (0700 dir, 0600 doc, created
+  only on write paths);
+* `commit` never creates a document: creation belongs to migration.
+
+Migration (`migration.py`): reads legacy strictly through
+`FileStateStore` (no second parser; unset-on-garbage semantics carry
+over, nothing "repaired"); publishes via seed-if-absent
+(`os.link`/EEXIST — mirrors the shell's `seed_provider_state_file`), so
+JSON that exists always wins and a race can only skip. Reruns are
+no-ops. Legacy slot files are never moved/deleted: rollback = stop
+reading JSON. `DEFAULT_PROVIDERS` must equal the shell's `PROVIDERS`
+roster — asserted against the real array by the parity suite (SP5).
+
+Crash-proof scope is unchanged by this phase: the at-least-once
+crash-prefix proof covers the success transition; and while whole-document
+atomicity removes multi-slot partial-commit risk for FUTURE migrated
+transitions, each transition still needs individual review and behavior
+tests before its writer moves behind `commit()`.
+
+Later phases (scheduler decisions, quota adapters) grow out of these
+seams one boundary at a time — see the migration order in the project
+log, never a big-bang rewrite.
 
 ## Shell freeze
 
