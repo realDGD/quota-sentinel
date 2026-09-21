@@ -412,3 +412,24 @@ The script substitutes the real paths, validates each file with `plutil
 -lint`, and refuses to install anything containing an unrendered
 placeholder. It is idempotent — re-run it after moving the checkout.
 
+## Tests
+
+The suites under `tests/` are standalone scripts with no test runner to
+install. Run them from the repository root so the checkout is importable:
+
+```bash
+for t in tests/*.zsh; do zsh "$t" || echo "FAIL $t"; done
+for t in tests/*.py;  do PYTHONPATH=. python3 "$t" || echo "FAIL $t"; done
+```
+
+`tests/feishu-listener-regression.py` additionally needs `lark-oapi`, which
+is declared in its own PEP 723 header, so run that one through uv:
+
+```bash
+PYTHONPATH=. uv run tests/feishu-listener-regression.py
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
