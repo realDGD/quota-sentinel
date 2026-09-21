@@ -202,6 +202,82 @@ a backup, or by re-running the cutover from the untouched legacy files) —
 there is no automatic repair subsystem, because a repair heuristic over the
 scheduler's source of truth is exactly how a lost debt becomes invisible.
 
+## Document backend contracts (Phase 2 / 3A, preserved)
+
+The contracts the JSON backend and the cutover preparation were built against
+still hold, and the phases that consumed them (3B, 3C) did not weaken any of
+them. They are restated here because a migration that quietly drops its own
+safety wording is how the safety itself gets lost. Each sentence below is a
+CONTRACT pinned by `tests/python-state-cutover-regression.py`, not prose.
+
+**Preparation is not ownership.**
+
+```text
+Phase 3A PREPARED is NOT JSON AUTHORITATIVE
+```
+
+Phase 3A only prepares a semantically current JSON document for a later,
+explicit switch — which is exactly what `cutover` now performs. Preparing a
+document does not move ownership.
+
+**Source of truth is absolute**, and the lock precondition is declared rather
+than faked:
+
+```text
+Source of truth is absolute: the ProviderState read from the legacy slot
+files AT CALL TIME. A pre-existing shadow is comparison material at best.
+a lock file existing does not imply the caller owns it
+```
+
+This is the exact opposite of Phase 2 `migrate_provider`, whose skip-if-exists
+rule is right for a bootstrap seed and wrong for a source-of-truth refresh —
+the two are deliberately different operations and neither borrows the other's
+rules.
+
+**Validation is one pipeline, run before any mutation:**
+
+```text
+validate_state -> state_to_document -> validate_document -> deterministic UTF-8 bytes
+```
+
+The plan-then-execute boundary means the whole preflight completes before the first filesystem mutation, so a business-value failure cannot leave a half-written document.
+
+**Failures are fail-closed and their branches are distinguished, not blurred.**
+The load/schema failures named above — `MissingStateDocumentError`,
+`DocumentCorruptError`, `SchemaError` — all FAIL CLOSED on state mutation: no
+default document, no advanced deadline, no completed task.
+
+```text
+failure AFTER a successful publish (verification mismatch)
+```
+
+is a different animal: the newly-published complete document may legitimately
+be on disk, no ownership changed, and rollback of authoritative ownership is unnecessary. Adding a shadow rollback there would be "fixing" correct behavior
+into a more fragile one, which is why the rule is written down rather than
+left to taste.
+
+**Durability scope is stated, not implied:**
+
+```text
+Atomic-visibility guarantees cover process crash and concurrent readers
+Power-loss durability is NOT claimed and NOT implemented
+```
+
+A publish is a temp-write/fsync/rename, so a reader observes the complete old
+document or the complete new one, and a process killed at any point leaves no
+torn document. What that does NOT buy: the file's contents are fsynced before
+the rename, but the containing directory entry is not, so an operating-system
+or hardware failure may lose the rename even though no process ever observed a
+torn document. Closing that gap would need a directory fsync on every publish;
+nobody has asked for that guarantee, and claiming it without the fsync would
+be worse than saying so.
+
+The Phase 3B ownership-switch design questions — how a process decides who
+owns the state after a restart, and how to keep a reader and a writer from
+disagreeing — are answered by *State backend authority* above: the
+double-truth risk is closed by making the durable manifest the single fact,
+and by the router's generation-guarded read.
+
 ## State write-path registry
 
 Every path that writes authoritative scheduler state, and the lock it must

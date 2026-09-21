@@ -1834,165 +1834,26 @@ format_quota_message() {
 # missing values become null there — never "now" — and the conversion is
 # idempotent.
 
-normalize_pi_codex_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    .headers as $h |
-    ($h["x-codex-primary-used-percent"] | tonumber) as $primary_used |
-    ($h["x-codex-primary-window-minutes"] | tonumber) as $primary_window |
-    ($h["x-codex-primary-reset-at"] | tonumber) as $primary_reset |
-    ($h["x-codex-secondary-used-percent"] | tonumber) as $secondary_used |
-    ($h["x-codex-secondary-window-minutes"] | tonumber) as $secondary_window |
-    ($h["x-codex-secondary-reset-at"] | tonumber) as $secondary_reset |
-    select($primary_window == 300 and $secondary_window == 10080 and
-      $primary_used >= 0 and $primary_used <= 100 and
-      $secondary_used >= 0 and $secondary_used <= 100) |
-    {
-      source: "Pi 快照（可能不是最新）",
-      fresh: false,
-      cached: true,
-      capturedAt: (.capturedAt // null),
-      fiveHour: {remainingPercent: (100 - $primary_used), resetAt: $primary_reset},
-      weekly: {remainingPercent: (100 - $secondary_used), resetAt: $secondary_reset}
-    }
-  ' "$input" >"$output"
+# Quota normalisation is Python (quota_sentinel.quota). The shell used to
+# carry seven jq programs here; they are now one implementation with golden
+# tests. Each wrapper keeps its historical contract: rc 0 with the canonical
+# document written to $2, rc 1 when this payload carries no usable quota.
+quota_normalize() {
+  local kind="$1" input="$2" output="$3"
+  scheduler_bridge quota-normalize --kind "$kind" \
+    --input "$input" --output "$output"
 }
 
-normalize_pi_antigravity_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    (.fiveHour.remainingPercent | tonumber) as $five_remaining |
-    (.fiveHour.resetAt | tonumber) as $five_reset |
-    (.weekly.remainingPercent | tonumber) as $weekly_remaining |
-    (.weekly.resetAt | tonumber) as $weekly_reset |
-    select($five_remaining >= 0 and $five_remaining <= 100 and
-      $weekly_remaining >= 0 and $weekly_remaining <= 100) |
-    {
-      source: "Pi 快照（可能不是最新）",
-      fresh: false,
-      cached: true,
-      capturedAt: (.capturedAt // null),
-      fiveHour: {remainingPercent: $five_remaining, resetAt: $five_reset},
-      weekly: {remainingPercent: $weekly_remaining, resetAt: $weekly_reset}
-    }
-  ' "$input" >"$output"
-}
-
-normalize_pi_opencode_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    def window:
-      {remainingPercent: (.remainingPercent | tonumber), resetAt: (.resetAt | tonumber)};
-    . as $orig |
-    select(($orig.fiveHour | type) == "object" and ($orig.weekly | type) == "object") |
-    ($orig.fiveHour | window) as $five |
-    ($orig.weekly | window) as $weekly |
-    select($five.remainingPercent >= 0 and $five.remainingPercent <= 100 and
-      $weekly.remainingPercent >= 0 and $weekly.remainingPercent <= 100) |
-    {
-      source: "Pi 快照（可能不是最新）",
-      fresh: false,
-      cached: true,
-      capturedAt: ($orig.capturedAt // null),
-      fiveHour: $five,
-      weekly: $weekly
-    } + (($orig.monthly | try window catch null) as $monthly |
-         if $monthly == null then {} else {monthly: $monthly} end)
-  ' "$input" >"$output"
-}
-
-normalize_codexbar_codex_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    def epoch($value):
-      if ($value | type) == "number" then ($value | floor)
-      elif ($value | type) == "string" then ($value | fromdateiso8601)
-      else empty end;
-    def remaining($used): ([0, (100 - ($used | tonumber)), 100] | sort | .[1] | round);
-    ([.[] | select(.provider == "codex" and (.usage | type) == "object")][0] // empty) as $row |
-    select($row != null) |
-    $row.usage as $usage |
-    ([$usage.primary, $usage.secondary, ($usage.extraRateWindows[]?.window)] | map(select(. != null))) as $windows |
-    ([$windows[] | select(.windowMinutes == 300 and .usedPercent != null)][0] // empty) as $five |
-    ([$windows[] | select(.windowMinutes == 10080 and .usedPercent != null)][0] // empty) as $weekly |
-    select($five != null and $weekly != null) |
-    {
-      source: ("CodexBar · " + ($row.source // "cli")),
-      fresh: true,
-      capturedAt: (now | floor),
-      fiveHour: {remainingPercent: remaining($five.usedPercent), resetAt: epoch($five.resetsAt)},
-      weekly: {remainingPercent: remaining($weekly.usedPercent), resetAt: epoch($weekly.resetsAt)}
-    }
-  ' "$input" >"$output"
-}
-
-normalize_codexbar_antigravity_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    def epoch($value):
-      if ($value | type) == "number" then ($value | floor)
-      elif ($value | type) == "string" then ($value | fromdateiso8601)
-      else empty end;
-    def remaining($used): ([0, (100 - ($used | tonumber)), 100] | sort | .[1] | round);
-    ([.[] | select(.provider == "antigravity" and (.usage | type) == "object")][0] // empty) as $row |
-    select($row != null) |
-    $row.usage as $usage |
-    ($usage.extraRateWindows // []) as $windows |
-    ([$windows[] | select(.window.windowMinutes == 300 and (((.id // "") | contains("gemini")) or ((.title // "") | ascii_downcase | contains("gemini"))))][0].window // empty) as $five |
-    ([$windows[] | select(.window.windowMinutes == 10080 and (((.id // "") | contains("gemini")) or ((.title // "") | ascii_downcase | contains("gemini"))))][0].window // empty) as $weekly |
-    select($five != null and $weekly != null) |
-    {
-      source: ("CodexBar · " + ($row.source // "cli")),
-      fresh: true,
-      capturedAt: (now | floor),
-      fiveHour: {remainingPercent: remaining($five.usedPercent), resetAt: epoch($five.resetsAt)},
-      weekly: {remainingPercent: remaining($weekly.usedPercent), resetAt: epoch($weekly.resetsAt)}
-    }
-  ' "$input" >"$output"
-}
-
-# CodexBar reports OpenCode Go windows as primary (5h) / secondary (weekly) /
-# tertiary (monthly) keyed by windowMinutes; its usedPercent follows the same
-# used-not-remaining convention as the codex provider.
-normalize_codexbar_opencode_quota() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    def epoch($value):
-      if ($value | type) == "number" then ($value | floor)
-      elif ($value | type) == "string" then
-        # The OpenCode Go API emits ISO-8601 with milliseconds, which
-        # fromdateiso8601 rejects; strip the fraction before parsing.
-        (if ($value | test("\\.[0-9]+Z$")) then ($value | sub("\\.[0-9]+Z$"; "Z")) else $value end
-          | fromdateiso8601)
-      else empty end;
-    def remaining($used): ([0, (100 - ($used | tonumber)), 100] | sort | .[1] | round);
-    def window_for($windows; $minutes):
-      ([$windows[] | select(.windowMinutes == $minutes and .usedPercent != null)][0] // empty);
-    def window_of($window):
-      {remainingPercent: remaining($window.usedPercent), resetAt: epoch($window.resetsAt)};
-    ([.[] | select(.provider == "opencodego" and (.usage | type) == "object")][0] // empty) as $row |
-    select($row != null) |
-    $row.usage as $usage |
-    ([$usage.primary, $usage.secondary, $usage.tertiary] | map(select(. != null))) as $windows |
-    (window_for($windows; 300)) as $five |
-    (window_for($windows; 10080)) as $weekly |
-    (window_for($windows; 43200)) as $monthly |
-    select($five != null and $weekly != null) |
-    {
-      source: ("CodexBar · " + ($row.source // "api")),
-      fresh: true,
-      capturedAt: (now | floor),
-      fiveHour: window_of($five),
-      weekly: window_of($weekly)
-    } + (if $monthly != null then {monthly: window_of($monthly)} else {} end)
-  ' "$input" >"$output"
-}
+# The `[[ -s ]]` guard is not decoration: it is the difference between a
+# quick shell test and a subprocess when the payload is absent, which is the
+# COMMON case for every fallback tier the ladder steps over. The jq versions
+# had exactly the same guard.
+normalize_pi_codex_quota() { [[ -s "$1" ]] || return 1; quota_normalize pi-codex "$1" "$2"; }
+normalize_pi_antigravity_quota() { [[ -s "$1" ]] || return 1; quota_normalize pi-antigravity "$1" "$2"; }
+normalize_pi_opencode_quota() { [[ -s "$1" ]] || return 1; quota_normalize pi-opencode "$1" "$2"; }
+normalize_codexbar_codex_quota() { [[ -s "$1" ]] || return 1; quota_normalize codexbar-codex "$1" "$2"; }
+normalize_codexbar_antigravity_quota() { [[ -s "$1" ]] || return 1; quota_normalize codexbar-antigravity "$1" "$2"; }
+normalize_codexbar_opencode_quota() { [[ -s "$1" ]] || return 1; quota_normalize codexbar-opencode "$1" "$2"; }
 
 fetch_native_codex_quota() {
   local output="$1"
@@ -2291,29 +2152,12 @@ save_pi_quota_snapshots() {
 # Read a stale quota file from disk through the normalized-schema boundary:
 # validates the shape and rewrites capturedAt to the epoch-integer/null
 # contract, so historical files cannot leak ISO strings into effective quota.
-# This is the SINGLE home of the epoch_ts definition; every read path that
-# feeds effective quota goes through here. Accepts epoch integers, ISO-8601
-# with optional fractional seconds, "Z" or numeric timezone offsets; invalid
-# and missing values become null — never "now". Idempotent.
+# Accepts epoch integers, ISO-8601 with optional fractional seconds, "Z" or
+# numeric timezone offsets; invalid and missing values become null — never
+# "now". Idempotent. The conversion itself is Python.
 renormalise_quota_file() {
-  local input="$1" output="$2"
-  [[ -s "$input" ]] || return 1
-  "$JQ_BIN" -e '
-    def epoch_ts:
-      if type == "number" then floor
-      elif type == "string" then
-        (try
-          (if test("[+-][0-9]{2}:?[0-9]{2}$") then
-            capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?<sign>[+-])(?<hh>[0-9]{2}):?(?<mm>[0-9]{2})$") as $m |
-            (($m.d + "Z") | fromdateiso8601) -
-              (if $m.sign == "-" then -1 else 1 end) * (($m.hh | tonumber) * 3600 + (($m.mm | tonumber) * 60))
-          else (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) end)
-         catch null)
-      else null end;
-    select(.fiveHour.resetAt != null and .weekly.resetAt != null) |
-    . + {capturedAt: ((.capturedAt // null) | epoch_ts)}
-  ' "$input" >"$output" 2>/dev/null || return 1
-  [[ -s "$output" ]] || return 1
+  [[ -s "$1" ]] || return 1
+  quota_normalize renormalize "$1" "$2"
 }
 
 use_pi_snapshot_codex() {
@@ -2390,50 +2234,85 @@ quota_tier() {
   return $rc
 }
 
+# One tier of one provider's ladder. The tier NAMES and their order come
+# from the Python plan; what lives here is only HOW to execute a tier,
+# because vendor probes under the shared process-group timeout are the
+# shell's job.
+quota_tier_command() {
+  local provider="$1" tier="$2" output="$3"
+  case "$tier" in
+    native) "fetch_native_${provider}_quota" "$output" ;;
+    codexbar-live) "fetch_codexbar_${provider}_quota" "$output" ;;
+    codexbar-cache) "use_codexbar_cached_${provider}" "$output" ;;
+    pi-snapshot) "use_pi_snapshot_${provider}" "$output" ;;
+    *) die "unknown quota tier '$tier' for provider '$provider'" ;;
+  esac
+}
+
+# The whole roster's ladder in ONE bridge call. `collect_effective_quotas`
+# walks this every tick, so a per-provider call would pay the interpreter
+# start-up three times for data that never changes.
+quota_plan_roster() {
+  scheduler_bridge quota-plan "$@"
+}
+
+# Record the freshness verdict for a provider. The flag is a per-provider
+# global because the card and the scheduler both read it; the VALUE comes
+# from the plan, so the shell never decides which tiers are trustworthy.
+quota_set_fresh() {
+  local provider="$1" value="$2" name
+  case "$provider" in
+    codex) name="CODEX_QUOTA_IS_FRESH" ;;
+    antigravity) name="ANTIGRAVITY_QUOTA_IS_FRESH" ;;
+    opencode) name="OPENCODE_QUOTA_IS_FRESH" ;;
+    *) die "unknown provider '$provider'" ;;
+  esac
+  typeset -g "$name=$value"
+}
+
+# Resolve every provider through its declared ladder. First tier that
+# produces a usable document wins; the tiers below it never run.
 collect_effective_quotas() {
   prepare_quota_probe
+  local provider output tier fresh line rc outcome
+  local plan current="" entry
+  plan="$(quota_plan_roster "${PROVIDERS[@]}")"
 
-  # Codex 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
-  if quota_tier codex native fetch_native_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
-    CODEX_QUOTA_IS_FRESH=1
-  elif quota_tier codex codexbar-live fetch_codexbar_codex_quota "$CODEX_QUOTA_NORMALIZED_FILE"; then
-    CODEX_QUOTA_IS_FRESH=1
-  elif quota_tier codex codexbar-cache use_codexbar_cached_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
-    CODEX_QUOTA_IS_FRESH=0
-  elif quota_tier codex pi-snapshot use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"; then
-    CODEX_QUOTA_IS_FRESH=0
-  else
-    CODEX_QUOTA_IS_FRESH=0
-    log_error "quota codex: all tiers unavailable"
-  fi
+  # Walk the plan once into "tier:fresh" words per provider. The plan lists
+  # every provider's tiers in order, so one pass is enough and the ladder
+  # order never has to be repeated here.
+  typeset -A LADDER=()
+  while IFS= read -r line; do
+    case "$line" in
+      provider=*) current="${line#provider=}" ;;
+      tier=*)
+        tier="${${line#tier=}%%$'\t'*}"
+        fresh="${line##*fresh=}"
+        LADDER[$current]+="$tier:$fresh "
+        ;;
+    esac
+  done <<<"$plan"
 
-  # Antigravity 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
-  if quota_tier antigravity native fetch_native_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
-    ANTIGRAVITY_QUOTA_IS_FRESH=1
-  elif quota_tier antigravity codexbar-live fetch_codexbar_antigravity_quota "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
-    ANTIGRAVITY_QUOTA_IS_FRESH=1
-  elif quota_tier antigravity codexbar-cache use_codexbar_cached_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
-    ANTIGRAVITY_QUOTA_IS_FRESH=0
-  elif quota_tier antigravity pi-snapshot use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"; then
-    ANTIGRAVITY_QUOTA_IS_FRESH=0
-  else
-    ANTIGRAVITY_QUOTA_IS_FRESH=0
-    log_error "quota antigravity: all tiers unavailable"
-  fi
-
-  # OpenCode 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
-  if quota_tier opencode native fetch_native_opencode_quota "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
-    OPENCODE_QUOTA_IS_FRESH=1
-  elif quota_tier opencode codexbar-live fetch_codexbar_opencode_quota "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
-    OPENCODE_QUOTA_IS_FRESH=1
-  elif quota_tier opencode codexbar-cache use_codexbar_cached_opencode "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
-    OPENCODE_QUOTA_IS_FRESH=0
-  elif quota_tier opencode pi-snapshot use_pi_snapshot_opencode "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
-    OPENCODE_QUOTA_IS_FRESH=0
-  else
-    OPENCODE_QUOTA_IS_FRESH=0
-    log_error "quota opencode: all tiers unavailable"
-  fi
+  for provider in "${PROVIDERS[@]}"; do
+    output="$(provider_normalized_quota_file "$provider")"
+    outcome=""
+    for entry in ${=LADDER[$provider]}; do
+      tier="${entry%%:*}"
+      rc=0
+      quota_tier "$provider" "$tier" \
+        quota_tier_command "$provider" "$tier" "$output" || rc=$?
+      if (( rc == 0 )); then
+        outcome="${entry##*:}"
+        break
+      fi
+    done
+    if [[ -n "$outcome" ]]; then
+      quota_set_fresh "$provider" "$outcome"
+    else
+      quota_set_fresh "$provider" 0
+      log_error "quota $provider: all tiers unavailable"
+    fi
+  done
 }
 
 quota_message_from_file() {

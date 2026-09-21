@@ -363,8 +363,13 @@ class SecretsAndPaths(unittest.TestCase):
         r'"app_secret"\s*:\s*"[^"]{8,}"',
         r"app_secret=[A-Za-z0-9]{8,}",
     )
-    # Files whose only matches are detection canaries / regex sources.
-    CANARY_FILES = {"tests/uv-project-regression.py"}
+    # Files whose only matches are detection canaries / regex sources. Both
+    # are checked line by line below, so this is an allowlist of two known
+    # strings, not a blanket exemption.
+    CANARY_FILES = {
+        "tests/uv-project-regression.py",
+        "tests/python-architecture-audit-regression.py",
+    }
     # Values that are obviously placeholders rather than credentials.
     PLACEHOLDER_VALUES = {
         "test-secret", "TOPSECRET", "REDACTED", "redacted", "example",
@@ -476,6 +481,65 @@ class GitignoreCoverage(unittest.TestCase):
             rel = str(path.relative_to(REPO))
             with self.subTest(file=rel):
                 self.assertIn(rel, tracked, f"{rel} exists but is untracked")
+
+
+class QuotaAdapterAgreement(unittest.TestCase):
+    """AR9: the shell and the Python adapters agree on the quota ladder.
+
+    The ladder and the capability facts are declared once, in
+    ``quota_sentinel.quota``. The shell still EXECUTES a tier (vendor probes
+    under the shared timeout) and still renders provider titles, so those two
+    places are checked for agreement rather than trusted.
+    """
+
+    def test_ar9_shell_executes_exactly_the_declared_tiers(self):
+        sys.path.insert(0, str(REPO))
+        from quota_sentinel.quota.adapters import PROVIDERS, TIER_LADDER
+
+        body = function_body("quota_tier_command")
+        for tier in TIER_LADDER:
+            with self.subTest(tier=tier.value):
+                self.assertIn(f"{tier.value})", body)
+        # No extra arm the plan does not know about.
+        arms = re.findall(r"^\s{4}([a-z-]+)\)", body, re.M)
+        self.assertEqual(sorted(arms), sorted(t.value for t in TIER_LADDER))
+        # ... and the provider roster is the same one.
+        match = re.search(r"^readonly PROVIDERS=\(([^)]*)\)", SHELL, re.M)
+        self.assertEqual(tuple(match.group(1).split()), tuple(PROVIDERS))
+
+    def test_ar9b_shell_and_adapter_agree_on_provider_titles(self):
+        """Titles are rendering data the shell still owns, so the two copies
+        must at least be mechanically identical."""
+        sys.path.insert(0, str(REPO))
+        from quota_sentinel.quota.adapters import ADAPTERS
+
+        body = function_body("provider_card_title")
+        for provider, adapter in ADAPTERS.items():
+            with self.subTest(provider=provider):
+                self.assertIn(f'{provider}) print -r -- "{adapter.title}"', body)
+
+    def test_ar9c_shell_keeps_no_jq_quota_normaliser(self):
+        """The seven jq programs are gone; normalisation is one Python
+        implementation with golden tests."""
+        for name in (
+            "normalize_pi_codex_quota",
+            "normalize_pi_antigravity_quota",
+            "normalize_pi_opencode_quota",
+            "normalize_codexbar_codex_quota",
+            "normalize_codexbar_antigravity_quota",
+            "normalize_codexbar_opencode_quota",
+            "renormalise_quota_file",
+        ):
+            with self.subTest(function=name):
+                body = function_body(name)
+                self.assertIn("quota_normalize", body)
+                self.assertNotIn("JQ_BIN", body)
+
+    def test_ar9d_monthly_is_display_only_where_declared(self):
+        sys.path.insert(0, str(REPO))
+        from quota_sentinel.quota.adapters import ADAPTERS
+        monthly = sorted(p for p, a in ADAPTERS.items() if a.monthly_display_only)
+        self.assertEqual(monthly, ["opencode"])
 
 
 class DocumentationPointers(unittest.TestCase):

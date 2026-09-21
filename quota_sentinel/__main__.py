@@ -42,6 +42,7 @@ from quota_sentinel.state.json_store import JsonStateStore
 from quota_sentinel.state.migration import migrate_all
 from quota_sentinel.scheduler import cli as scheduler_cli
 from quota_sentinel.notifications import plan as notification_plan
+from quota_sentinel.quota import cli as quota_cli
 
 
 def default_state_dir() -> Path:
@@ -205,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Scheduler-domain verbs (Phase 3C bridge). Registered from their own
     # module so the parser stays a table of contents, not a second API.
     scheduler_cli.register(sub)
+    quota_cli.register(sub)
     return parser
 
 
