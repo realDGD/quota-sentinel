@@ -310,6 +310,50 @@ class UvProjectTests(unittest.TestCase):
                          "environment — runtime must not self-heal; the "
                          "installer's uv sync --locked owns env freshness")
 
+    # ---- UV11: the scheduler bridge stays a class-C helper -----------------
+    def test_uv11_scheduler_bridge_is_stdlib_only_on_system_python(self):
+        """The shell calls the scheduler domain on the HOT path (every timer
+        tick), so the bridge must run on the system interpreter with `-S` and
+        import nothing outside the standard library. If a third-party import
+        ever enters that graph, the daemon would start depending on a project
+        environment it is explicitly not allowed to assume."""
+        system_python = os.environ.get("QUOTA_SENTINEL_SYSTEM_PYTHON", "/usr/bin/python3")
+        self.assertTrue(os.access(system_python, os.X_OK), system_python)
+
+        program = (
+            "import sys;"
+            f"sys.path.insert(0, {str(REPO)!r});"
+            "import quota_sentinel.scheduler, quota_sentinel.state;"
+            "mods = sorted({m.split('.')[0] for m in sys.modules"
+            " if not m.startswith('_')});"
+            "third = [m for m in mods if m in"
+            " ('lark_oapi', 'requests', 'httpx', 'anyio', 'pydantic')];"
+            "print('third=' + ','.join(third))"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO)
+        r = subprocess.run(
+            [system_python, "-S", "-c", program],
+            capture_output=True, text=True, timeout=60, cwd="/private/tmp", env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("third=", r.stdout)
+        self.assertEqual(
+            r.stdout.strip(), "third=",
+            "the scheduler bridge imported a third-party package; it must stay "
+            "stdlib-only so a broken project venv cannot stop the timer",
+        )
+
+    def test_uv12_shell_bridge_invocation_stays_class_c(self):
+        """Pin the exact invocation the shell uses, in the shell itself."""
+        shell = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN" -S -m quota_sentinel',
+            shell,
+            "the scheduler bridge must keep running on the system interpreter "
+            "with -S (see ARCHITECTURE.md, class C)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

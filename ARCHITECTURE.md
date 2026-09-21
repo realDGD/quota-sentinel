@@ -6,52 +6,70 @@ behavioral parts; this file names the boundaries so future changes keep them.
 ## Ownership
 
 ```text
-task_orchestrator.py          = when
-  watchdog, precise deadline wake, sleep recovery, durable run history
-  (task-orchestrator.sqlite3 — observability only)
+quota_sentinel/                = the system's brain (Python)
+  state/                       authoritative scheduler state + backend authority
+  scheduler/                   scheduler policy, transitions, decisions
+  quota/                       provider quota adapters and normalisation
+  __main__.py                  the CLI the shell and operators call
 
-quota-sentinel.sh             = scheduling policy / how
-  deadline calculation, Fresh/Stale, retry debt, reset trust gate,
-  candidate/anchor confirmation, provider execution
+quota-sentinel.sh              = thin compatibility + system boundary (zsh)
+  model runner                 provider CLI invocation, process groups, timeouts
+  quota tier execution         the vendor probes, under the shared timeout helper
+  Feishu transport, cards      rendering and delivery
+  locks, install glue          run.lock / quota.lock, launchd-facing bootstrap
 
-provider state files          = scheduler authoritative state
-task-orchestrator.sqlite3     = history / observability, never authoritative
+task_orchestrator.py           = when (wake scheduling + durable run history)
+  task-orchestrator.sqlite3    = history / observability, NEVER authoritative
 ```
 
-Authoritative scheduler state must never move into the SQLite history DB.
-`task_orchestrator.py` reads state files for wake scheduling but does not own
-them.
+Authoritative scheduler state must never move into the SQLite history DB, and
+must never exist in two places: exactly one backend owns it at any instant,
+and a single durable fact says which one (see *State backend authority*).
+
+The shell no longer holds scheduler policy. It owns processes, locks, model
+execution, quota probing and notifications, and asks Python for every decision
+and every transition. `tests/python-scheduler-regression.py` fails if a policy
+value or a deadline algorithm reappears in the shell.
 
 ## Provider capability vs scheduler policy
 
-Provider capability (per adapter): the quota native source, fallback chain,
-and the set of quota windows (OpenCode additionally has a monthly window that
-is display-only and never participates in deadline math).
+Provider capability (per adapter, `quota_sentinel.quota.adapters`): the quota
+native source, the fallback ladder, and the set of quota windows (OpenCode
+additionally has a monthly window that is display-only and never participates
+in deadline math).
 
 Scheduler policy (shared, provider-generic): Fresh/Stale authority, the reset
 trust gate, candidate-reset confirmation, the reset anchor and near-movement
 accumulation guard, matured-debt preservation, reset-buffer blocking, and
-retry debt. These live in `sync_provider_deadline_from_quota` /
-`evaluate_provider` and apply identically to every provider. Do not express
-them as per-provider capability flags.
+retry debt. These live in `quota_sentinel.scheduler.policy` and apply
+identically to every provider. Do not express them as per-provider capability
+flags: `monthly_display_only` is a fact about OpenCode's vendor API, while
+"only Fresh data may move a deadline" is a rule about ours.
 
 ## Lock responsibilities and order
 
 ```text
 run.lock     = model execution + the serialization boundary for all
-               authoritative scheduler-state mutations
+               authoritative scheduler-state mutations + the backend cutover
 quota.lock   = quota acquisition serialization (probes, caches, snapshots)
 ```
 
 Sanctioned nesting order: **run → quota** (a holder of run.lock may take
 quota.lock). **Never wait for run.lock while holding quota.lock** — that
-inverts the order and can ABBA-deadlock with `check_schedule`. All run.lock
-acquisition from opportunistic paths (e.g. `/usage`) is non-blocking: busy
-means skip, never queue.
+inverts the order and can ABBA-deadlock with `check`. All run.lock acquisition
+from opportunistic paths (e.g. `/usage`) is non-blocking: busy means skip,
+never queue.
 
 `quota.lock` is deliberately NOT a scheduler-state lock: the retry phase of
-`check_schedule` commits state while holding only run.lock, so that a quota
-probe can never block debt repayment.
+`check` commits state while holding only run.lock, so that a quota probe can
+never block debt repayment.
+
+```text
+run.lock ──▶ quota.lock        sanctioned
+quota.lock ──✗──▶ run.lock     forbidden (ABBA with check)
+```
+
+No third lock may be introduced to shortcut either rule.
 
 ## Persistence invariant: at-least-once
 
@@ -69,14 +87,16 @@ dropping a due task. The mechanisms that encode this:
   deadline.
 * A matured deadline is a committed debt: fresh quota data may not move it
   into the future in the same round.
-* `commit_provider_success` orders its writes so any crash point leaves the
-  provider looking due-again (re-run), not done-but-never-run.
-* The candidate/anchor pair shares write ordering such that a crash can lose a
-  promotion opportunity but can never fabricate a trusted reset.
+* The success commit is a single transition; on the document backend it is a
+  single atomic replacement, and on the legacy backend its slot order keeps
+  `next_due_at` last, so any crash point leaves the provider looking
+  due-again (re-run) rather than done-but-never-run.
+* The candidate/anchor pair changes such that a crash can lose a promotion
+  opportunity but can never fabricate a trusted reset.
 
-Any refactor that collapses these writes (e.g. a future one-document state
-store) must preserve the direction: reachable-after-crash states may demand
-extra work, never permit skipping due work.
+Any refactor that collapses these writes must preserve the direction:
+reachable-after-crash states may demand extra work, never permit skipping due
+work.
 
 ## Scheduler state slots (8 per provider)
 
@@ -86,10 +106,101 @@ last_known_reset  last_triggered_window
 reset_anchor      reset_candidate
 ```
 
-`reset_candidate` is transient: the file's absence means "no candidate
-pending". A future JSON state document must represent that explicitly
-(`"reset_candidate": null` for a definite no-candidate; a *missing key* is a
-schema/migration error, never business state).
+`reset_candidate` is transient. A v1 document encodes that explicitly
+(`"reset_candidate": null` for a definite no-candidate) and every key is
+always materialized; a *missing key* is a schema error, never business state.
+On the legacy backend the file's absence carries that meaning.
+
+## State backend authority (Phase 3B)
+
+Two durable representations of the same slots exist, and exactly one is
+authoritative at any instant:
+
+```text
+legacy backend   <state_dir>/<provider>-<slot>       per-slot files
+json backend     <state_dir>/<provider>-state.json   one v1 document per provider
+```
+
+**The single fact** is `<state_dir>/backend-authority.json`:
+
+```json
+{"backend": "json", "epoch": 1, "schema_version": 1}
+```
+
+* Atomic (temp-write/fsync/rename), versioned, and strict: an unknown version
+  or backend is a loud error.
+* **Absent manifest = this deployment was never cut over = legacy is
+  authoritative.** That is a bootstrap rule with a mechanical trigger, not an
+  inference from content.
+* A *damaged* manifest is never defaulted to either side: `read_authority`
+  raises, mutations fail closed, readers fail loudly. Guessing here would let
+  a legacy writer create a second, diverging source of truth.
+* `epoch` increments on every durable switch, so "the same authority" is
+  distinguishable from "a different authority that looks similar".
+
+`AuthoritativeStateStore` is the only authority → backend mapping in the
+codebase. Production code never branches on the backend itself.
+
+* Writers (`commit`) hold `run.lock`; the cutover holds the same lock, so a
+  flip cannot interleave with a mutation. The router still re-reads the fact
+  after committing and raises `ConcurrentAuthorityChangeError` if it moved —
+  a precondition violation must be loud.
+* Readers (`load`, `load_all`) mostly do NOT hold the lock (`status`, the
+  timer's deadline scan, `/usage`). They use a generation guard: read the
+  fact, read the state, read the fact again; accept only when both agree, else
+  retry, else fail loudly. `load_all` applies the guard to the whole roster so
+  a caller never mixes providers from two different backends.
+* No caching layer exists: a long-lived process (the precision timer loops for
+  days) must not pin a backend selection at start-up.
+
+### Cutover and rollback
+
+`cutover` (the explicit operator verb) runs under `run.lock`:
+
+```text
+read the durable fact            already json -> idempotent no-op
+read CURRENT legacy state        the source of truth, never a frozen shadow
+refresh + verify every document  one atomic publish each, semantic equality
+re-read every document as a set
+publish the authority fact       <- the single commit point
+re-read the fact and confirm
+```
+
+The whole roster switches in ONE epoch; there is no state in which Codex is
+JSON while antigravity is still legacy. Every crash prefix resolves
+mechanically: before the flip the authority is still legacy (refreshed
+documents are harmless shadows), and the flip itself is one atomic
+replacement, so readers see the complete old or the complete new manifest.
+`tests/python-authority-regression.py` injects a crash at every checkpoint,
+including inside the manifest publish, and asserts that ownership is always
+determinable, that no legacy byte ever changes, and that no torn document or
+temp file survives. `tests/state-authority-regression.zsh` proves the
+operator-visible lifecycle through the real shell.
+
+Legacy files are **never deleted, moved or rewritten by the cutover**; after
+the flip they are a rollback artifact and no production path reads or writes
+them. The shell's legacy accessors are guarded: they `die` rather than touch
+the retired backend once JSON owns the state.
+
+`rollback` is the inverse switch and refuses unless it is a PURE UNDO (every
+document still equal to its legacy file). Once JSON has advanced, "roll back"
+would discard authoritative state — a human decision with a human-sized
+backup, not an automatic one.
+
+### Failure policy on the authoritative backend
+
+```text
+MissingStateDocumentError   no document for this provider
+DocumentCorruptError        bytes are not UTF-8 JSON
+SchemaError                 parsed but violates v1
+```
+
+None of these may be answered with a default `ProviderState()`. Mutations fail
+closed, tasks are not marked complete, deadlines do not advance, and the
+failure is loud. Recovery is deliberately minimal: restore the document (from
+a backup, or by re-running the cutover from the untouched legacy files) —
+there is no automatic repair subsystem, because a repair heuristic over the
+scheduler's source of truth is exactly how a lost debt becomes invisible.
 
 ## State write-path registry
 
@@ -97,252 +208,151 @@ Every path that writes authoritative scheduler state, and the lock it must
 hold while doing so. **New writers must be added here and covered by a
 regression case.**
 
+All entries funnel through `quota_sentinel.scheduler.service` →
+`AuthoritativeStateStore.commit` → the selected backend.
+
 | # | Write path | State written | Locks at write time |
 |---|---|---|---|
-| 1 | `check` → Phase A `run_retry_burst` → `commit_provider_success` | attempt, task, retry_pending, next_due, anchor/candidate (clear) | run |
-| 2 | `check` → Phase B quota collection | (quota caches only, not scheduler state) | run + quota |
-| 3 | `check` → Phase C `evaluate_provider` → `sync_provider_deadline_from_quota` / fallback seed | last_known_reset, next_due, anchor, candidate | run + quota |
+| 1 | `check` → Phase A `run_retry_burst` | attempt + debt (`begin_attempt`), later attempts (`record_attempt`), success commit per provider | run |
+| 2 | `check` → Phase B quota collection | quota caches only (not scheduler state) | run + quota |
+| 3 | `check` → Phase C `scheduler-decide-all` | last_known_reset, next_due, anchor, candidate, fallback seed | run + quota |
 | 4 | `run` → initial `run_retry_burst` | as #1 | run |
-| 5 | `run` → post-run sync (`last_window` + sync) | last_window + as #3 | run + quota (quota busy → sync skipped, fallback stands) |
+| 5 | `run` → post-run sync (`scheduler-last-window` + `scheduler-sync`) | last_window + as #3 | run + quota (quota busy → sync skipped, fallback stands) |
 | 6 | `usage` → opportunistic sync after collection | as #3 | quota (collect) → **released** → run (non-blocking; busy → skip) |
-| 7 | bootstrap `migrate_legacy_state` (main, state-touching commands only) | seeds absent per-provider files from legacy single-provider files | none — via `seed_provider_state_file` (temp + `link(2)` EEXIST publish): creation is atomic and non-destructive, so a cold-start migration racing a live writer can only skip, never clobber; legacy sources are never consumed |
+| 7 | `cutover` → `scheduler-ensure-authority` | the authority manifest, after refreshing every document | run |
+| 8 | bootstrap `migrate_legacy_state` (state-touching commands only) | seeds absent per-provider legacy files | none — `seed_provider_state_file` publishes by `link(2)` EEXIST, so creation is atomic and non-destructive; skipped entirely once JSON is authoritative |
 
-Reads (`read_provider_*`) are pure: no lazy migration, no repair writes. The
-legacy upgrade runs once at command entry (#7).
+Reads are pure: no lazy migration, no repair writes. `/usage` never runs a
+model and never touches `last_task`/`last_window`; its opportunistic deadline
+sync runs only when the scheduler is idle.
 
-> Note (Phase 2): shadow JSON document creation (`python3 -m
-> quota_sentinel migrate`) is deliberately NOT in this registry — it does
-> not write authoritative state. It needs no lock because it is
-> seed-if-absent only: it can create a missing shadow document and can
-> never overwrite any document, authoritative or otherwise. If/when JSON
-> becomes authoritative, its writer paths join this table.
+## Python scheduler (Phase 3C)
 
-## Python state store (strangler Phase 1)
+```text
+quota_sentinel/scheduler/policy.py        pure transitions, no I/O
+quota_sentinel/scheduler/models.py        Decision, SyncAction, QuotaObservation,
+                                          Transition, RunOutcome
+quota_sentinel/scheduler/observation.py   one normalised quota probe -> evidence
+quota_sentinel/scheduler/service.py       the ONLY place policy meets a store
+quota_sentinel/scheduler/cli.py           the bridge the shell calls
+```
 
-`quota_sentinel.state` provides the first Python-side view of scheduler
-state:
+`policy` is `new_state = f(old_state, inputs, now)`. It performs no network
+call, runs no model, takes no lock, touches no filesystem and never mutates a
+second provider. It is a transcription of the shell policy that preceded it —
+constants, branch order and tie-breaking are unchanged, and the zsh suites
+remain the black-box compatibility proof.
 
-* `ProviderState` models the eight slots structurally (transient
-  `reset_candidate` as an explicit `None`-able value); models know no file
-  names and do not re-validate what the persistence boundary checks.
-* `FileStateStore` reads and writes exactly the shell's per-provider file
-  layout. `load()` is pure — a missing, unparsable, or corrupt-encoding
-  slot reads as `None`, unsets only itself, and is never repaired.
-* `commit(old → new)` is plan-then-execute: the stale check, the provider
-  name validation, the legality of every requested change (only
-  `reset_candidate`/`reset_anchor` may be cleared) and the SERIALIZATION
-  of every value to its final UTF-8 bytes complete BEFORE the first
-  filesystem mutation. An invalid transition leaves the disk
-  byte-for-byte untouched — the publish stage can fail only on
-  filesystem errors, never on business values. Values are validated
-  explicitly (no `assert` on persistence paths — `python -O` must not
-  weaken them) and `bool` is rejected wherever an epoch int is required.
-* The store owns the persistence-directory invariant on its WRITE path
-  only: `commit` creates/normalizes `state_dir` to mode 0700 before its
-  first publish and writes files 0600; `load` never creates anything and
-  a no-op commit publishes/creates nothing.
-* **The `old_state` stale check is defensive misuse detection only.** It
-  is NOT a compare-and-swap and NOT cross-process serialization: a
-  writer that mutates disk after the check but before the publishes will
-  be silently overwritten (`test_stale_check_is_defensive_not_cas` pins
-  this). **Every future production StateStore writer must execute inside
-  the existing `run.lock` serialization boundary.** No such writer is
-  wired today, which is why none is listed in the write-path registry.
-* The canonical publish order mirrors `commit_provider_success` with
-  `next_due_at` last, so crash prefixes of the SUCCESS transition stay
-  at-least-once directional — and that is currently all the order is
-  proven for. Other scheduler transitions (generation init, far-reset
-  promotion, retry-debt creation/repayment, candidate lifecycle) must be
-  individually reviewed and crash-tested before being moved behind
-  `commit()`; the global slot order must not be assumed to cover them.
-* Only ONE shell path is wired through it today: the `status` next-due
-  display (`status_next_due`), a read with the shell getter as automatic
-  fallback. Scheduler policy, quota logic and **every state write** still
-  run in the shell unchanged.
-* Shell↔store agreement holds for every value project writers produce.
-  Two pathological-content divergences (multi-colon `reset_candidate`
-  where the shell slices first:last, and zero-padded epochs where the
-  shell echoes raw bytes) are deliberate strictness/canonicalization
-  decisions, enumerated case by case in
-  `tests/state-store-parity-regression.zsh` (SP4) and the store's Python
-  suite; the parity wording is intentionally not "100% slot-for-slot on
-  arbitrary bytes".
-* `task_orchestrator.ScheduleState` is deliberately NOT unified onto the
-  store yet: it owns cross-provider aggregation (min due, exclude
-  pending, snapshot, roster) and its epoch parser is looser than the
-  shell's (`int()` accepts `+5`, `5_0`, padded digits). The contract the
-  future unification must preserve is pinned by
-  `ScheduleStateContractSpecTests`; wiring changes wait for their own
-  phase.
+Branch order is load-bearing and pinned by tests:
 
-## JSON document backend (Phase 2 — shadow representation)
+1. **matured debt protection** — a deadline that has matured is a committed
+   obligation; a fresh probe arriving at due time may not re-anchor the window
+   forward (live regression 2026-08-30: 18:11:35 → 23:15:38);
+2. **fresh calibration** — otherwise a Fresh observation may move the deadline
+   earlier or later, but only before the scheduled reset;
+3. **no-quota fallback** — with still no usable deadline, seed
+   `last_task + RUN_INTERVAL` and persist it.
 
-`quota_sentinel.state.schema` + `json_store` + `migration` add a second
-durable representation: one `<provider>-state.json` per provider.
+Deadline calibration itself: establish the generation anchor from the first
+Fresh reset, accept near-window movement inside the anchor tolerance while
+never moving the anchor, and require two stable far observations before
+promotion. The anchor is what closes the cumulative-near-movement loophole: a
+sequence of individually-small movements cannot walk the deadline forward.
 
-**Ownership during Phase 2 (explicit):** the shell's per-slot files remain
-the AUTHORITATIVE runtime state — every scheduler write, read and decision
-uses them. JSON documents are SHADOW snapshots created only by the
-explicit bootstrap `python3 -m quota_sentinel migrate` (library:
-`migration.migrate_all`). They are NOT re-synced when the shell writes
-after seeding: a shadow document freezes the legacy state at migration
-time (later drift is expected and harmless because nothing authoritative
-reads the shadow yet). Declaring JSON authoritative requires moving
-writer ownership — a later phase, registered in the write-path table at
-that moment. `status` still reads slot files via `FileStateStore`.
+Transitions exist as first-class values, each individually proven:
+`begin_attempt`, `record_attempt`, `commit_success`, `record_last_window`,
+`sync_deadline` (7 branches), `evaluate_due`, `retry_blocked`.
 
-Schema v1 (`schema.py`):
+`Transition.publish` names slots a transition must MATERIALIZE even when the
+value is unchanged. The success commit uses it for `retry_pending=0`: the
+pre-migration shell always left an explicit "no debt" file behind, and
+"absent" and "0" being equal to every reader does not make changing the
+on-disk contract acceptable.
 
-* flat document, `schema_version: 1` plus all eight slot keys ALWAYS
-  materialized;
-* explicit `null` = business unset; **missing key = corruption**;
-  **unknown key = corruption**; unsupported/absent version = refusal,
-  never guessing;
-* strict types matching the persistence boundary: plain non-negative ints
-  (bool excluded), plain bool `retry_pending`, single-line non-empty
-  window string or null, `reset_candidate` null or exactly
-  `{reset_at, observed_at}`;
-* deterministic bytes (sorted keys, fixed layout, strict UTF-8) so
-  serialize is reproducible and unrepresentable text fails pre-filesystem.
+`Transition.writes` (changed OR forced) is what decides whether the backend is
+touched at all, so a no-op branch — Stale quota, reset-buffer blocking, an
+unpaid debt — is provably non-writing rather than accidentally writing
+identical bytes.
 
-`JsonStateStore`:
+### Shell ↔ Python boundary
 
-* `load` pure and LOUD: absent document → `MissingStateDocumentError`
-  (absence is bootstrap state, never defaulted); corrupt bytes/JSON →
-  `DocumentCorruptError`; schema violation → `SchemaError`. A whole
-  authoritative document is never silently read as all-unset, and nothing
-  is auto-repaired;
-* `commit` = whole-document transaction: defensive stale check (NOT a
-  CAS — same rule as the file store: production writers must run inside
-  `run.lock`), full validation + final-bytes serialization before the
-  first filesystem mutation (the stale check reads; reads are pure),
-  then ONE temp/fsync/atomic-replace publish.
-  Business-value failure ⇒ old document byte-identical; crash or
-  filesystem failure ⇒ readers see old-complete or new-complete, never
-  half JSON. That single-unit atomicity is precisely what the per-slot
-  file backend could not offer;
-* write-side directory ownership identical (0700 dir, 0600 doc, created
-  only on write paths);
-* `commit` never creates a document: creation belongs to migration.
+The shell calls the domain through `scheduler_bridge`
+(`python3 -S -m quota_sentinel --state-dir …`), on the system interpreter
+because the bridge's import graph is stdlib-only (pinned by
+`tests/uv-project-regression.py`). `-S` skips site processing; nothing on this
+path needs it.
 
-Migration (`migration.py`): reads legacy strictly through
-`FileStateStore` (no second parser; unset-on-garbage semantics carry
-over, nothing "repaired"); publishes via seed-if-absent
-(`os.link`/EEXIST — mirrors the shell's `seed_provider_state_file`), so
-JSON that exists always wins and a race can only skip. Reruns are
-no-ops. Legacy slot files are never moved/deleted: rollback = stop
-reading JSON. `DEFAULT_PROVIDERS` must equal the shell's `PROVIDERS`
-roster — asserted against the real array by the parity suite (SP5).
+Decisions are batched per phase — one interpreter start per roster phase, not
+one per provider — because the precision timer walks this path every minute.
+Batching shares the PROCESS; it never shares a transaction: each provider
+still gets its own transition and its own commit.
 
-Crash-proof scope is unchanged by this phase: the at-least-once
-crash-prefix proof covers the success transition; and while whole-document
-atomicity removes multi-slot partial-commit risk for FUTURE migrated
-transitions, each transition still needs individual review and behavior
-tests before its writer moves behind `commit()`.
+The bridge prints machine records, not prose:
 
-Later phases (scheduler decisions, quota adapters) grow out of these
-seams one boundary at a time — see the migration order in the project
-log, never a big-bang rewrite.
+```text
+provider=<name>                          the records that follow belong to it
+change<TAB>p<TAB>slot<TAB>old<TAB>new    one durable slot changed
+log=info|warn<TAB>text                   what to log, at which level
+end=<name>                               the provider's records are complete
+```
 
-## Cutover preparation (Phase 3A)
+The Python side emits explicit change records precisely so the run log keeps
+the shape it had when the shell diffed values itself. Verbs whose shell
+predecessors logged nothing but the value diff emit no `log=` record.
 
-`quota_sentinel.state.cutover.prepare_provider_cutover` refreshes a
-provider's shadow JSON from the CURRENT authoritative legacy state and
-verifies semantic equality. It is preparation for a future cutover, not
-the cutover itself.
+Exit codes are part of the contract, because the shell decides with `if` and
+`case`:
 
-Source of truth is absolute: the legacy slot files as read at call time.
-A pre-existing shadow document — stale, all-null or corrupt — is
-replaced, never trusted, never timestamp-compared and never "resolved"
-against legacy (there is deliberately no conflict-resolution algorithm).
-This is the exact opposite of Phase 2 `migrate_provider`
-(seed-if-absent, existing JSON wins) and the two operations must not be
-conflated:
+```text
+scheduler-decide      0 due | 1 wait | 2 unpaid debt (skipped) | 4 error
+scheduler-sync        0 applied | 1 no valid quota | 2 blocked | 3 deferred
+scheduler-valid-reset 0 found | 1 none
+```
 
-| | migrate (Phase 2) | prepare (Phase 3A) |
-|---|---|---|
-| existing JSON | always wins, skip | replaced if semantically different |
-| corrupt JSON | blocks seeding | rebuilt from legacy |
-| purpose | freeze a shadow snapshot | make the shadow current |
-| requires run.lock context | no (skip-only) | YES (precondition, see below) |
+Policy constants (run interval, reset buffer, tolerances, retry limits and
+backoff) have exactly ONE owner: `scheduler-config` prints them and the shell
+assigns them at start-up, validating them there. A shell literal would be a
+second source of truth for the scheduler's behavior.
 
-Contract:
+## Quota adapters
 
-* PRECONDITION: the caller already holds `run.lock` (serialization
-  against authoritative writers). The primitive does not and must not
-  verify or fake it: a lock file existing does not imply the caller owns it.
-  Mechanical proof comes with Phase 3B wiring, where the caller is
-  the lock holder.
-* Validation pipeline (single rule source, no drift), one contiguous
-  contract phrase: validate_state -> state_to_document -> validate_document -> deterministic UTF-8 bytes — the whole preflight completes before the first filesystem mutation. (Pure READS of legacy and shadow happen earlier, by design; "before any filesystem operation" would be false.)
-* POSTCONDITION on success: legacy slot files byte-identical; the
-  document decodes (through the ordinary loud loader) to EXACTLY the
-  legacy ProviderState; idempotent re-runs write nothing.
-* Failure contract — the safety invariant is "legacy stays untouched
-  and authoritative", NOT "the shadow keeps its old value". Branch by
-  whether the publish itself succeeded:
-  1. in every failure, legacy remains untouched and authoritative;
-  2. in every failure, the shadow never becomes authoritative;
-  3. failure before the successful publish (domain/schema/serialization,
-     or a filesystem failure inside the atomic replace): the shadow
-     remains old-complete or absent;
-  4. failure AFTER a successful publish (verification mismatch): the
-     shadow may hold the newly-published complete document — that is
-     not an ownership change and needs no rollback (do NOT add shadow
-     rollback to satisfy older wording);
-  5. no failure may ever leave torn JSON;
-  6. rollback of authoritative ownership is unnecessary, because
-     ownership never changed from legacy.
+`quota_sentinel/quota/` owns the provider roster, the fallback ladder, the
+per-provider capability differences, and the normalisation of a probe into the
+one document shape the scheduler and the cards read.
 
-Phase 3A PREPARED is NOT JSON AUTHORITATIVE. Ownership after a
-successful prepare is exactly ownership before it: legacy files
-authoritative, JSON a semantically-current shadow. No scheduler
-transition executes here; the at-least-once semantics of the shell are
-untouched. Phase 3A only prepares a semantically current JSON document;
-it does not alter scheduler execution semantics.
+The ladder is data, not control flow:
 
-Authoritative JSON load-failure policy (binding on Phase 3B, when
-production reads may start hitting JSON errors): the three typed
-failures — MissingStateDocumentError, DocumentCorruptError, SchemaError —
-must FAIL CLOSED on state mutation: never default an unreadable document
-to ProviderState(), never mark work completed, never advance a deadline,
-never drop a retry debt or pending candidate; surface loudly and keep
-the existing durable state intact. Silent defaults are the one failure
-mode that directly violates at-least-once. Recovery mechanics (who
-rebuilds from what, how operators intervene) are Phase 3B design work;
-the prohibition is absolute now.
+```text
+native ──▶ codexbar-live ──▶ codexbar-cache ──▶ pi-snapshot
+```
 
-Durability scope, stated precisely: Atomic-visibility guarantees cover process crash and concurrent readers (temp + fsync + atomic rename — readers always see old-complete or new-complete). Power-loss durability (post-rename persistence after a hard reboot: parent-directory fsync, macOS F_FULLFSYNC) is NOT claimed and NOT implemented. Making JSON
-authoritative does not by itself change this envelope — today's slot
-files have exactly the same property — but if a future design requires
-power-loss durability, it needs evidence and its own design review
-first, not an opportunistic fsync pile-on.
+Freshness is a property of the tier, not of a caller's memory: only the two
+live tiers are Fresh, and only a Fresh observation can move a deadline.
+OpenCode's monthly window is `monthly_display_only=True` on its adapter, and
+the scheduler's observation reader cannot even see it — a stronger guarantee
+than a comment telling callers not to look.
 
-Phase 3B ownership-switch design questions (must be answered BEFORE any
-reader/writer flips; no production switch was implemented in 3A):
+Vendor probes still execute in the shell, under the shared process-group
+timeout helper, because that is where the kill-group and orphan-reaping
+semantics are already proven. Adding a fourth provider should mean: an
+adapter, a roster entry, and tests — not a new arm in a dozen
+`case "$provider"` statements.
 
-1. Which durable fact expresses "JSON is authoritative"? Candidate
-   designs must be argued, not assumed — adding a new state file
-   (backend-owner / cutover-complete flag) is disallowed without
-   justifying against double-truth risk, atomicity, recovery, and
-   versioning. An alternative with no new state: keep legacy slot files
-   as the marker itself (their presence/absence or content IS the
-   signal) — to be evaluated.
-2. How are reader and writer prevented from disagreeing mid-switch
-   (reader=JSON/writer=legacy or the reverse)? Likely answer: both
-   flips happen inside one run.lock-held critical section, derived per
-   invocation from durable facts, never cached across processes.
-3. Switch order: refresh-and-verify (this phase's prepare) must be
-   proven current INSIDE the same locked section that flips the writer.
-4. Crash after any partial point of the switch: recovery must be
-   mechanically derivable from durable state alone (idempotent prepare +
-   legacy-readable-until-final-step).
-5. Rollback path: while legacy files remain present, byte-complete and
-   still-written, rollback = flip derivation back; this is why 3B must
-   NOT delete or freeze-consume legacy files.
-6. When do legacy files stop being authoritative (final writer flip)?
-7. When — if ever — may legacy files be deleted? (Answer is very likely
-   "not in Phase 3B"; removal needs its own reviewed step.)
+## Notification boundary
+
+The shell renders and delivers Feishu cards; the *decision* to notify is a
+consequence of scheduler transitions. `/usage` semantics are fixed and must
+not drift:
+
+```text
+/usage = quota fetch + card response, never a model run
+fresh quota + idle scheduler -> opportunistic deadline refresh
+run.lock busy                -> skip the scheduler sync, still send the card
+```
+
+The busy reply never leaks lock names, PIDs or timeout internals. Card fields,
+provider order, quota source labels, recipient filtering and deduplication are
+observable behavior and are pinned by the Feishu suites.
 
 ## Python runtime / dependency ownership (Phase 3A.5)
 
@@ -367,7 +377,11 @@ Interpreter strategy — three deliberate classes, not one uniform rule:
 |---|---|---|---|
 | A. project | `uv run --frozen --no-sync` | `feishu_listener.py` (+ in-process `task_orchestrator`), `quota-sentinel` console script / `python -m quota_sentinel`, Python test suites | the only third-party dependency (`lark-oapi`) lives here; daemon must never resolve/sync/network at start |
 | B. isolated | `uv run --offline --no-project --no-config python -B …` | `antigravity_usage.py` | deliberate supply-chain boundary: must stay outside the project even now that a root pyproject exists — `--no-project` is load-bearing and pinned by tests/antigravity-native-regression.py |
-| C. system | `/usr/bin/python3` (`PYTHON3_BIN`, retained) | `run_with_timeout.py`, `opencode_usage.py`, native-probe python check, `python -m quota_sentinel` status seam | stdlib-only, invoked on shell/scheduler hot paths; must not gain uv startup latency, cache, or environment coupling; the >=3.9 floor keeps class C and the uv project env behaviorally identical for this code |
+| C. system | `/usr/bin/python3` (`PYTHON3_BIN`, retained) | `run_with_timeout.py`, `opencode_usage.py`, native-probe python check, the scheduler bridge, the `status` next-due seam | stdlib-only, invoked on shell/scheduler hot paths; must not gain uv startup latency, cache, or environment coupling; the >=3.9 floor keeps class C and the uv project env behaviorally identical for this code |
+
+The scheduler bridge belongs in class C by the same argument that created the
+class: the precision timer tick must not pay a project start-up, and a
+decision must keep working while the project environment is being rebuilt.
 
 LaunchAgent lifecycle: setup phase (`install-launchagents.sh`) verifies uv
 and runs `uv sync --locked` — the ONLY network-capable step; the agent
@@ -378,10 +392,6 @@ would not discover the repo; `--frozen` forbids lock re-resolution,
 fails loudly at daemon start (err log) instead of self-healing — by design.
 Cache: production uses the default user cache; `UV_CACHE_DIR` overrides are
 test/sandbox-local only.
-
-`quota-sentinel.sh` diff-zero for logic: the only allowed shell changes from
-this phase onward are thin runtime call-throughs; none was needed (class C
-stays system Python by choice, see table).
 
 Registry / index policy (Phase 3A.5 residual): the committed `uv.lock` is
 resolved exclusively from public PyPI (`pypi.org` /
@@ -413,19 +423,58 @@ re-run `./install-launchagents.sh` (which does `uv sync --locked`);
 runtime failing on a broken env is the designed fail-loud behavior, not a
 bug to self-heal around.
 
-## Shell freeze
+## Shell end state
 
-`quota-sentinel.sh` is in functional freeze: bug fixes, compatibility fixes,
-provider-specific model-runner adjustments, and thin call-through layers to new
-Python adapters are allowed. New long-lived subsystems, new scheduler state
-files, large new quota-parsing blocks, per-provider copies of the quota
-pipeline, and new scheduler policy branches are not.
+`quota-sentinel.sh` keeps exactly four responsibilities:
+
+1. **CLI compatibility layer** — `check|wait|run|usage|cutover|status|…`
+   argument handling and the legacy verb surface.
+2. **Model runner adapter** — provider CLI invocation, `auth.json`/settings
+   handling, provider environment, process groups, timeouts, and the retry
+   burst's process management. Python decides *whether* to run and *what the
+   outcome means*; the shell decides *how* to run it.
+3. **Quota tier execution** — invoking the vendor probes under the shared
+   timeout helper.
+4. **System glue** — locks, temp dirs, launchd bootstrap, install.
+
+It no longer contains: scheduler policy, state transition policy, deadline
+algorithms, retry policy values, authoritative state persistence, or quota
+normalisation policy.
+
+The model runner staying in shell is a deliberate boundary, not a to-do. Its
+interface is explicit: the scheduler asks for one attempt per provider and
+receives an exit status; the Python side never reads a shell global to make a
+decision.
+
+Shell freeze (still in force): bug fixes, compatibility fixes,
+provider-specific model-runner adjustments, and thin call-through layers to
+Python are allowed. New long-lived subsystems, new scheduler state files,
+large new quota-parsing blocks, per-provider copies of the quota pipeline, and
+new scheduler policy branches are not.
+
+## Migration and rollback
+
+Upgrading an existing deployment:
+
+```text
+1. install the new version; the installer boots the old agent out first, so
+   no process that still believes in the legacy backend can be alive
+2. run `quota-sentinel.sh cutover` — under run.lock, verified, atomic
+3. legacy slot files remain on disk, untouched, as the rollback artifact
+```
+
+An automatic cleanup of legacy files is deliberately NOT provided: deleting a
+user's state is their decision, and the files are harmless once retired.
 
 ## Testing doctrine
 
-The `.zsh` regression suites are the behavioral contract for the scheduling
-layer; keep them passing as black-box tests when moving logic between layers
-(strangler migrations preserve the entry-point API and its observable
-contract). The Feishu card layout, log wording, and internal call order are
-*not* part of the contract; tests assert on return codes, state-file
-transitions, and dispatched message content only.
+* The zsh suites are the BLACK-BOX compatibility contract for behavior the
+  user sees: CLI parity, scheduler decisions, retry semantics, `/usage`,
+  cards. Migrating logic into Python does not retire them — a new Python suite
+  is an *additional* white-box proof.
+* Python suites are the white-box proof for transitions, the authority
+  protocol, the schema and the store contracts.
+* A test may only be changed when the CONTRACT changed, and the change must be
+  explained. Timeouts and thresholds are not relaxed to reach green.
+* Persistence and scheduler suites run under `python -O` too: no security or
+  correctness property may depend on `assert`.
