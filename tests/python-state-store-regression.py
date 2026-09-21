@@ -462,9 +462,13 @@ class PlanBeforePersistenceTests(unittest.TestCase):
         )
 
     def test_r2_unencodable_value_fails_before_first_filesystem_touch(self) -> None:
-        # Plan-stage proof: wrap every primitive that could touch the fs;
-        # any call while building the plan for an unencodable value is a
-        # contract violation.
+        # Plan-stage proof: the two primitives the publish stage uses to
+        # create/replace slot files (os.open, os.replace) are spied; any
+        # call through them while committing an unencodable value is a
+        # contract violation. (Slot DELETIONS go through unlink and are
+        # out of scope for this spy — no deletion is planned in this
+        # transition, and R1's whole-directory signature already covers
+        # debris from any primitive.)
         old = self._seed_full_valid()
         new = ProviderState(
             last_attempt_at=999,
@@ -479,8 +483,6 @@ class PlanBeforePersistenceTests(unittest.TestCase):
         fs_touches = []
         real_open = os.open
         real_replace = os.replace
-        real_unlink = os.unlink
-        real_mkdir = os.mkdir
 
         def spy_open(*args, **kwargs):
             fs_touches.append(("open", args[0]))
@@ -523,8 +525,13 @@ class PlanBeforePersistenceTests(unittest.TestCase):
         self.assertEqual(disk_signature(self.state_dir), before)
 
     def test_t4_validation_survives_python_O(self) -> None:
-        # Run the same invalid commits under `python3 -O`, where any
-        # assert-based validation would have evaporated. Must still raise.
+        # Run invalid commits under `python3 -O`, where any assert-based
+        # validation would have evaporated. Must still raise AND mutate
+        # nothing — including the mixed case whose FIRST slot change is
+        # valid while a LATER slot is unencodable (the pre-encode leak:
+        # under str-plan builds that would put attempt=999 on disk before
+        # failing). The child snapshots the dir around the whole sequence
+        # and fails if any byte moved.
         script = (
             "import sys, tempfile, os\n"
             "sys.path.insert(0, %r)\n"
@@ -540,16 +547,23 @@ class PlanBeforePersistenceTests(unittest.TestCase):
             "       old.__class__(**{**old.__dict__, 'last_task_at': 3.5}),\n"
             "       old.__class__(**{**old.__dict__, 'reset_candidate': ResetCandidate(True, 1)}),\n"
             "       old.__class__(**{**old.__dict__, 'retry_pending': 1}),\n"
-            # R3: lone surrogate — valid str, unencodable to UTF-8. Built
-            # inside the subprocess so no shell quoting games; must still
-            # be refused under -O, pre-mutation, as StateStoreError.
-            "       old.__class__(**{**old.__dict__, 'last_triggered_window': \"\\ud800\"})]\n"
+            "       old.__class__(**{**old.__dict__, 'last_triggered_window': \"\\ud800\"}),\n"
+            # Mixed: VALID earlier change (attempt) + unencodable later
+            # (window) — the exact late-failure leak shape.
+            "       old.__class__(**{**old.__dict__, 'last_attempt_at': 999, "
+            "'last_triggered_window': \"\\ud800\"})]\n"
+            "def snapshot():\n"
+            "    return sorted((name, open(os.path.join(d, name), 'rb').read())\n"
+            "                  for name in os.listdir(d))\n"
+            "before = snapshot()\n"
             "for candidate in bad:\n"
             "    try:\n"
             "        s.commit('codex', old, candidate)\n"
             "    except StateStoreError:\n"
             "        continue\n"
             "    sys.exit('ACCEPTED under -O: ' + repr(candidate))\n"
+            "if snapshot() != before:\n"
+            "    sys.exit('MUTATED under -O')\n"
             "print('OK')\n"
             % str(Path(__file__).resolve().parent.parent)
         )
@@ -701,8 +715,8 @@ class StaleCheckScopeTests(unittest.TestCase):
 
 
 class MalformedValueParityTests(unittest.TestCase):
-    """§11: every shell-vs-store behavior on malformed content is a
-    REGISTERED decision. Cases marked DIVERGENCE are deliberate strictness
+    """§11: every shell-vs-store behavior on non-canonical (pathological) content is a
+    REGISTERED decision (007 is not itself illegal — it is merely non-canonical). Cases marked DIVERGENCE are deliberate strictness
     against content no project writer produces; the shell column records
     what the shell getter does (cross-checked by the zsh parity suite).
 

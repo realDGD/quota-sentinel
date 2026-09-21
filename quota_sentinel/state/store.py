@@ -348,8 +348,15 @@ class FileStateStore(ProviderStateStore):
             try:
                 if mutation.operation == "delete":
                     mutation.path.unlink(missing_ok=True)
+                elif mutation.payload is not None:
+                    # Plan invariant: writes carry their final encoded
+                    # bytes; nothing here can fail on business values.
+                    _publish_atomic(mutation.path, mutation.payload)
                 else:
-                    _publish_atomic(mutation.path, mutation.payload or b"")
+                    raise StateStoreError(
+                        f"{provider}: internal plan invariant violated: "
+                        f"write mutation for {mutation.attribute} has no payload"
+                    )
             except OSError as exc:
                 raise StateStoreError(
                     f"{provider}: failed to {mutation.operation} slot "

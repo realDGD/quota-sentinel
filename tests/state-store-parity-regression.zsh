@@ -5,7 +5,7 @@
 # produce, quota_sentinel.state must read the shell's per-provider state
 # files with the same semantics as the shell's own getters — same values,
 # same unset rules, same transient reset_candidate compound — and must be
-# strictly read-only. Known malformed-input divergences (zero-padded
+# strictly read-only. Known non-canonical-input divergences (zero-padded
 # epochs, multi-colon candidates) are explicitly registered in SP4, so
 # they remain decisions rather than discoveries. status() already routes
 # its next-due display through the store (with the shell getter as
@@ -136,7 +136,7 @@ sp3_expect="$(print -r -- "next codex run: $(format_reset_time $(( base_now + 10
 print -r -- "$sp3_out" | grep -Fqx "$sp3_expect"
 print -r -- "SP3 (status via store matches shell formatting exactly): passed"
 
-# ---- SP4: malformed-value registry (Phase 1.1) --------------------------------
+# ---- SP4: non-canonical-value registry (pathological content no writer emits) --------------------------------
 # Every pathological file content gets BOTH sides' verdict asserted
 # explicitly. "SAME" cases prove agreement; DIVERGENCE cases are deliberate
 # strictness decisions for content no project writer can produce — they are
@@ -188,6 +188,6 @@ printf '\377\376\n' >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
 [[ "$(read_provider_reset_candidate codex 2>/dev/null || echo unset)" == "unset" ]]
 [[ "$(py_slot codex reset_candidate)" == "unset" ]]
 rm -f "$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
-print -r -- "SP4 (malformed-value registry: agreements + 2 registered divergences): passed"
+print -r -- "SP4 (non-canonical-value registry: agreements + 2 registered divergences): passed"
 
 print -r -- "state-store parity regression: all cases passed"
