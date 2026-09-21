@@ -1,4 +1,6 @@
-"""Scheduler state access: models, stores, versioned document schema."""
+"""Scheduler state access: models, stores, versioned document schema,
+the durable backend-authority protocol, and the routing seam that selects
+a backend from that authority."""
 from __future__ import annotations
 
 from .models import ProviderState, ResetCandidate
@@ -21,10 +23,35 @@ from .store import (
     StateStoreError,
 )
 from .json_store import JsonStateStore, document_filename
+from .authority import (
+    AUTHORITY_FILENAME,
+    AUTHORITY_SCHEMA_VERSION,
+    BACKEND_JSON,
+    BACKEND_LEGACY,
+    SUPPORTED_BACKENDS,
+    AuthorityCorruptError,
+    AuthorityError,
+    AuthoritySchemaError,
+    BackendAuthority,
+    ConcurrentAuthorityChangeError,
+    authority_path,
+    bootstrap_authority,
+    parse_authority,
+    read_authority,
+    read_authority_if_present,
+    serialize_authority,
+    write_authority,
+)
+from .router import AuthoritativeStateStore
 from .cutover import (
     CutoverPreparation,
+    CutoverVerificationError,
+    RollbackRefusedError,
+    BackendSwitch,
+    cutover_to_json,
     prepare_all_cutover,
     prepare_provider_cutover,
+    rollback_to_legacy,
 )
 from .migration import (
     ACTION_EXISTS,
@@ -63,4 +90,27 @@ __all__ = [
     "CutoverPreparation",
     "prepare_provider_cutover",
     "prepare_all_cutover",
+    "AUTHORITY_FILENAME",
+    "AUTHORITY_SCHEMA_VERSION",
+    "BACKEND_JSON",
+    "BACKEND_LEGACY",
+    "SUPPORTED_BACKENDS",
+    "AuthorityError",
+    "AuthorityCorruptError",
+    "AuthoritySchemaError",
+    "ConcurrentAuthorityChangeError",
+    "BackendAuthority",
+    "authority_path",
+    "bootstrap_authority",
+    "parse_authority",
+    "read_authority",
+    "read_authority_if_present",
+    "serialize_authority",
+    "write_authority",
+    "AuthoritativeStateStore",
+    "BackendSwitch",
+    "CutoverVerificationError",
+    "RollbackRefusedError",
+    "cutover_to_json",
+    "rollback_to_legacy",
 ]
