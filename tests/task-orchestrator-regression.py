@@ -138,6 +138,26 @@ class TaskOrchestratorTest(unittest.TestCase):
         self.assertEqual(len(self.runner.calls), 1)
         self.assertEqual(self.store.recent_runs(1)[0]["trigger"], "deadline")
 
+    def test_opencode_deadline_triggers_one_check(self) -> None:
+        self.write_due("codex", 800)
+        self.write_due("opencode", 500)
+        self.engine.run_startup()
+        self.runner.calls.clear()
+
+        self.clock.value = 499
+        self.assertFalse(self.engine.run_ready_once())
+        self.clock.value = 500
+        self.assertTrue(self.engine.run_ready_once())
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(self.store.recent_runs(1)[0]["trigger"], "deadline")
+
+    def test_opencode_pending_debt_is_not_a_precision_deadline(self) -> None:
+        self.write_due("opencode", 150)
+        self.write_pending("opencode", 1)
+
+        self.assertEqual(self.state.snapshot()["opencode"], 150)
+        self.assertIsNone(self.state.next_due())
+
     def test_deadline_and_watchdog_at_same_instant_coalesce(self) -> None:
         self.write_due("codex", 900)
         self.engine.run_startup()

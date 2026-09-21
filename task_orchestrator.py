@@ -43,8 +43,10 @@ EXTERNAL_STATE_RECHECK_SECONDS = 60
 LOOP_ERROR_BACKOFF_SECONDS = 60
 CHECK_COMMAND_TIMEOUT_SECONDS = float(
     # One check may first repay a two-attempt pending debt and then run the
-    # other provider's three-attempt initial burst, with two quota-collection
-    # phases. 2100s stays above that legal worst case while remaining finite.
+    # remaining providers' three-attempt initial burst, with two
+    # quota-collection phases. Providers within a round run in parallel, so
+    # three providers still cost 2x310s + 3x310s + 2x207s ≈ 1964s: 2100s stays
+    # above that legal worst case while remaining finite.
     os.environ.get("QUOTA_SENTINEL_CHECK_TIMEOUT", "2100")
 )
 
@@ -202,7 +204,7 @@ class ScheduleState:
     def __init__(
         self,
         state_dir: Path = DEFAULT_STATE_DIR,
-        providers: tuple[str, ...] = ("codex", "antigravity"),
+        providers: tuple[str, ...] = ("codex", "antigravity", "opencode"),
     ) -> None:
         self.state_dir = Path(state_dir)
         self.providers = providers

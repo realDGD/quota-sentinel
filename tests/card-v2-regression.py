@@ -337,5 +337,76 @@ class TestFeishuCardV2RefinedLayout(unittest.TestCase):
         out_bar = self.run_zsh_fn('quota_bar 77')
         self.assertEqual(out_bar, "■■■■■■■■□□")
 
+    # -------------------------------------------------------------
+    # Case 13: OpenCode Go. Three providers stack one full-width block per
+    # provider, and the display-only monthly cap is appended to that provider's
+    # block only. The original two-provider layouts must stay untouched.
+    # -------------------------------------------------------------
+    def provider_block_titles(self, card):
+        # The title+status row is the only column_set with flex_mode "none";
+        # the quota rows use "stretch" and repeat the window labels.
+        titles = []
+        for element in card["body"]["elements"]:
+            if element.get("tag") != "column_set" or element.get("flex_mode") != "none":
+                continue
+            first = element["columns"][0]["elements"][0]
+            if first.get("tag") == "markdown":
+                titles.append(first["content"])
+        return titles
+
+    def body_text(self, card):
+        return json.dumps(card["body"]["elements"], ensure_ascii=False)
+
+    def test_case_13a_three_provider_card_stacks_each_block_once(self):
+        out = self.run_zsh_fn("card_preview all")
+        card = json.loads(json.loads(out)["content"])
+        self.assertEqual(card["header"]["template"], "green")
+        self.assertEqual(
+            self.provider_block_titles(card),
+            ["**GPT-5.6 Luna**", "**Gemini 3.7 Flash · Low**", "**DeepSeek V4 Flash · Off**"],
+        )
+        body = self.body_text(card)
+        self.assertEqual(body.count("本月度"), 1, "monthly line must appear once, for OpenCode only")
+        self.assertIn("本月度　剩余 98%", body)
+
+    def test_case_13b_monthly_line_is_omitted_when_absent(self):
+        fixture = os.path.join(self.test_dir.name, "opencode-no-monthly.json")
+        with open(fixture, "w") as f:
+            json.dump({
+                "source": "Native · opencode-go /usage",
+                "fresh": True,
+                "capturedAt": 1788000000,
+                "fiveHour": {"remainingPercent": 88, "resetAt": 1788018000},
+                "weekly": {"remainingPercent": 95, "resetAt": 1788600000},
+            }, f)
+        out = self.run_zsh_fn(
+            f'OPENCODE_QUOTA_NORMALIZED_FILE="{fixture}" '
+            f'OPENCODE_RUN_RESULT="发送成功" '
+            f'build_feishu_v2_stacked_payload "user1" "uuid1" "task" opencode'
+        )
+        card = json.loads(json.loads(out)["content"])
+        self.assertEqual(card["header"]["template"], "green")
+        self.assertNotIn("本月度", self.body_text(card))
+
+    def test_case_13c_opencode_failure_turns_the_header_red(self):
+        out = self.run_zsh_fn(
+            'OPENCODE_QUOTA_NORMALIZED_FILE="" '
+            'OPENCODE_RUN_RESULT="发送失败" '
+            'build_feishu_v2_stacked_payload "user1" "uuid1" "task" opencode'
+        )
+        card = json.loads(json.loads(out)["content"])
+        self.assertEqual(card["header"]["template"], "red")
+        self.assertIn("🔴 **失败**", self.body_text(card))
+
+    def test_case_13d_two_provider_layouts_stay_exactly_two_columns(self):
+        for preview_args in ("both",):
+            out = self.run_zsh_fn(f"card_preview {preview_args}")
+            card = json.loads(json.loads(out)["content"])
+            self.assertEqual(card["body"]["elements"][0]["tag"], "column_set")
+            self.assertEqual(card["body"]["elements"][0]["flex_mode"], "stretch")
+            self.assertEqual(len(card["body"]["elements"][0]["columns"]), 2)
+            self.assertNotIn("本月度", self.body_text(card))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,8 +19,10 @@ typeset -ga LAST_ATTEMPTED=()
 typeset -gi TOTAL_RUNS=0
 typeset -g MOCK_CODEX_RESET=0
 typeset -g MOCK_ANTIGRAVITY_RESET=0
+typeset -g MOCK_OPENCODE_RESET=0
 typeset -g MOCK_CODEX_FRESH=0
 typeset -g MOCK_ANTIGRAVITY_FRESH=0
+typeset -g MOCK_OPENCODE_FRESH=0
 typeset -g CAPTURED_USAGE_MSG=""
 
 reset_scheduler_state() {
@@ -28,12 +30,16 @@ reset_scheduler_state() {
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
   LAST_ATTEMPTED=()
   TOTAL_RUNS=0
+  # Each case parks the provider it does not exercise; do the same for OpenCode
+  # so a case's assertions about "nothing else is due" keep their meaning.
+  write_provider_next_due opencode $(( $(/bin/date '+%s') + 999999 ))
 }
 
 collect_effective_quotas() {
   ensure_temp_dir
   CODEX_QUOTA_IS_FRESH="$MOCK_CODEX_FRESH"
   ANTIGRAVITY_QUOTA_IS_FRESH="$MOCK_ANTIGRAVITY_FRESH"
+  OPENCODE_QUOTA_IS_FRESH="$MOCK_OPENCODE_FRESH"
   if (( MOCK_CODEX_FRESH == 1 )); then
     print -r -- '{"source":"Native · codex app-server","fresh":true,"fiveHour":{"remainingPercent":80,"resetAt":'$MOCK_CODEX_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_CODEX_RESET + 500000 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
   else
@@ -43,6 +49,11 @@ collect_effective_quotas() {
     print -r -- '{"source":"Native · agy local service","fresh":true,"fiveHour":{"remainingPercent":95,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":90,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
   else
     print -r -- '{"source":"CodexBar · cached（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_ANTIGRAVITY_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_ANTIGRAVITY_RESET + 500000 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  fi
+  if (( MOCK_OPENCODE_FRESH == 1 )); then
+    print -r -- '{"source":"Native · opencode-go /usage","fresh":true,"fiveHour":{"remainingPercent":92,"resetAt":'$MOCK_OPENCODE_RESET'},"weekly":{"remainingPercent":81,"resetAt":'$(( MOCK_OPENCODE_RESET + 604800 ))'},"monthly":{"remainingPercent":73,"resetAt":'$(( MOCK_OPENCODE_RESET + 2500000 ))'}}' >"$OPENCODE_QUOTA_NORMALIZED_FILE"
+  else
+    print -r -- '{"source":"Pi 快照（可能不是最新）","fresh":false,"fiveHour":{"remainingPercent":50,"resetAt":'$MOCK_OPENCODE_RESET'},"weekly":{"remainingPercent":50,"resetAt":'$(( MOCK_OPENCODE_RESET + 604800 ))'}}' >"$OPENCODE_QUOTA_NORMALIZED_FILE"
   fi
 }
 
@@ -284,6 +295,22 @@ use_codexbar_cached_codex "$fixture_out"
 [[ "$(jq -r '.cached' "$fixture_out")" == "true" ]]
 [[ "$(jq -r '.capturedAt' "$fixture_out")" == "1788000000" ]]
 print -r -- "Case 12 (CodexBar cache stays stale/display-only): passed"
+
+# 13. OpenCode Go calibrates from fresh quota exactly like the other two: the
+# 5-hour reset drives the deadline, and the monthly window never participates.
+reset_scheduler_state
+MOCK_OPENCODE_FRESH=1
+MOCK_OPENCODE_RESET=$(( base_now + 2400 ))
+write_provider_next_due codex $(( base_now + 10000 ))
+write_provider_next_due antigravity $(( base_now + 10000 ))
+write_provider_last_window opencode $(( base_now + 2400 ))
+check_schedule
+collect_effective_quotas
+sync_provider_deadline_from_quota opencode "$base_now"
+[[ "$(read_provider_next_due opencode)" == "$(( MOCK_OPENCODE_RESET + RESET_BUFFER_SECONDS ))" ]]
+[[ "$(read_provider_last_known_reset opencode)" == "$MOCK_OPENCODE_RESET" ]]
+(( TOTAL_RUNS == 0 ))
+print -r -- "Case 13 (OpenCode fresh reset calibrates its own deadline): passed"
 
 cleanup
 print -r -- "dynamic schedule regression: all cases passed"

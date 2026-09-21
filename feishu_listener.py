@@ -37,10 +37,11 @@ TASK_ORCHESTRATOR: TaskOrchestrator | None = None
 
 # Outer bound for one /usage subprocess. Must stay above the shell-side
 # worst case including child kill grace: lock 20s + Native Codex ~15s +
-# CodexBar Codex 2x(20+10)s + Native agy ~21s + CodexBar agy (35+10)s
-# ≈ 161s; Feishu auth 45s + send 3x45s + retry delays ≈ 183s. The outer
-# bound includes both acquisition and delivery. No cadence changes.
-USAGE_COMMAND_TIMEOUT_SECONDS = 360
+# CodexBar Codex 2x(20+10)s + Native agy ~21s + CodexBar agy (35+10)s +
+# Native opencode ~16s + CodexBar opencode (20+10)s ≈ 207s; Feishu auth 45s
+# + send 3x45s + retry delays ≈ 183s. The outer bound includes both
+# acquisition and delivery. No cadence changes.
+USAGE_COMMAND_TIMEOUT_SECONDS = 480
 
 
 def read_keychain(service: str) -> str:

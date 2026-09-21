@@ -55,6 +55,13 @@ if [[ "$provider" == "antigravity" ]]; then
     '{capturedAt:($iso),fiveHour:{remainingPercent:90,resetAt:$reset},weekly:{remainingPercent:80,resetAt:($reset+483000)}}' \
     >"$PI_ANTIGRAVITY_QUOTA_FILE"
 fi
+if [[ "$provider" == "opencode-go" ]]; then
+  now=$(date +%s)
+  now_iso="$(/bin/date -u '+%Y-%m-%dT%H:%M:%S.000Z')"
+  "$JQ_BIN" -n --arg iso "$now_iso" --argjson reset "$((now+17000))" \
+    '{capturedAt:($iso),fiveHour:{remainingPercent:92,resetAt:$reset},weekly:{remainingPercent:81,resetAt:($reset+604800)},monthly:{remainingPercent:73,resetAt:($reset+2500000)}}' \
+    >"$PI_OPENCODE_QUOTA_FILE"
+fi
 print -r -- "1"
 exit 0
 MOCK
@@ -62,7 +69,7 @@ chmod +x "$BIN_DIR/pi"
 
 export QUOTA_SENTINEL_PI_BIN="$BIN_DIR/pi"
 export QUOTA_SENTINEL_PI_AUTH_FILE="$TEST_TEMP_DIR/auth.json"
-print -r -- '{"openai-codex":{"token":"x"},"antigravity":{"token":"x"}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
+print -r -- '{"openai-codex":{"token":"x"},"antigravity":{"token":"x"},"opencode-go":{"type":"api_key","key":"x"}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
 export PI_MOCK_CALLS_DIR="$TEST_TEMP_DIR/calls"
 
 export PI_SOURCE_ONLY=1
@@ -74,8 +81,10 @@ ensure_temp_dir
 # Hermetic quota stubs; individual cases re-point these as needed.
 fetch_native_codex_quota() { return 1; }
 fetch_native_antigravity_quota() { return 1; }
+fetch_native_opencode_quota() { return 1; }
 fetch_codexbar_codex_quota() { return 1; }
 fetch_codexbar_antigravity_quota() { return 1; }
+fetch_codexbar_opencode_quota() { return 1; }
 
 typeset -ga CAPTURED_MESSAGES=()
 send_feishu_message() {
@@ -88,10 +97,15 @@ reset_state() {
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
   rm -rf "$PI_MOCK_CALLS_DIR"
   mkdir -p "$PI_MOCK_CALLS_DIR"
+  # OpenCode is parked far in the future: this suite exercises codex and
+  # antigravity, and an unparked third provider is "due" the moment a check
+  # evaluates it.
+  write_provider_next_due opencode $(( $(/bin/date '+%s') + 999999 ))
 }
 calls() {  # provider key → mock call counter (mock files use pi provider names)
   local key="$1"
   [[ "$key" == "codex" ]] && key="openai-codex"
+  [[ "$key" == "opencode" ]] && key="opencode-go"
   cat "$PI_MOCK_CALLS_DIR/$key.count" 2>/dev/null || echo 0
 }
 assert_log_contains() {  # fixed-string match: patterns may contain '*' etc.
@@ -319,7 +333,17 @@ PI_MOCK_SUCCESS_AFTER=99 check_schedule
 [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-retry-pending")" == "1" ]]
 print -r -- "  PASS: pre-existing pending state picked up and repaid by watchdog burst"
 
-print -r -- "== RY17: error summaries are logged masked =="
+print -r -- "== RY17: OpenCode commits success and seeds its own 5h01 fallback =="
+reset_state
+PI_MOCK_SUCCESS_AFTER=1 run_and_reschedule_selected opencode
+[[ "$(calls opencode)" == "1" ]]
+oc_task="$(read_provider_last_task opencode)"
+[[ "$oc_task" =~ ^[0-9]+$ ]]
+[[ "$(read_provider_next_due opencode)" == "$(( oc_task + RUN_INTERVAL_SECONDS ))" ]]
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/opencode-retry-pending")" == "0" ]]
+print -r -- "  PASS: single attempt, success committed, fallback seeded"
+
+print -r -- "== RY18: error summaries are logged masked =="
 assert_log_contains "attempt=1 error: mock failure attempt 1: bearer***"
 if grep -q "SuperSecretTokenValue123" "$QUOTA_SENTINEL_LOG_DIR/$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d').log"; then
   print -u2 "FAIL: unmasked credential leaked into the run log"

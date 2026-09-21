@@ -13,3 +13,27 @@ logs/
 node_modules/
 dist/
 build/
+
+# AI coding-agent session artifacts
+.zcode/
+.claude/
+.cursor/
+
+# Environment and secret files
+.env
+.env.*
+.venv/
+venv/
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.bak
+*.orig
+
+# Local state and runtime data
+*.sqlite
+*.sqlite3
+*.db
+*.snapshot

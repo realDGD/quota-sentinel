@@ -68,13 +68,19 @@ if [[ "\$provider" == "antigravity" ]]; then
   print -r -- "1"
   exit 0
 fi
+if [[ "\$provider" == "opencode-go" ]]; then
+  now=\$(/bin/date +%s)
+  print -r -- '{"capturedAt":"'"$(/bin/date -u '+%Y-%m-%dT%H:%M:%S.000Z')"'","fiveHour":{"remainingPercent":92,"resetAt":'\$((now+17000))'},"weekly":{"remainingPercent":81,"resetAt":'\$((now+500000))'},"monthly":{"remainingPercent":73,"resetAt":'\$((now+2500000))'}}' >"\$PI_OPENCODE_QUOTA_FILE"
+  print -r -- "1"
+  exit 0
+fi
 exit 1
 MOCK
 chmod +x "$BIN_DIR/pi"
 
 export QUOTA_SENTINEL_PI_BIN="$BIN_DIR/pi"
 export QUOTA_SENTINEL_PI_AUTH_FILE="$TEST_TEMP_DIR/auth.json"
-print -r -- '{"openai-codex":{"token":"x"},"antigravity":{"token":"x"}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
+print -r -- '{"openai-codex":{"token":"x"},"antigravity":{"token":"x"},"opencode-go":{"type":"api_key","key":"x"}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
 export QUOTA_SENTINEL_CODEXBAR_BIN="$BIN_DIR/codexbar"
 
 export PI_SOURCE_ONLY=1
@@ -84,9 +90,13 @@ trap cleanup EXIT
 ensure_temp_dir
 
 # Native probes are stubbed out: they are covered by their own timeout logic
-# and must stay hermetic here.
+# and must stay hermetic here. The OpenCode CodexBar tier is stubbed too: the
+# mock codexbar binary only speaks the codex payload, and its "hang" mode would
+# otherwise add a second timeout wait to this suite.
 fetch_native_codex_quota() { return 1; }
 fetch_native_antigravity_quota() { return 1; }
+fetch_native_opencode_quota() { return 1; }
+fetch_codexbar_opencode_quota() { return 1; }
 
 typeset -ga CAPTURED_MESSAGES=()
 send_feishu_message() {

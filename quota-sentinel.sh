@@ -21,18 +21,26 @@ readonly SCRIPT_NAME="${0:t}"
 readonly CODEX_QUOTA_EXTENSION="$SCRIPT_DIR/capture-codex-quota.ts"
 readonly ANTIGRAVITY_QUOTA_EXTENSION="$SCRIPT_DIR/capture-antigravity-quota.ts"
 readonly ANTIGRAVITY_PROVIDER_EXTENSION="/Users/__USER__/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts"
+readonly OPENCODE_QUOTA_EXTENSION="$SCRIPT_DIR/capture-opencode-quota.ts"
+readonly OPENCODE_USAGE_HELPER="${QUOTA_SENTINEL_OPENCODE_USAGE_HELPER:-$SCRIPT_DIR/opencode_usage.py}"
 readonly KEYCHAIN_ACCOUNT="quota-sentinel"
 readonly FEISHU_API_BASE="https://open.feishu.cn/open-apis"
 readonly FEISHU_APP_ID_SERVICE="com.example.quota-sentinel.feishu-app-id"
 readonly FEISHU_APP_SECRET_SERVICE="com.example.quota-sentinel.feishu-app-secret"
 readonly FEISHU_USER_ID_SERVICE="com.example.quota-sentinel.feishu-user-id"
+readonly OPENCODE_API_KEY_SERVICE="com.example.quota-sentinel.opencode-go-api-key"
 readonly STATE_DIR="${QUOTA_SENTINEL_STATE_DIR:-/Users/__USER__/Library/Application Support/quota-sentinel}"
 readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"
 readonly QUOTA_LOCK_FILE="$STATE_DIR/quota.lock"
 readonly CODEXBAR_CODEX_CACHE_FILE="$STATE_DIR/codexbar-codex-last-success.json"
 readonly CODEXBAR_ANTIGRAVITY_CACHE_FILE="$STATE_DIR/codexbar-antigravity-last-success.json"
+readonly CODEXBAR_OPENCODE_CACHE_FILE="$STATE_DIR/codexbar-opencode-last-success.json"
 readonly PI_CODEX_SNAPSHOT_FILE="$STATE_DIR/pi-codex-quota.json"
 readonly PI_ANTIGRAVITY_SNAPSHOT_FILE="$STATE_DIR/pi-antigravity-quota.json"
+readonly PI_OPENCODE_SNAPSHOT_FILE="$STATE_DIR/pi-opencode-quota.json"
+# The single source of truth for provider enumeration: scheduler loops, run
+# defaults and requirement validation all derive from this list.
+readonly PROVIDERS=(codex antigravity opencode)
 readonly RUN_INTERVAL_SECONDS=18060              # 5 hours 01 minute
 readonly RESET_BUFFER_SECONDS=240                # 4 minutes after reset
 readonly RESET_NEAR_MOVEMENT_SECONDS=300         # immediate same-window jitter
@@ -44,14 +52,17 @@ readonly TIMER_RECHECK_SECONDS=60
 # Hard execution bounds: a hung model task or quota probe must never hold the
 # run/quota locks forever. Include kill grace when budgeting /usage: lock 20s
 # + Native Codex ~15s + CodexBar Codex 2×(20+10)s + Native agy ~21s
-# + CodexBar agy (35+10)s ≈ 161s, before Feishu delivery. The listener's
-# outer timeout is 360s, including Feishu auth/send retries (up to ~183s).
+# + CodexBar agy (35+10)s + Native opencode ~16s + CodexBar opencode (20+10)s
+# ≈ 207s, before Feishu delivery. The listener's outer timeout is 480s,
+# including Feishu auth/send retries (up to ~183s).
 # Provider-specific query bounds do not change cadence.
 readonly MODEL_TASK_TIMEOUT_SECONDS="${QUOTA_SENTINEL_MODEL_TIMEOUT:-300}"
 readonly MODEL_TASK_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_MODEL_KILL_GRACE:-10}"
 readonly CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_CODEXBAR_TIMEOUT:-20}"
 readonly ANTIGRAVITY_CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT:-35}"
 readonly ANTIGRAVITY_NATIVE_TIMEOUT_SECONDS="${QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT:-20}"
+readonly OPENCODE_CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT:-20}"
+readonly OPENCODE_NATIVE_TIMEOUT_SECONDS="${QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT:-15}"
 readonly CODEXBAR_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_CODEXBAR_KILL_GRACE:-10}"
 # Retry policy: a model task only counts when it truly succeeds. A due task is
 # marked retry_pending BEFORE its first attempt and repaid by bursts — the
@@ -77,19 +88,27 @@ typeset -g ANTIGRAVITY_AGENT_DIR=""
 typeset -g ANTIGRAVITY_STDOUT_FILE=""
 typeset -g ANTIGRAVITY_STDERR_FILE=""
 typeset -g ANTIGRAVITY_QUOTA_FILE=""
+typeset -g OPENCODE_AGENT_DIR=""
+typeset -g OPENCODE_STDOUT_FILE=""
+typeset -g OPENCODE_STDERR_FILE=""
+typeset -g OPENCODE_QUOTA_FILE=""
 typeset -g CODEXBAR_CODEX_RAW_FILE=""
 typeset -g CODEXBAR_ANTIGRAVITY_RAW_FILE=""
+typeset -g CODEXBAR_OPENCODE_RAW_FILE=""
 typeset -g CODEX_QUOTA_NORMALIZED_FILE=""
 typeset -g ANTIGRAVITY_QUOTA_NORMALIZED_FILE=""
+typeset -g OPENCODE_QUOTA_NORMALIZED_FILE=""
 typeset -g CODEX_QUOTA_IS_FRESH=0
 typeset -g ANTIGRAVITY_QUOTA_IS_FRESH=0
+typeset -g OPENCODE_QUOTA_IS_FRESH=0
 typeset -g CODEX_RUN_RESULT=""
 typeset -g ANTIGRAVITY_RUN_RESULT=""
+typeset -g OPENCODE_RUN_RESULT=""
 typeset -gi RUN_LOCK_HELD=0
 typeset -gi QUOTA_LOCK_HELD=0
 
 usage() {
-  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|all]|usage|discover-feishu-user|status]"
+  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|discover-feishu-user|status]"
 }
 
 die() {
@@ -154,8 +173,10 @@ ensure_temp_dir() {
   fi
   CODEXBAR_CODEX_RAW_FILE="$LAST_TEMP_DIR/codexbar-codex.json"
   CODEXBAR_ANTIGRAVITY_RAW_FILE="$LAST_TEMP_DIR/codexbar-antigravity.json"
+  CODEXBAR_OPENCODE_RAW_FILE="$LAST_TEMP_DIR/codexbar-opencode.json"
   CODEX_QUOTA_NORMALIZED_FILE="$LAST_TEMP_DIR/codex-effective-quota.json"
   ANTIGRAVITY_QUOTA_NORMALIZED_FILE="$LAST_TEMP_DIR/antigravity-effective-quota.json"
+  OPENCODE_QUOTA_NORMALIZED_FILE="$LAST_TEMP_DIR/opencode-effective-quota.json"
 }
 
 provider_next_due_file() {
@@ -258,7 +279,7 @@ migrate_legacy_state() {
   # retry_pending deliberately starts at 0 (missing file) — there is no
   # reliable evidence of an outstanding debt from before this version.
   local m_provider m_task
-  for m_provider in codex antigravity; do
+  for m_provider in "${PROVIDERS[@]}"; do
     if [[ ! -r "$STATE_DIR/${m_provider}-last-attempt-at" ]] &&
       [[ -r "$STATE_DIR/${m_provider}-last-task-at" ]]; then
       m_task="$(<"$STATE_DIR/${m_provider}-last-task-at")"
@@ -452,26 +473,20 @@ write_provider_last_window() {
 }
 
 read_next_due() {
-  local c_due a_due min_due=""
+  local provider p_due min_due=""
   # Providers with an unpaid debt (retry_pending=1) are deliberately excluded:
   # their stale past deadline would spin the precision timer once per second.
   # Debt repayment is driven by the watchdog retry phase instead.
-  if ! provider_is_pending codex; then
-    c_due="$(read_provider_next_due "codex" || true)"
-  fi
-  if ! provider_is_pending antigravity; then
-    a_due="$(read_provider_next_due "antigravity" || true)"
-  fi
+  for provider in "${PROVIDERS[@]}"; do
+    provider_is_pending "$provider" && continue
+    p_due="$(read_provider_next_due "$provider" || true)"
+    [[ "$p_due" =~ ^[0-9]+$ ]] || continue
+    if [[ ! "$min_due" =~ ^[0-9]+$ ]] || (( p_due < min_due )); then
+      min_due="$p_due"
+    fi
+  done
 
-  if [[ "$c_due" =~ ^[0-9]+$ ]] && [[ "$a_due" =~ ^[0-9]+$ ]]; then
-    min_due=$(( c_due < a_due ? c_due : a_due ))
-  elif [[ "$c_due" =~ ^[0-9]+$ ]]; then
-    min_due="$c_due"
-  elif [[ "$a_due" =~ ^[0-9]+$ ]]; then
-    min_due="$a_due"
-  else
-    return 1
-  fi
+  [[ "$min_due" =~ ^[0-9]+$ ]] || return 1
   print -r -- "$min_due"
 }
 
@@ -566,6 +581,22 @@ feishu_ready() {
   { [[ -n "${FEISHU_APP_ID:-}" ]] || keychain_has "$FEISHU_APP_ID_SERVICE"; } &&
     { [[ -n "${FEISHU_APP_SECRET:-}" ]] || keychain_has "$FEISHU_APP_SECRET_SERVICE"; } &&
     { [[ -n "${FEISHU_USER_ID:-}" ]] || keychain_has "$FEISHU_USER_ID_SERVICE"; }
+}
+
+# OpenCode Go quota credential: an API key, not a push credential. It is read
+# only by the Native quota tier, which pipes it to its helper over stdin, so it
+# never reaches a process argument list. A missing key is deliberately NOT
+# fatal: the provider degrades to the CodexBar tiers, which hold their own copy.
+opencode_api_key() {
+  if [[ -n "${OPENCODE_API_KEY:-}" ]]; then
+    print -r -- "$OPENCODE_API_KEY"
+  else
+    keychain_read "$OPENCODE_API_KEY_SERVICE" 2>/dev/null || true
+  fi
+}
+
+opencode_api_key_available() {
+  [[ -n "${OPENCODE_API_KEY:-}" ]] || keychain_has "$OPENCODE_API_KEY_SERVICE"
 }
 
 feishu_error_detail() {
@@ -1184,6 +1215,117 @@ build_feishu_v2_usage_payload() {
     }'
 }
 
+# Provider -> display title. Single source of truth for the OpenCode title;
+# the two pre-existing titles also appear inline in the legacy builders.
+provider_card_title() {
+  case "$1" in
+    codex) print -r -- "GPT-5.6 Luna" ;;
+    antigravity) print -r -- "Gemini 3.7 Flash · Low" ;;
+    opencode) print -r -- "DeepSeek V4 Flash · Off" ;;
+  esac
+}
+
+provider_list_includes() {
+  local needle="$1" p
+  shift
+  for p in "$@"; do
+    [[ "$p" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# OpenCode Go's plan also carries a monthly cap. It is display-only: the
+# scheduler keys off the 5-hour reset exactly like the other providers. The
+# line is emitted only when the quota file carries a valid monthly window.
+opencode_monthly_line() {
+  local quota_file="$1" remaining reset
+  remaining="$("$JQ_BIN" -r '.monthly.remainingPercent // empty' "$quota_file" 2>/dev/null || true)"
+  reset="$("$JQ_BIN" -r '.monthly.resetAt // empty' "$quota_file" 2>/dev/null || true)"
+  [[ "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ ]] || return 1
+  print -r -- "本月度　剩余 ${remaining}%　重置 $(format_reset_time "$reset")"
+}
+
+# Splice the monthly line into an existing provider block, just before its
+# trailing divider, so it reads as part of that provider's section.
+splice_opencode_monthly() {
+  local elements="$1" quota_file="$2" line
+  line="$(opencode_monthly_line "$quota_file")" || { print -r -- "$elements"; return 0; }
+  "$JQ_BIN" -n --argjson elems "$elements" --arg text "$line" '
+    ($elems | map(select(.tag != null))) as $clean |
+    ([{ tag: "markdown", content: ("<font color=\"grey\">" + $text + "</font>") }]) as $extra |
+    if ($clean | length) > 0 and $clean[-1].tag == "hr" then
+      $clean[0:-1] + $extra + [$clean[-1]]
+    else
+      $clean + $extra
+    end'
+}
+
+# Vertical multi-provider card: one full-width block per provider. Three
+# providers would crowd the two-column layout the original builders use, so
+# OpenCode-involving messages stack instead. Behaviour for codex/antigravity
+# alone is untouched: those keep build_feishu_v2_task_payload and
+# build_feishu_v2_usage_payload verbatim.
+build_feishu_v2_stacked_payload() {
+  local user_id="$1" request_uuid="$2" mode="$3"
+  shift 3
+  local attempted=("$@")
+  local header_template="green" p result elements block
+  local body_elements_json="[]" intro_json="[]"
+
+  for p in "${attempted[@]}"; do
+    result="$(provider_final_result "$p")"
+    [[ "$mode" != "task" || "${result:-发送成功}" == "发送成功" ]] || header_template="red"
+  done
+
+  for p in "${attempted[@]}"; do
+    result=""
+    if [[ "$mode" == "task" ]]; then
+      result="$(provider_final_result "$p")"
+      result="${result:-发送成功}"
+    fi
+    elements="$(build_provider_v2_elements "$(provider_card_title "$p")" "$result" "$(provider_normalized_quota_file "$p")" "single")" || return 1
+    if [[ "$p" == "opencode" ]]; then
+      block="$(splice_opencode_monthly "$elements" "$(provider_normalized_quota_file "$p")")" && elements="$block"
+    fi
+    body_elements_json="$("$JQ_BIN" -n --argjson acc "$body_elements_json" --argjson block "$elements" '$acc + $block')"
+  done
+
+  if [[ "$mode" == "usage" ]]; then
+    intro_json="$("$JQ_BIN" -n '[{ tag: "markdown", content: "**即时配额查询**　未执行模型任务" }]')"
+  fi
+
+  body_elements_json="$("$JQ_BIN" -n --argjson intro "$intro_json" --argjson body "$body_elements_json" \
+    '$intro + $body + [{ tag: "markdown", content: "<font color=\"grey\">Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底</font>" }]')"
+
+  "$JQ_BIN" -n \
+    --arg receive_id "$user_id" \
+    --arg template "$header_template" \
+    --arg uuid "$request_uuid" \
+    --argjson elements "$body_elements_json" \
+    '{
+      receive_id: $receive_id,
+      msg_type: "interactive",
+      content: ({
+        schema: "2.0",
+        config: {
+          width_mode: "default"
+        },
+        header: {
+          template: $template,
+          title: {
+            tag: "plain_text",
+            content: "AI 模型运行与配额"
+          }
+        },
+        body: {
+          direction: "vertical",
+          elements: $elements
+        }
+      } | tostring),
+      uuid: $uuid
+    }'
+}
+
 dispatch_notification() {
   local message="$1"
   feishu_ready || die "Feishu enterprise-app credentials are not configured"
@@ -1218,12 +1360,24 @@ prepare_provider_env() {
       cp -p "$PI_AUTH_FILE" "$ANTIGRAVITY_AGENT_DIR/auth.json"
       print -r -- '{}' >"$ANTIGRAVITY_AGENT_DIR/settings.json"
       ;;
+    opencode)
+      # opencode-go is an api_key provider: the copied auth.json already
+      # carries its key and no transport override is needed.
+      OPENCODE_AGENT_DIR="$LAST_TEMP_DIR/opencode-agent"
+      OPENCODE_STDOUT_FILE="$LAST_TEMP_DIR/opencode-stdout"
+      OPENCODE_STDERR_FILE="$LAST_TEMP_DIR/opencode-stderr"
+      OPENCODE_QUOTA_FILE="$LAST_TEMP_DIR/opencode-quota.json"
+      mkdir -p "$OPENCODE_AGENT_DIR"
+      cp -p "$PI_AUTH_FILE" "$OPENCODE_AGENT_DIR/auth.json"
+      print -r -- '{}' >"$OPENCODE_AGENT_DIR/settings.json"
+      ;;
   esac
 }
 
 prepare_run() {
   prepare_provider_env codex
   prepare_provider_env antigravity
+  prepare_provider_env opencode
 }
 
 provider_normalized_quota_file() {
@@ -1231,6 +1385,7 @@ provider_normalized_quota_file() {
   case "$provider" in
     codex) print -r -- "$CODEX_QUOTA_NORMALIZED_FILE" ;;
     antigravity) print -r -- "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE" ;;
+    opencode) print -r -- "$OPENCODE_QUOTA_NORMALIZED_FILE" ;;
     *) die "Unknown provider: $provider" ;;
   esac
 }
@@ -1244,6 +1399,7 @@ provider_quota_is_fresh() {
   case "$provider" in
     codex) (( CODEX_QUOTA_IS_FRESH == 1 )) ;;
     antigravity) (( ANTIGRAVITY_QUOTA_IS_FRESH == 1 )) ;;
+    opencode) (( OPENCODE_QUOTA_IS_FRESH == 1 )) ;;
     *) return 1 ;;
   esac
 }
@@ -1252,6 +1408,7 @@ prepare_quota_probe() {
   ensure_temp_dir
   CODEX_QUOTA_IS_FRESH=0
   ANTIGRAVITY_QUOTA_IS_FRESH=0
+  OPENCODE_QUOTA_IS_FRESH=0
 }
 
 # Masked, truncated tail of a provider's stderr for the run log. The full
@@ -1362,6 +1519,57 @@ run_antigravity() {
     log_warn "model antigravity phase=$phase attempt=$attempt/$limit result=failed rc=$exit_code elapsed=${elapsed}s"
   fi
   log_warn "model antigravity attempt=$attempt error: $(safe_error_summary "$ANTIGRAVITY_STDERR_FILE")"
+  return 1
+}
+
+# deepseek-v4-flash declares thinking levels off/low/high/max; `off` sends
+# thinking:{type:"disabled"} and so spends no reasoning tokens, matching the
+# token economy of the other two providers.
+run_opencode() {
+  local phase="${1:-initial}" attempt="${2:-1}" limit="${3:-1}"
+  local output exit_code=0 t0 elapsed
+  t0="$(now_epoch)"
+  (
+    cd /private/tmp
+    PI_CODING_AGENT_DIR="$OPENCODE_AGENT_DIR" \
+    PI_OPENCODE_QUOTA_FILE="$OPENCODE_QUOTA_FILE" \
+    PI_OFFLINE=1 \
+    "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$MODEL_TASK_TIMEOUT_SECONDS" \
+      --kill-grace "$MODEL_TASK_KILL_GRACE_SECONDS" \
+      -- \
+      "$PI_BIN" \
+      --provider opencode-go \
+      --model deepseek-v4-flash \
+      --thinking off \
+      --mode text \
+      --print \
+      --no-session \
+      --no-tools \
+      --no-extensions \
+      --no-skills \
+      --no-prompt-templates \
+      --no-themes \
+      --no-context-files \
+      --no-approve \
+      --offline \
+      --system-prompt "忽略上下文" \
+      --extension "$OPENCODE_QUOTA_EXTENSION" \
+      -- "不用思考，只回复我 1"
+  ) >"$OPENCODE_STDOUT_FILE" 2>>"$OPENCODE_STDERR_FILE" || exit_code=$?
+
+  elapsed=$(( $(now_epoch) - t0 ))
+  output="$(<"$OPENCODE_STDOUT_FILE")"
+  if (( exit_code == 0 )) && [[ "$output" == "1" ]]; then
+    log_info "model opencode phase=$phase attempt=$attempt/$limit result=success elapsed=${elapsed}s"
+    return 0
+  fi
+  if (( exit_code == 124 )); then
+    log_warn "model opencode phase=$phase attempt=$attempt/$limit result=timeout rc=124 elapsed=${elapsed}s"
+  else
+    log_warn "model opencode phase=$phase attempt=$attempt/$limit result=failed rc=$exit_code elapsed=${elapsed}s"
+  fi
+  log_warn "model opencode attempt=$attempt error: $(safe_error_summary "$OPENCODE_STDERR_FILE")"
   return 1
 }
 
@@ -1488,6 +1696,30 @@ normalize_pi_antigravity_quota() {
   ' "$input" >"$output"
 }
 
+normalize_pi_opencode_quota() {
+  local input="$1" output="$2"
+  [[ -s "$input" ]] || return 1
+  "$JQ_BIN" -e '
+    def window:
+      {remainingPercent: (.remainingPercent | tonumber), resetAt: (.resetAt | tonumber)};
+    . as $orig |
+    select(($orig.fiveHour | type) == "object" and ($orig.weekly | type) == "object") |
+    ($orig.fiveHour | window) as $five |
+    ($orig.weekly | window) as $weekly |
+    select($five.remainingPercent >= 0 and $five.remainingPercent <= 100 and
+      $weekly.remainingPercent >= 0 and $weekly.remainingPercent <= 100) |
+    {
+      source: "Pi 快照（可能不是最新）",
+      fresh: false,
+      cached: true,
+      capturedAt: ($orig.capturedAt // null),
+      fiveHour: $five,
+      weekly: $weekly
+    } + (($orig.monthly | try window catch null) as $monthly |
+         if $monthly == null then {} else {monthly: $monthly} end)
+  ' "$input" >"$output"
+}
+
 normalize_codexbar_codex_quota() {
   local input="$1" output="$2"
   [[ -s "$input" ]] || return 1
@@ -1537,6 +1769,44 @@ normalize_codexbar_antigravity_quota() {
       fiveHour: {remainingPercent: remaining($five.usedPercent), resetAt: epoch($five.resetsAt)},
       weekly: {remainingPercent: remaining($weekly.usedPercent), resetAt: epoch($weekly.resetsAt)}
     }
+  ' "$input" >"$output"
+}
+
+# CodexBar reports OpenCode Go windows as primary (5h) / secondary (weekly) /
+# tertiary (monthly) keyed by windowMinutes; its usedPercent follows the same
+# used-not-remaining convention as the codex provider.
+normalize_codexbar_opencode_quota() {
+  local input="$1" output="$2"
+  [[ -s "$input" ]] || return 1
+  "$JQ_BIN" -e '
+    def epoch($value):
+      if ($value | type) == "number" then ($value | floor)
+      elif ($value | type) == "string" then
+        # The OpenCode Go API emits ISO-8601 with milliseconds, which
+        # fromdateiso8601 rejects; strip the fraction before parsing.
+        (if ($value | test("\\.[0-9]+Z$")) then ($value | sub("\\.[0-9]+Z$"; "Z")) else $value end
+          | fromdateiso8601)
+      else empty end;
+    def remaining($used): ([0, (100 - ($used | tonumber)), 100] | sort | .[1] | round);
+    def window_for($windows; $minutes):
+      ([$windows[] | select(.windowMinutes == $minutes and .usedPercent != null)][0] // empty);
+    def window_of($window):
+      {remainingPercent: remaining($window.usedPercent), resetAt: epoch($window.resetsAt)};
+    ([.[] | select(.provider == "opencodego" and (.usage | type) == "object")][0] // empty) as $row |
+    select($row != null) |
+    $row.usage as $usage |
+    ([$usage.primary, $usage.secondary, $usage.tertiary] | map(select(. != null))) as $windows |
+    (window_for($windows; 300)) as $five |
+    (window_for($windows; 10080)) as $weekly |
+    (window_for($windows; 43200)) as $monthly |
+    select($five != null and $weekly != null) |
+    {
+      source: ("CodexBar · " + ($row.source // "api")),
+      fresh: true,
+      capturedAt: (now | floor),
+      fiveHour: window_of($five),
+      weekly: window_of($weekly)
+    } + (if $monthly != null then {monthly: window_of($monthly)} else {} end)
   ' "$input" >"$output"
 }
 
@@ -1652,6 +1922,30 @@ fetch_native_antigravity_quota() {
   return 1
 }
 
+# Native tier: OpenCode Go's own usage API, reached through a bounded helper
+# that consumes no model tokens. The key travels on the helper's stdin, so no
+# process argument list and no environment block ever carries it. Only the
+# helper's fixed reason code is logged, never its raw stderr or the response.
+fetch_native_opencode_quota() {
+  local output="$1" key reason=""
+  [[ -r "$OPENCODE_USAGE_HELPER" ]] || return 1
+  require_executable "$PYTHON3_BIN"
+  key="$(opencode_api_key)"
+  if [[ -z "$key" ]]; then
+    log_warn "quota opencode: native skipped (no API key in $OPENCODE_API_KEY_SERVICE)"
+    return 1
+  fi
+  if printf '%s\n' "$key" | "$PYTHON3_BIN" -B "$OPENCODE_USAGE_HELPER" \
+      --curl "$CURL_BIN" --timeout "$OPENCODE_NATIVE_TIMEOUT_SECONDS" \
+      >"$output" 2>"${output}.stderr"; then
+    [[ -s "$output" ]] || return 1
+    return 0
+  fi
+  reason="$(/usr/bin/sed -n 's/^opencode_usage: \([a-z_0-9]*\)$/\1/p' "${output}.stderr")"
+  log_warn "quota opencode: native /usage failed (${reason:-runtime_unavailable})"
+  return 1
+}
+
 save_codexbar_cache() {
   local live_normalized="$1" cache_file="$2"
   local temp_cache="${cache_file}.tmp.$$"
@@ -1731,6 +2025,29 @@ fetch_codexbar_antigravity_quota() {
   return 1
 }
 
+fetch_codexbar_opencode_quota() {
+  local output="$1" rc=0
+  [[ -x "$CODEXBAR_BIN" ]] || return 1
+  # Only the api source draws on the credential this deployment manages; the
+  # web source needs interactive browser cookies, which a launchd context has
+  # none of.
+  if "$PYTHON3_BIN" "$RUN_WITH_TIMEOUT_HELPER" \
+      --timeout "$OPENCODE_CODEXBAR_TIMEOUT_SECONDS" \
+      --kill-grace "$CODEXBAR_KILL_GRACE_SECONDS" \
+      -- \
+      "$CODEXBAR_BIN" usage --provider opencodego --source api --format json --json-only --no-color \
+      >"$CODEXBAR_OPENCODE_RAW_FILE" 2>"$LAST_TEMP_DIR/codexbar-opencode.stderr"; then
+    if normalize_codexbar_opencode_quota "$CODEXBAR_OPENCODE_RAW_FILE" "$output"; then
+      save_codexbar_cache "$output" "$CODEXBAR_OPENCODE_CACHE_FILE" || true
+      return 0
+    fi
+  else
+    rc=$?
+    (( rc == 124 )) && log_warn "quota opencode: codexbar-live TIMEOUT after ${OPENCODE_CODEXBAR_TIMEOUT_SECONDS}s (source api)"
+  fi
+  return 1
+}
+
 use_codexbar_cached_codex() {
   local output="$1"
   [[ -s "$CODEXBAR_CODEX_CACHE_FILE" ]] || return 1
@@ -1773,6 +2090,7 @@ atomic_copy() {
 save_pi_quota_snapshots() {
   local codex_normalized="$LAST_TEMP_DIR/codex-pi-normalized.json"
   local antigravity_normalized="$LAST_TEMP_DIR/antigravity-pi-normalized.json"
+  local opencode_normalized="$LAST_TEMP_DIR/opencode-pi-normalized.json"
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
   if normalize_pi_codex_quota "$CODEX_QUOTA_FILE" "$codex_normalized"; then
@@ -1780,6 +2098,9 @@ save_pi_quota_snapshots() {
   fi
   if normalize_pi_antigravity_quota "$ANTIGRAVITY_QUOTA_FILE" "$antigravity_normalized"; then
     atomic_copy "$antigravity_normalized" "$PI_ANTIGRAVITY_SNAPSHOT_FILE" || true
+  fi
+  if normalize_pi_opencode_quota "$OPENCODE_QUOTA_FILE" "$opencode_normalized"; then
+    atomic_copy "$opencode_normalized" "$PI_OPENCODE_SNAPSHOT_FILE" || true
   fi
 }
 
@@ -1835,8 +2156,38 @@ use_pi_or_saved_codex_fallback() {
   use_pi_snapshot_codex "$CODEX_QUOTA_NORMALIZED_FILE"
 }
 
+use_codexbar_cached_opencode() {
+  local output="$1"
+  [[ -s "$CODEXBAR_OPENCODE_CACHE_FILE" ]] || return 1
+  local staged="$output.staged"
+  renormalise_quota_file "$CODEXBAR_OPENCODE_CACHE_FILE" "$staged" || return 1
+  "$JQ_BIN" -e '
+    . + {
+      source: "CodexBar · cached（可能不是最新）",
+      fresh: false,
+      cached: true
+    }
+  ' "$staged" >"$output" 2>/dev/null || { rm -f "$staged"; return 1; }
+  rm -f "$staged"
+  [[ -s "$output" ]] || return 1
+}
+
 use_pi_or_saved_antigravity_fallback() {
   use_pi_snapshot_antigravity "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+}
+
+use_pi_snapshot_opencode() {
+  local output="$1"
+  local normalized="$LAST_TEMP_DIR/opencode-pi-normalized.json"
+  if normalize_pi_opencode_quota "$OPENCODE_QUOTA_FILE" "$normalized" &&
+    renormalise_quota_file "$normalized" "$output"; then
+    return 0
+  fi
+  renormalise_quota_file "$PI_OPENCODE_SNAPSHOT_FILE" "$output"
+}
+
+use_pi_or_saved_opencode_fallback() {
+  use_pi_snapshot_opencode "$OPENCODE_QUOTA_NORMALIZED_FILE"
 }
 
 quota_tier() {
@@ -1885,6 +2236,20 @@ collect_effective_quotas() {
     ANTIGRAVITY_QUOTA_IS_FRESH=0
     log_error "quota antigravity: all tiers unavailable"
   fi
+
+  # OpenCode 4-tier hierarchy: Native -> CodexBar Live -> CodexBar Cache -> Pi Snapshot
+  if quota_tier opencode native fetch_native_opencode_quota "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
+    OPENCODE_QUOTA_IS_FRESH=1
+  elif quota_tier opencode codexbar-live fetch_codexbar_opencode_quota "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
+    OPENCODE_QUOTA_IS_FRESH=1
+  elif quota_tier opencode codexbar-cache use_codexbar_cached_opencode "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
+    OPENCODE_QUOTA_IS_FRESH=0
+  elif quota_tier opencode pi-snapshot use_pi_snapshot_opencode "$OPENCODE_QUOTA_NORMALIZED_FILE"; then
+    OPENCODE_QUOTA_IS_FRESH=0
+  else
+    OPENCODE_QUOTA_IS_FRESH=0
+    log_error "quota opencode: all tiers unavailable"
+  fi
 }
 
 quota_message_from_file() {
@@ -1916,6 +2281,10 @@ codex_quota_message() {
 
 antigravity_quota_message() {
   quota_message_from_file "$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+}
+
+opencode_quota_message() {
+  quota_message_from_file "$OPENCODE_QUOTA_NORMALIZED_FILE"
 }
 
 format_provider_card_section() {
@@ -2000,6 +2369,9 @@ task_notification_message() {
       antigravity)
         sections+=("$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "${ANTIGRAVITY_RUN_RESULT:-发送成功}" "$(antigravity_quota_message)")")
         ;;
+      opencode)
+        sections+=("$(format_provider_card_section "**$(provider_card_title opencode)**" "${OPENCODE_RUN_RESULT:-发送成功}" "$(opencode_quota_message)")")
+        ;;
     esac
   done
 
@@ -2017,15 +2389,37 @@ task_notification_message() {
     "🕒 $timestamp"
 }
 
+# The optional third argument keeps the two-provider output byte-identical
+# when no OpenCode quota is supplied.
 usage_notification_message() {
   local codex_quota="$1"
   local antigravity_quota="$2"
+  local opencode_quota="${3:-}"
   local timestamp
   timestamp="$(TZ=Asia/Shanghai /bin/date '+%Y-%m-%d %H:%M:%S %Z')"
 
-  local sec1 sec2
+  local sec1 sec2 sec3=""
   sec1="$(format_provider_card_section "**GPT-5.6 Luna**" "" "$codex_quota")"
   sec2="$(format_provider_card_section "**Gemini 3.7 Flash · Low**" "" "$antigravity_quota")"
+  if [[ -n "$opencode_quota" ]]; then
+    sec3="$(format_provider_card_section "**$(provider_card_title opencode)**" "" "$opencode_quota")"
+    printf '%s\n' \
+      "**即时配额查询**　未执行模型任务" \
+      "" \
+      "$sec1" \
+      "" \
+      "────────────" \
+      "" \
+      "$sec2" \
+      "" \
+      "────────────" \
+      "" \
+      "$sec3" \
+      "" \
+      "**图例**　■ 剩余　□ 已用" \
+      "🕒 $timestamp"
+    return 0
+  fi
 
   printf '%s\n' \
     "**即时配额查询**　未执行模型任务" \
@@ -2076,7 +2470,7 @@ discover_feishu_user() {
 
 validate_run_requirements() {
   local providers=("$@") provider
-  (( ${#providers[@]} > 0 )) || providers=(codex antigravity)
+  (( ${#providers[@]} > 0 )) || providers=("${PROVIDERS[@]}")
   require_executable "$PI_BIN"
   require_executable "$CURL_BIN"
   require_executable "$JQ_BIN"
@@ -2097,6 +2491,13 @@ validate_run_requirements() {
         [[ -r "$ANTIGRAVITY_QUOTA_EXTENSION" ]] || die "Antigravity quota hook is not readable"
         [[ -r "$ANTIGRAVITY_PROVIDER_EXTENSION" ]] || die "Antigravity provider extension is not readable"
         ;;
+      opencode)
+        # A model run needs Pi's own credential only; the quota API key is a
+        # separate credential whose absence merely drops the Native tier.
+        "$JQ_BIN" -e 'has("opencode-go")' "$PI_AUTH_FILE" >/dev/null ||
+          die "Pi credential for OpenCode Go is missing"
+        [[ -r "$OPENCODE_QUOTA_EXTENSION" ]] || die "OpenCode quota hook is not readable"
+        ;;
       *) die "Unknown provider: $provider" ;;
     esac
   done
@@ -2104,28 +2505,28 @@ validate_run_requirements() {
 }
 
 status() {
-  validate_run_requirements codex antigravity
+  validate_run_requirements "${PROVIDERS[@]}"
   print -r -- "ready"
   print -r -- "channel: feishu enterprise app"
   if [[ -x "$CODEX_BIN" ]] || [[ -x "$CODEXBAR_BIN" ]]; then
-    print -r -- "quota primary: Native Direct (Codex app-server / Antigravity agy) · CodexBar fallback"
+    print -r -- "quota primary: Native Direct (Codex app-server / Antigravity agy / OpenCode Go usage API) · CodexBar fallback"
   else
     print -r -- "quota primary: unavailable; last Pi snapshots may be used"
   fi
-  local codex_due antigravity_due
-  codex_due="$(read_provider_next_due "codex" || true)"
-  antigravity_due="$(read_provider_next_due "antigravity" || true)"
-
-  if [[ "$codex_due" =~ ^[0-9]+$ ]]; then
-    print -r -- "next codex run: $(format_reset_time "$codex_due")"
+  if opencode_api_key_available; then
+    print -r -- "opencode api key: configured"
   else
-    print -r -- "next codex run: due now"
+    print -r -- "opencode api key: missing ($OPENCODE_API_KEY_SERVICE); Native tier disabled"
   fi
-  if [[ "$antigravity_due" =~ ^[0-9]+$ ]]; then
-    print -r -- "next antigravity run: $(format_reset_time "$antigravity_due")"
-  else
-    print -r -- "next antigravity run: due now"
-  fi
+  local p p_due
+  for p in "${PROVIDERS[@]}"; do
+    p_due="$(read_provider_next_due "$p" || true)"
+    if [[ "$p_due" =~ ^[0-9]+$ ]]; then
+      print -r -- "next $p run: $(format_reset_time "$p_due")"
+    else
+      print -r -- "next $p run: due now"
+    fi
+  done
 }
 
 five_hour_reset_at() {
@@ -2327,6 +2728,7 @@ provider_final_result() {
   case "$1" in
     codex) print -r -- "${CODEX_RUN_RESULT:-}" ;;
     antigravity) print -r -- "${ANTIGRAVITY_RUN_RESULT:-}" ;;
+    opencode) print -r -- "${OPENCODE_RUN_RESULT:-}" ;;
   esac
 }
 
@@ -2341,6 +2743,7 @@ commit_provider_success() {
   case "$provider" in
     codex) CODEX_RUN_RESULT="发送成功" ;;
     antigravity) ANTIGRAVITY_RUN_RESULT="发送成功" ;;
+    opencode) OPENCODE_RUN_RESULT="发送成功" ;;
   esac
   log_info "success commit $provider: last_task=$success_at fallback_due=$(( success_at + RUN_INTERVAL_SECONDS )) retry_pending=0"
 }
@@ -2368,6 +2771,7 @@ run_retry_burst() {
     case "$provider" in
       codex) CODEX_RUN_RESULT="发送失败" ;;
       antigravity) ANTIGRAVITY_RUN_RESULT="发送失败" ;;
+      opencode) OPENCODE_RUN_RESULT="发送失败" ;;
     esac
   done
 
@@ -2380,6 +2784,7 @@ run_retry_burst() {
       case "$provider" in
         codex) run_codex "$phase" "$round" "$limit" & pids+=($!) ;;
         antigravity) run_antigravity "$phase" "$round" "$limit" & pids+=($!) ;;
+        opencode) run_opencode "$phase" "$round" "$limit" & pids+=($!) ;;
       esac
     done
 
@@ -2415,7 +2820,12 @@ dispatch_task_notification() {
     dispatch_notification "$(task_notification_message "${attempted[@]}")"
   else
     local card_payload
-    if card_payload="$(build_feishu_v2_task_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "${attempted[@]}")" && [[ -n "$card_payload" ]]; then
+    if provider_list_includes opencode "${attempted[@]}"; then
+      card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "task" "${attempted[@]}")" || card_payload=""
+    else
+      card_payload="$(build_feishu_v2_task_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "${attempted[@]}")" || card_payload=""
+    fi
+    if [[ -n "$card_payload" ]]; then
       dispatch_notification "$card_payload"
     else
       dispatch_notification "$(task_notification_message "${attempted[@]}")"
@@ -2465,7 +2875,7 @@ run_selected_providers() {
 
 run_and_reschedule_selected() {
   local targets=("$@")
-  (( ${#targets[@]} > 0 )) || targets=(codex antigravity)
+  (( ${#targets[@]} > 0 )) || targets=("${PROVIDERS[@]}")
   acquire_run_lock || die "Another model run is already in progress"
   run_selected_providers "${targets[@]}"
   release_run_lock
@@ -2480,7 +2890,7 @@ usage_busy_message() {
 }
 
 send_usage_notification() {
-  local codex_quota antigravity_quota notification t0
+  local codex_quota antigravity_quota opencode_quota notification t0
   t0="$(now_epoch)"
   log_info "usage: requested"
 
@@ -2496,20 +2906,26 @@ send_usage_notification() {
 
   # /usage never runs a model and never touches last-task/last-window, but its
   # already-fetched live quota is authoritative enough to refresh deadlines.
-  sync_provider_deadline_from_quota codex || true
-  sync_provider_deadline_from_quota antigravity || true
+  local p
+  for p in "${PROVIDERS[@]}"; do
+    sync_provider_deadline_from_quota "$p" || true
+  done
 
   codex_quota="$(codex_quota_message)" || true
   antigravity_quota="$(antigravity_quota_message)" || true
+  opencode_quota="$(opencode_quota_message)" || true
 
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
-    notification="$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+    notification="$(usage_notification_message "$codex_quota" "$antigravity_quota" "$opencode_quota")"
   else
     local card_payload
-    if card_payload="$(build_feishu_v2_usage_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')")" && [[ -n "$card_payload" ]]; then
+    # The /usage card always covers the full provider roster, so it uses the
+    # stacked layout now that a third provider exists.
+    card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "usage" "${PROVIDERS[@]}")" || card_payload=""
+    if [[ -n "$card_payload" ]]; then
       notification="$card_payload"
     else
-      notification="$(usage_notification_message "$codex_quota" "$antigravity_quota")"
+      notification="$(usage_notification_message "$codex_quota" "$antigravity_quota" "$opencode_quota")"
     fi
   fi
   release_quota_lock
@@ -2522,8 +2938,10 @@ setup_mock_preview_quota() {
   local now="$(/bin/date '+%s')"
   print -r -- '{"source":"Native · codex app-server","fresh":true,"capturedAt":'$now',"fiveHour":{"remainingPercent":100,"resetAt":'$(( now + 17880 ))'},"weekly":{"remainingPercent":84,"resetAt":'$(( now + 595800 ))'}}' >"$CODEX_QUOTA_NORMALIZED_FILE"
   print -r -- '{"source":"Native · agy local service","fresh":true,"capturedAt":'$now',"fiveHour":{"remainingPercent":77,"resetAt":'$(( now + 17700 ))'},"weekly":{"remainingPercent":86,"resetAt":'$(( now + 369660 ))'}}' >"$ANTIGRAVITY_QUOTA_NORMALIZED_FILE"
+  print -r -- '{"source":"Native · opencode-go /usage","fresh":true,"capturedAt":'$now',"fiveHour":{"remainingPercent":88,"resetAt":'$(( now + 16980 ))'},"weekly":{"remainingPercent":95,"resetAt":'$(( now + 317340 ))'},"monthly":{"remainingPercent":98,"resetAt":'$(( now + 2574000 ))'}}' >"$OPENCODE_QUOTA_NORMALIZED_FILE"
   CODEX_RUN_RESULT="发送成功"
   ANTIGRAVITY_RUN_RESULT="发送成功"
+  OPENCODE_RUN_RESULT="发送成功"
 }
 
 card_preview() {
@@ -2532,7 +2950,7 @@ card_preview() {
   local payload
   case "$mode" in
     usage)
-      payload="$(build_feishu_v2_usage_payload "mock-user-id" "preview-usage-$(/bin/date +%s)")"
+      payload="$(build_feishu_v2_stacked_payload "mock-user-id" "preview-usage-$(/bin/date +%s)" "usage" "${PROVIDERS[@]}")"
       ;;
     single|codex)
       payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-single-$(/bin/date +%s)" codex)"
@@ -2540,8 +2958,15 @@ card_preview() {
     antigravity)
       payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-single-$(/bin/date +%s)" antigravity)"
       ;;
-    both|all|auto|*)
+    opencode)
+      payload="$(build_feishu_v2_stacked_payload "mock-user-id" "preview-single-$(/bin/date +%s)" "task" opencode)"
+      ;;
+    both)
+      # "both" keeps its original meaning: the two pre-existing providers.
       payload="$(build_feishu_v2_task_payload "mock-user-id" "preview-both-$(/bin/date +%s)" codex antigravity)"
+      ;;
+    all|auto|*)
+      payload="$(build_feishu_v2_stacked_payload "mock-user-id" "preview-all-$(/bin/date +%s)" "task" "${PROVIDERS[@]}")"
       ;;
   esac
   print -r -- "$payload" | "$JQ_BIN" .
@@ -2553,7 +2978,7 @@ send_test_card() {
   local payload
   case "$mode" in
     usage)
-      payload="$(build_feishu_v2_usage_payload "$(feishu_user_id)" "test-usage-$(/bin/date +%s)")"
+      payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id)" "test-usage-$(/bin/date +%s)" "usage" "${PROVIDERS[@]}")"
       ;;
     single|codex)
       payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" codex)"
@@ -2561,11 +2986,17 @@ send_test_card() {
     antigravity)
       payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" antigravity)"
       ;;
+    opencode)
+      payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id)" "test-single-$(/bin/date +%s)" "task" opencode)"
+      ;;
     progress)
       payload="$(build_progress_test_card_payload "$(feishu_user_id)" "test-progress-$(/bin/date +%s)")"
       ;;
-    both|all|auto|*)
+    both)
       payload="$(build_feishu_v2_task_payload "$(feishu_user_id)" "test-both-$(/bin/date +%s)" codex antigravity)"
+      ;;
+    all|auto|*)
+      payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id)" "test-all-$(/bin/date +%s)" "task" "${PROVIDERS[@]}")"
       ;;
   esac
   dispatch_notification "$payload"
@@ -2589,7 +3020,7 @@ provider_retry_due() {
 
 check_schedule() {
   local due_providers=() retry_pending_list=() recovered=()
-  local t0 elapsed c_due a_due p
+  local t0 elapsed p p_due due_log
 
   # Serialize the due decision and the subsequent model run. Without this,
   # watchdog and precision-timer processes can both decide from the same stale
@@ -2600,7 +3031,7 @@ check_schedule() {
   # Phase A — repay pending debts first: a fresh probe must never push a
   # due-but-unsucceeded task into the future. No quota lock is held here, so
   # 30s retry sleeps and model timeouts never block /usage.
-  for p in codex antigravity; do
+  for p in "${PROVIDERS[@]}"; do
     provider_retry_due "$p" && retry_pending_list+=("$p")
   done
   if (( ${#retry_pending_list[@]} > 0 )); then
@@ -2624,7 +3055,7 @@ check_schedule() {
   # Phase C — evaluate only providers without a pending debt. A provider that
   # already went through this round's watchdog burst (success OR failure) is
   # never re-evaluated as due in the same check.
-  for p in codex antigravity; do
+  for p in "${PROVIDERS[@]}"; do
     if provider_is_pending "$p"; then
       log_info "check: $p pending (debt unpaid); normal due evaluation skipped"
       continue
@@ -2646,9 +3077,12 @@ check_schedule() {
   fi
 
   if (( ${#due_providers[@]} == 0 )); then
-    c_due="$(read_provider_next_due codex 2>/dev/null || true)"
-    a_due="$(read_provider_next_due antigravity 2>/dev/null || true)"
-    log_info "check: nothing due (codex next $(format_reset_time "$c_due" 2>/dev/null || echo unset), antigravity next $(format_reset_time "$a_due" 2>/dev/null || echo unset)) (${elapsed}s)"
+    due_log=""
+    for p in "${PROVIDERS[@]}"; do
+      p_due="$(read_provider_next_due "$p" 2>/dev/null || true)"
+      due_log+="$p next $(format_reset_time "$p_due" 2>/dev/null || echo unset), "
+    done
+    log_info "check: nothing due (${due_log%, }) (${elapsed}s)"
     release_run_lock
     return 0
   fi
@@ -2702,11 +3136,14 @@ main() {
         antigravity)
           run_and_reschedule_selected antigravity
           ;;
+        opencode)
+          run_and_reschedule_selected opencode
+          ;;
         all|both|"")
-          run_and_reschedule_selected codex antigravity
+          run_and_reschedule_selected "${PROVIDERS[@]}"
           ;;
         *)
-          die "Unknown run target: $target (expected: codex, antigravity, or all)"
+          die "Unknown run target: $target (expected: codex, antigravity, opencode, or all)"
           ;;
       esac
       ;;

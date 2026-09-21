@@ -50,7 +50,7 @@ chmod +x "$BIN_DIR/pi"
 
 export QUOTA_SENTINEL_PI_BIN="$BIN_DIR/pi"
 export QUOTA_SENTINEL_PI_AUTH_FILE="$TEST_TEMP_DIR/auth.json"
-print -r -- '{"openai-codex":{},"antigravity":{}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
+print -r -- '{"openai-codex":{},"antigravity":{},"opencode-go":{"type":"api_key","key":"x"}}' >"$QUOTA_SENTINEL_PI_AUTH_FILE"
 export PI_MOCK_CALLS_DIR="$TEST_TEMP_DIR/calls"
 
 export PI_SOURCE_ONLY=1
@@ -61,8 +61,10 @@ ensure_temp_dir
 
 fetch_native_codex_quota() { return 1; }
 fetch_native_antigravity_quota() { return 1; }
+fetch_native_opencode_quota() { return 1; }
 fetch_codexbar_codex_quota() { return 1; }
 fetch_codexbar_antigravity_quota() { return 1; }
+fetch_codexbar_opencode_quota() { return 1; }
 
 typeset -ga CAPTURED_MESSAGES=()
 send_feishu_message() { CAPTURED_MESSAGES+=("$4"); return 0; }

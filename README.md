@@ -1,8 +1,8 @@
-# Quota Sentinel + Gemini (Feishu enterprise app)
+# Quota Sentinel + Gemini + DeepSeek (Feishu enterprise app)
 
-Runs GPT-5.6 Luna and Gemini 3.7 Flash (Low) in parallel, sends one combined
-status message through a Feishu enterprise self-built app, and saves no Pi
-sessions.
+Runs GPT-5.6 Luna, Gemini 3.7 Flash (Low) and DeepSeek V4 Flash (OpenCode Go)
+in parallel, sends one combined status message through a Feishu enterprise
+self-built app, and saves no Pi sessions.
 
 Feishu receives an interactive card with a green header when both model calls
 succeed and a red header when either one fails. Its body is equivalent to:
@@ -26,9 +26,26 @@ Gemini 3.7 Flash · Low
 ↳ 重置　2026-09-03 16:41:58 CST（剩余 4天 19小时 51分）
 ↳ 来源　CodexBar · cli
 
+────────────
+
+DeepSeek V4 Flash · Off
+🟢 发送成功
+5 小时：■■■■■■■■■□ 剩余 88%
+↳ 重置　2026-08-30 00:21:14 CST（剩余 3小时 31分）
+周额度：■■■■■■■■■■ 剩余 95%
+↳ 重置　2026-09-03 16:41:58 CST（剩余 4天 19小时 51分）
+↳ 来源　Native · opencode-go /usage
+本月度　剩余 98%　重置 2026-10-17 11:04:30 CST
+
 ■ 剩余　□ 已用
 🕒 2026-08-29 20:30:00 CST
 ```
+
+The layout depends on which providers ran: one provider fills the card with its
+two quota windows side by side, the original two providers keep their
+two-column card, and any message that includes OpenCode stacks one full-width
+block per provider. OpenCode Go is the only plan with a third window, so its
+monthly cap is appended to its own block as a grey display-only line.
 
 Each provider is successful only when Pi exits normally and its model replies
 exactly `1`. Quota collection is reported independently.
@@ -44,6 +61,13 @@ exactly `1`. Quota collection is reported independently.
      (agy >= 1.1.11, structured metadata only; no model prompt).
    - **Fallbacks**: CodexBar Live, CodexBar cached result, then the Pi
      Antigravity API snapshot.
+3. **OpenCode Go Quota**:
+   - **Primary**: Native `GET https://opencode.ai/zen/go/v1/usage` with the
+     API key (`opencode_usage.py`, metadata only; no model prompt).
+   - **Fallbacks**: CodexBar Live (`--provider opencodego --source api`),
+     CodexBar cached result, then the Pi session snapshot. The 5-hour rolling
+     window drives the schedule exactly like the other providers; the monthly
+     cap is carried for display only and never participates in scheduling.
 
 All live quota calls are metadata-only: they consume no prompt tokens and no
 inference turns.
@@ -78,6 +102,23 @@ variable first, then from these macOS Keychain services under account
 
 `FEISHU_DRY_RUN=1` prints the message instead of calling the API.
 
+The OpenCode Go quota credential is separate from the push credentials and is
+read only by the Native quota tier:
+
+| Credential | Environment override | Keychain service |
+| --- | --- | --- |
+| OpenCode Go API key | `OPENCODE_API_KEY` | `com.example.quota-sentinel.opencode-go-api-key` |
+
+```bash
+security add-generic-password -U -a quota-sentinel \
+  -s com.example.quota-sentinel.opencode-go-api-key -w '<OpenCode Go API key>'
+```
+
+Without it the provider still runs and still reports quota: the Native tier is
+skipped and CodexBar's `opencodego` provider (which keeps its own copy of the
+key) takes over. A **model** run needs no key here at all — it authenticates
+from Pi's own `opencode-go` entry in `auth.json`.
+
 ### Feishu setup
 
 The Feishu channel uses an enterprise self-built app (企业自建应用) and delivers
@@ -111,13 +152,15 @@ to the bot's 1:1 chat with you (私聊):
 - No skills, plugins, prompt templates, or themes
 - No `AGENTS.md` or `CLAUDE.md` context
 - Minimal custom system prompt instructing the models to ignore context
-- Luna thinking disabled; Gemini uses its lowest supported level (`low`)
+- Luna and DeepSeek thinking disabled (`off`); Gemini uses its lowest supported
+  level (`low`)
 
 Discovered extensions remain disabled. The only explicitly loaded code is the
-tool-free Codex quota hook, the Antigravity provider required for Gemini, and a
-tool-free Antigravity `agent_end` quota hook. These do not add model context or
-register model-callable tools. Antigravity quota metadata requests consume no
-model tokens.
+tool-free Codex quota hook, the Antigravity provider required for Gemini, a
+tool-free Antigravity `agent_end` quota hook, and a tool-free OpenCode Go
+`agent_end` quota hook. These do not add model context or register
+model-callable tools. Antigravity and OpenCode Go quota metadata requests
+consume no model tokens.
 
 Push credentials never appear in process arguments or URLs: the Feishu app
 secret travels through the request body on stdin, and the tenant token through
@@ -131,12 +174,14 @@ an Authorization header supplied to curl over stdin.
 ./quota-sentinel.sh usage
 ./quota-sentinel.sh status
 ./quota-sentinel.sh discover-feishu-user <email-or-mobile>
-./quota-sentinel.sh run [codex|antigravity|all]
+./quota-sentinel.sh run [codex|antigravity|opencode|all]
+./quota-sentinel.sh card-preview [all|both|codex|antigravity|opencode|usage]
+./quota-sentinel.sh send-test-card [all|both|codex|antigravity|opencode|usage|progress]
 ```
 
-- `check`: 15-minute watchdog probe. Independently evaluates Codex and Antigravity 5h quota states without model invocations, and triggers only the provider(s) due for execution.
-- `usage`: Instant quota check sent to Feishu for both providers without triggering model tasks.
-- `run [codex|antigravity|all]`: Runs specified provider (or both) and updates its schedule.
+- `check`: 15-minute watchdog probe. Independently evaluates each provider's 5h quota state without model invocations, and triggers only the provider(s) due for execution.
+- `usage`: Instant quota check sent to Feishu for every provider without triggering model tasks.
+- `run [codex|antigravity|opencode|all]`: Runs specified provider (or all three) and updates its schedule.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
 
@@ -178,10 +223,11 @@ Every external process is bounded so a hang can never hold the scheduler:
 
 | Operation | Bound | After the bound |
 | --- | --- | --- |
-| Model task (`run_codex` / `run_antigravity`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
+| Model task (`run_codex` / `run_antigravity` / `run_opencode`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
 | Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
-| CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
-| Feishu WebSocket listener outer bound | 360s | Subprocess group terminated (default quota acquisition ≈ 161s + existing Feishu auth/send retries ≈ 183s + margin) |
+| OpenCode Go Native `/usage` API | `QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Tier ① failed → CodexBar Live; fixed reason code logged, never a response body |
+| CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); OpenCode: `QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT` (20s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
+| Feishu WebSocket listener outer bound | 480s | Subprocess group terminated (default quota acquisition ≈ 207s + existing Feishu auth/send retries ≈ 183s + margin) |
 | Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The shell and every nested detached process group are terminated |
 
 Model and CodexBar timeouts run through `run_with_timeout.py`: the child gets its own session,
@@ -218,9 +264,11 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 ① Native Direct (FRESH)
    Codex: codex app-server JSON-RPC (account/rateLimits/read)
    Antigravity: built-in agy -p /usage --output-format json (via uv)
+   OpenCode Go: GET opencode.ai/zen/go/v1/usage with the API key (via python3)
    ↓ (fail)
 ② CodexBar Live (FRESH)
    codexbar usage --provider <codex|antigravity> --source cli
+   codexbar usage --provider opencodego --source api
    (On success: updates local CodexBar cache snapshot)
    ↓ (fail)
 ③ CodexBar Cached (STALE / DISPLAY ONLY)
@@ -234,8 +282,9 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
 
 - **Scheduler Freshness Rule**: Only Tier ① (Native) and Tier ②
   (CodexBar Live) are marked as `FRESH` and eligible to calibrate a provider's
-  deadline to the latest `reset_at + 4m` before its currently scheduled reset
-  occurs. Freshness is necessary but not sufficient: each provider generation
+  5-hour `reset_at + 4m` deadline before its currently scheduled reset occurs.
+  OpenCode Go's monthly window is neither fresh-authoritative nor schedulable:
+  it is display data carried alongside the two windows. Freshness is necessary but not sufficient: each provider generation
   keeps a fixed reset anchor. Earlier resets and later movement up to five
   minutes from that anchor remain dynamic; a farther-later reset must remain
   stable across an independent observation before it may replace the anchor.
@@ -292,7 +341,7 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
 
 ## Dynamic Reset Calibration & Fallback Scheduling
 
-- **Decoupled Provider States**: Codex and Antigravity each independently maintain `last_known_reset_at`, a fixed per-generation reset anchor, `next_due_at`, `last_task_at` (successful tasks only), `last_attempt_at`, and `retry_pending`.
+- **Decoupled Provider States**: Codex, Antigravity and OpenCode Go each independently maintain `last_known_reset_at`, a fixed per-generation reset anchor, `next_due_at`, `last_task_at` (successful tasks only), `last_attempt_at`, and `retry_pending`.
 - **Dynamic Calibration from Quota Probes**:
   - Every 15 minutes, the watchdog probes quota via the 4-tier hierarchy.
   - Immediately after a real task starts, its provider is seeded with a
@@ -324,9 +373,10 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
   - Any subsequent successful Fresh probe immediately replaces the fallback
     with its `reset_at + 4m` deadline.
 - **Targeted Execution & Card Scoping**:
-  - When only Antigravity reaches its deadline, only Gemini executes and only Gemini appears in the Feishu card (Codex is never marked as failed).
+  - When only Antigravity reaches its deadline, only Gemini executes and only Gemini appears in the Feishu card (other providers are never marked as failed).
   - When only Codex reaches its deadline, only Luna executes and only Luna appears in the Feishu card.
-  - When both reach their deadlines, both execute in parallel and are rendered in a combined card.
+  - When only OpenCode Go reaches its deadline, only DeepSeek executes and only DeepSeek appears in the Feishu card.
+  - Multiple providers that reach their deadlines execute in parallel in one round. Codex + Antigravity keep the original two-column card; any card that includes OpenCode stacks one full-width block per provider.
 - **State Persistence & Migration**: Stored independently per provider under `~/Library/Application Support/quota-sentinel/` with automatic legacy migration.
 
 ## LaunchAgents
