@@ -175,8 +175,30 @@ legacy_backend_active() {
   [[ "$backend" == "legacy" ]]
 }
 
-# Guard for the legacy slot accessors. They are the retired backend's API:
-# legal before the cutover, an internal error afterwards. The manifest check
+# ---------------------------------------------------------------------------
+# COMPATIBILITY SURFACE
+#
+# The read_provider_*/write_provider_*/clear_provider_* functions below are
+# the LEGACY BACKEND's API, not dead code and not a second policy:
+#
+#   * they are the live read/write path for a deployment that has not run
+#     `cutover` yet, and the rollback target if one is reverted;
+#   * they are guarded by require_legacy_backend, so once JSON owns the
+#     state they refuse (loudly) instead of writing a retired backend;
+#   * no production scheduler path calls them any more — the scheduler
+#     decisions and transitions are Python, and
+#     tests/python-architecture-audit-regression.py (AR2) fails if one
+#     reappears;
+#   * the zsh regression suites still call them directly, deliberately:
+#     they are the black-box contract for the legacy backend and for the
+#     on-disk byte format.
+#
+# Deleting them would break both an un-cut-over deployment and that
+# contract, so their removal is a separate, reviewed step — not a
+# migration side effect.
+# ---------------------------------------------------------------------------
+
+# Legal before the cutover, an internal error afterwards. The manifest check
 # costs nothing on a deployment that was never cut over, so the legacy hot
 # path stays exactly as fast as it was.
 require_legacy_backend() {
@@ -1556,12 +1578,6 @@ prepare_provider_env() {
       print -r -- '{}' >"$OPENCODE_AGENT_DIR/settings.json"
       ;;
   esac
-}
-
-prepare_run() {
-  prepare_provider_env codex
-  prepare_provider_env antigravity
-  prepare_provider_env opencode
 }
 
 provider_normalized_quota_file() {
