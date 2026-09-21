@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local task orchestration for quota-sentinel.
+"""Local task orchestration for Quota-Sentinel.
 
 This module deliberately owns *when* the existing shell scheduler is invoked,
 not *how* provider deadlines are calculated.  The shell remains the sole
@@ -28,14 +28,11 @@ logger = logging.getLogger("task_orchestrator")
 DEFAULT_STATE_DIR = Path(
     os.environ.get(
         "QUOTA_SENTINEL_STATE_DIR",
-        "/Users/__USER__/Library/Application Support/quota-sentinel",
+        Path.home() / "Library/Application Support/Quota-Sentinel",
     )
 )
 DEFAULT_DB_PATH = DEFAULT_STATE_DIR / "task-orchestrator.sqlite3"
-DEFAULT_SCRIPT_PATH = Path(
-    "/Users/__USER__/code/quota-sentinel/"
-    "quota-sentinel.sh"
-)
+DEFAULT_SCRIPT_PATH = Path(__file__).resolve().parent / "quota-sentinel.sh"
 
 WATCHDOG_INTERVAL_SECONDS = 900
 DEADLINE_BACKOFF_SECONDS = 60

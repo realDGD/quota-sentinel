@@ -27,10 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger("feishu_listener")
 
 KEYCHAIN_ACCOUNT = "quota-sentinel"
-APP_ID_SERVICE = "com.example.quota-sentinel.feishu-app-id"
-APP_SECRET_SERVICE = "com.example.quota-sentinel.feishu-app-secret"
-USER_ID_SERVICE = "com.example.quota-sentinel.feishu-user-id"
-SCRIPT_PATH = "/Users/__USER__/code/quota-sentinel/quota-sentinel.sh"
+APP_ID_SERVICE = "quota-sentinel.feishu-app-id"
+APP_SECRET_SERVICE = "quota-sentinel.feishu-app-secret"
+USER_ID_SERVICE = "quota-sentinel.feishu-user-id"
+SCRIPT_PATH = str(Path(__file__).resolve().parent / "quota-sentinel.sh")
 LOG_DIR = Path(SCRIPT_PATH).parent / "logs"
 AUTHORIZED_USER_ID: str | None = None
 TASK_ORCHESTRATOR: TaskOrchestrator | None = None

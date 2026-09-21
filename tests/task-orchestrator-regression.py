@@ -352,7 +352,7 @@ class LaunchAgentConfigTest(unittest.TestCase):
             return plistlib.load(handle)
 
     def test_listener_hosts_the_task_orchestrator(self) -> None:
-        job = self.load_plist("com.example.quota-sentinel.feishu-listener.plist")
+        job = self.load_plist("quota-sentinel.feishu-listener.plist")
         environment = job.get("EnvironmentVariables", {})
         self.assertIsInstance(environment, dict)
         self.assertEqual(environment.get("QUOTA_SENTINEL_ORCHESTRATOR_ENABLED"), "1")
@@ -364,8 +364,8 @@ class LaunchAgentConfigTest(unittest.TestCase):
         self.assertGreaterEqual(CHECK_COMMAND_TIMEOUT_SECONDS, 2_000)
 
     def test_legacy_watchdog_and_timer_are_disabled_rollback_artifacts(self) -> None:
-        watchdog = self.load_plist("com.example.quota-sentinel.plist")
-        timer = self.load_plist("com.example.quota-sentinel.timer.plist")
+        watchdog = self.load_plist("quota-sentinel.plist")
+        timer = self.load_plist("quota-sentinel.timer.plist")
 
         self.assertTrue(watchdog.get("Disabled"))
         self.assertFalse(watchdog.get("RunAtLoad"))

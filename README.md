@@ -96,9 +96,9 @@ variable first, then from these macOS Keychain services under account
 
 | Credential | Environment override | Keychain service |
 | --- | --- | --- |
-| App ID | `FEISHU_APP_ID` | `com.example.quota-sentinel.feishu-app-id` |
-| App Secret | `FEISHU_APP_SECRET` | `com.example.quota-sentinel.feishu-app-secret` |
-| Recipient user ID | `FEISHU_USER_ID` | `com.example.quota-sentinel.feishu-user-id` |
+| App ID | `FEISHU_APP_ID` | `quota-sentinel.feishu-app-id` |
+| App Secret | `FEISHU_APP_SECRET` | `quota-sentinel.feishu-app-secret` |
+| Recipient user ID | `FEISHU_USER_ID` | `quota-sentinel.feishu-user-id` |
 
 `FEISHU_DRY_RUN=1` prints the message instead of calling the API.
 
@@ -107,11 +107,11 @@ read only by the Native quota tier:
 
 | Credential | Environment override | Keychain service |
 | --- | --- | --- |
-| OpenCode Go API key | `OPENCODE_API_KEY` | `com.example.quota-sentinel.opencode-go-api-key` |
+| OpenCode Go API key | `OPENCODE_API_KEY` | `quota-sentinel.opencode-go-api-key` |
 
 ```bash
 security add-generic-password -U -a quota-sentinel \
-  -s com.example.quota-sentinel.opencode-go-api-key -w '<OpenCode Go API key>'
+  -s quota-sentinel.opencode-go-api-key -w '<OpenCode Go API key>'
 ```
 
 Without it the provider still runs and still reports quota: the Native tier is
@@ -137,9 +137,9 @@ to the bot's 1:1 chat with you (私聊):
 
    ```bash
    security add-generic-password -U -a quota-sentinel \
-     -s com.example.quota-sentinel.feishu-app-id -w '<app_id>'
+     -s quota-sentinel.feishu-app-id -w '<app_id>'
    security add-generic-password -U -a quota-sentinel \
-     -s com.example.quota-sentinel.feishu-app-secret -w '<app_secret>'
+     -s quota-sentinel.feishu-app-secret -w '<app_secret>'
    ```
 
 5. Run `./quota-sentinel.sh discover-feishu-user <personal-email-or-mobile>`
@@ -209,7 +209,7 @@ authority, reset+4 calibration, provider-specific scheduler-write blocking,
 implemented exclusively by the shell scheduler and are unchanged.
 
 Task executions and post-run deadline snapshots are stored in
-`~/Library/Application Support/quota-sentinel/task-orchestrator.sqlite3`
+`~/Library/Application Support/Quota-Sentinel/task-orchestrator.sqlite3`
 using SQLite WAL mode. An interrupted `running` row is marked `interrupted` on
 restart. Feishu `/usage` is recorded in the same history and wakes the control
 loop to notice any Fresh calibration, but it still runs only the `usage`
@@ -377,15 +377,15 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
   - When only Codex reaches its deadline, only Luna executes and only Luna appears in the Feishu card.
   - When only OpenCode Go reaches its deadline, only DeepSeek executes and only DeepSeek appears in the Feishu card.
   - Multiple providers that reach their deadlines execute in parallel in one round. Codex + Antigravity keep the original two-column card; any card that includes OpenCode stacks one full-width block per provider.
-- **State Persistence & Migration**: Stored independently per provider under `~/Library/Application Support/quota-sentinel/` with automatic legacy migration.
+- **State Persistence & Migration**: Stored independently per provider under `~/Library/Application Support/Quota-Sentinel/` with automatic legacy migration.
 
 ## LaunchAgents
 
-- `com.example.quota-sentinel.feishu-listener.plist`: Active Feishu WebSocket
+- `quota-sentinel.feishu-listener.plist`: Active Feishu WebSocket
   listener and local task-orchestrator host.
-- `com.example.quota-sentinel.plist`: Disabled legacy 15-minute watchdog,
+- `quota-sentinel.plist`: Disabled legacy 15-minute watchdog,
   retained as a rollback artifact.
-- `com.example.quota-sentinel.timer.plist`: Disabled legacy precision timer,
+- `quota-sentinel.timer.plist`: Disabled legacy precision timer,
   retained as a rollback artifact.
 
 Only the listener/orchestrator LaunchAgent may be loaded during normal

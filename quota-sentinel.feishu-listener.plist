@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.quota-sentinel.feishu-listener</string>
+  <string>quota-sentinel.feishu-listener</string>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/uv</string>
     <string>run</string>
-    <string>/Users/__USER__/code/quota-sentinel/feishu_listener.py</string>
+    <string>/Users/__USER__/code/Quota-Sentinel/feishu_listener.py</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -30,8 +30,8 @@
   <key>Umask</key>
   <integer>63</integer>
   <key>StandardOutPath</key>
-  <string>/Users/__USER__/Library/Logs/quota-sentinel/feishu-listener.out.log</string>
+  <string>/Users/__USER__/Library/Logs/Quota-Sentinel/feishu-listener.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/__USER__/Library/Logs/quota-sentinel/feishu-listener.err.log</string>
+  <string>/Users/__USER__/Library/Logs/Quota-Sentinel/feishu-listener.err.log</string>
 </dict>
 </plist>

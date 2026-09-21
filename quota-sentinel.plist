@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.quota-sentinel</string>
+  <string>quota-sentinel</string>
   <key>ProgramArguments</key>
   <array>
-		<string>/Users/__USER__/code/quota-sentinel/quota-sentinel.sh</string>
+		<string>/Users/__USER__/code/Quota-Sentinel/quota-sentinel.sh</string>
 		<string>check</string>
 	</array>
 	<key>Disabled</key>

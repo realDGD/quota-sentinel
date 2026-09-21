@@ -37,3 +37,6 @@ venv/
 *.sqlite3
 *.db
 *.snapshot
+
+# Pre-publication audit notes (local reference only)
+PRE-PUBLISH-AUDIT.md
