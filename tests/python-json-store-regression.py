@@ -48,6 +48,7 @@ from quota_sentinel.state import (
     serialize_state,
     state_to_document,
     validate_document,
+    validate_state,
 )
 from quota_sentinel.state.json_store import JsonStateStore
 from quota_sentinel.state.store import _publish_atomic
@@ -209,6 +210,109 @@ class SchemaCodecTests(unittest.TestCase):
         with self.assertRaises(SchemaError) as ctx:
             validate_document({}, "antigravity")
         self.assertIn("antigravity", str(ctx.exception))
+
+
+class DomainValidationTests(unittest.TestCase):
+    """C6 (Phase 3A P2-1): the runtime domain boundary must be typed.
+
+    Future Python transitions will construct ProviderState directly, so a
+    lookalike reset_candidate (dict / tuple / SimpleNamespace duck-type)
+    or a mistyped field must fail as SchemaError/StateStoreError with
+    provider + field context — never a raw AttributeError, never
+    silently accepted, never after a filesystem write.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    LOOKALIKES = (
+        ("dict", {"reset_at": 1, "observed_at": 2}),
+        ("tuple", (1, 2)),
+        ("str", "1:2"),
+        ("int", 5),
+    )
+
+    def test_candidate_lookalikes_rejected_typed(self) -> None:
+        import types
+        cases = list(self.LOOKALIKES) + [
+            ("simplenamespace", types.SimpleNamespace(reset_at=1, observed_at=2)),
+            ("floaty", ResetCandidate(1.0, 2)),   # right class, wrong field types
+        ]
+        for label, bad in cases:
+            with self.subTest(candidate=label):
+                state = ProviderState(
+                    **{**ProviderState().__dict__, "reset_candidate": bad}
+                )
+                with self.assertRaises(SchemaError) as ctx:
+                    serialize_state(state, "codex")
+                message = str(ctx.exception)
+                self.assertIn("codex", message)
+                self.assertIn("reset_candidate", message)
+                # explicitly NOT the old raw AttributeError signature:
+                self.assertNotIsInstance(ctx.exception, AttributeError)
+
+    def test_field_type_policy_on_domain_object(self) -> None:
+        offenders = [
+            ("bool epoch", {"last_attempt_at": True}),
+            ("str epoch", {"next_due_at": "500"}),
+            ("negative epoch", {"reset_anchor": -1}),
+            ("int pending", {"retry_pending": 1}),
+            ("str pending", {"retry_pending": "yes"}),
+            ("empty window", {"last_triggered_window": ""}),
+            ("multiline window", {"last_triggered_window": "a\nb"}),
+            ("surrogate window", {"last_triggered_window": "\ud800"}),
+            ("non-str window", {"last_triggered_window": 5}),
+        ]
+        for label, patch in offenders:
+            with self.subTest(case=label):
+                state = ProviderState(**{**ProviderState().__dict__, **patch})
+                with self.assertRaises(SchemaError):
+                    validate_state(state, "codex")
+                with self.assertRaises(StateStoreError):
+                    serialize_state(state, "codex")
+
+    def test_non_provider_state_rejected(self) -> None:
+        with self.assertRaises(SchemaError):
+            validate_state({"next_due_at": 5}, "codex")        # dict, not model
+
+    def test_valid_states_pass(self) -> None:
+        for state in (ProviderState(), FULL_STATE):
+            self.assertIs(validate_state(state, "codex"), state)
+
+    def test_domain_failure_means_zero_mutation_in_both_stores(self) -> None:
+        # FileStateStore: garbage never reaches a temp file.
+        fs = FileStateStore(self.state_dir)
+        empty = fs.load("codex")
+        good = ProviderState(next_due_at=4242)
+        fs.commit("codex", empty, good)
+        marker = (self.state_dir / "codex-next-due-at").read_bytes()
+        bad_state = ProviderState(
+            **{**good.__dict__, "last_attempt_at": 10,
+               "reset_candidate": {"reset_at": 1, "observed_at": 2}}
+        )
+        with self.assertRaises(StateStoreError):
+            fs.commit("codex", fs.load("codex"), bad_state)
+        self.assertEqual(
+            (self.state_dir / "codex-next-due-at").read_bytes(), marker
+        )
+        # JsonStateStore: existing document stays complete and untouched.
+        js = JsonStateStore(self.state_dir)
+        self.assertEqual(
+            migrate_provider(self.state_dir, "codex"), ACTION_SEEDED
+        )
+        doc_bytes = (self.state_dir / "codex-state.json").read_bytes()
+        with self.assertRaises(StateStoreError):
+            js.commit("codex", js.load("codex"), bad_state)
+        self.assertEqual(
+            (self.state_dir / "codex-state.json").read_bytes(), doc_bytes
+        )
+        self.assertEqual(
+            [p.name for p in self.state_dir.iterdir() if ".tmp." in p.name], []
+        )
 
 
 class JsonStoreTests(unittest.TestCase):

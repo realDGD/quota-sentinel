@@ -13,6 +13,7 @@ from .schema import (
     serialize_state,
     state_to_document,
     validate_document,
+    validate_state,
 )
 from .store import (
     FileStateStore,
@@ -46,6 +47,7 @@ __all__ = [
     "state_to_document",
     "document_to_state",
     "validate_document",
+    "validate_state",
     "serialize_state",
     "parse_document_bytes",
     "deserialize_state",

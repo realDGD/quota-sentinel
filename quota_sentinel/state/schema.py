@@ -71,9 +71,107 @@ def _has_surrogate(text: str) -> bool:
     return any("\ud800" <= ch <= "\udfff" for ch in text)
 
 
+# ---------------------------------------------------------------------------
+# Shared field rules. BOTH the domain-object boundary (validate_state) and the
+# persisted-document boundary (validate_document) call these, so the two can
+# never drift into two independent rule sets (§8). Only the label differs:
+# callers pass "field X" (domain) or "document key X" (persisted).
+# ---------------------------------------------------------------------------
+def _check_epoch(provider: str, label: str, value: object) -> None:
+    if value is None:
+        return
+    if not _is_plain_int(value) or value < 0:
+        raise SchemaError(
+            f"{provider}: {label} must be null or a plain non-negative int, "
+            f"got {value!r}"
+        )
+
+
+def _check_bool(provider: str, label: str, value: object) -> None:
+    if type(value) is not bool:
+        raise SchemaError(
+            f"{provider}: {label} must be a plain bool, got {value!r}"
+        )
+
+
+def _check_window(provider: str, label: str, value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value:
+        raise SchemaError(
+            f"{provider}: {label} must be null or a non-empty string, "
+            f"got {value!r}"
+        )
+    if "\n" in value or "\r" in value:
+        raise SchemaError(
+            f"{provider}: {label} must be single-line (raw slot round-trip), "
+            f"got {value!r}"
+        )
+    if _has_surrogate(value):
+        raise SchemaError(
+            f"{provider}: {label} contains surrogates and is not UTF-8 "
+            "representable"
+        )
+
+
+def _check_candidate_times(
+    provider: str, reset_at: object, observed_at: object
+) -> None:
+    # Candidate halves are never null (a candidate either fully exists or is
+    # absent), unlike the standalone epoch slots.
+    for name, value in (("reset_at", reset_at), ("observed_at", observed_at)):
+        if not _is_plain_int(value) or value < 0:
+            raise SchemaError(
+                f"{provider}: {CANDIDATE_KEY}.{name} must be a plain "
+                f"non-negative int, got {value!r}"
+            )
+
+
+def validate_state(state: object, provider: str) -> ProviderState:
+    """Domain-object boundary: a runtime ProviderState, before it is ever
+    projected onto a document, must already be well-typed.
+
+    Future Python scheduler transitions will CONSTRUCT ProviderState
+    directly (not read it back through the file loader), so a lookalike
+    reset_candidate (dict / tuple / SimpleNamespace / str) or a mistyped
+    field must fail HERE with a typed SchemaError — never as a raw
+    AttributeError deep inside state_to_document, and never by duck-typing
+    its way into a persisted document. This is the Phase 3A P2-1 fix; the
+    file/JSON stores call it before touching the filesystem, so a bad
+    domain object means zero filesystem mutation.
+    """
+    if not isinstance(state, ProviderState):
+        raise SchemaError(
+            f"{provider}: state must be a ProviderState, "
+            f"got {type(state).__name__}"
+        )
+    for attr in (
+        "last_attempt_at",
+        "last_task_at",
+        "next_due_at",
+        "last_known_reset",
+        "reset_anchor",
+    ):
+        _check_epoch(provider, f"field {attr}", getattr(state, attr))
+    _check_bool(provider, f"field {PENDING_KEY}", state.retry_pending)
+    _check_window(provider, f"field {WINDOW_KEY}", state.last_triggered_window)
+    candidate = state.reset_candidate
+    if candidate is not None:
+        if not isinstance(candidate, ResetCandidate):
+            raise SchemaError(
+                f"{provider}: field {CANDIDATE_KEY} must be null or a "
+                f"ResetCandidate, got {type(candidate).__name__}"
+            )
+        _check_candidate_times(
+            provider, candidate.reset_at, candidate.observed_at
+        )
+    return state
+
+
 def state_to_document(state: ProviderState) -> Dict[str, Any]:
-    """Project the domain model onto a complete v1 document (validated
-    afterwards by validate_document, never trusted blindly)."""
+    """Project an ALREADY-validated domain model onto a complete v1
+    document. Callers must run validate_state() first; validate_document()
+    then re-checks the projected shape independently."""
     candidate = state.reset_candidate
     return {
         VERSION_KEY: SCHEMA_VERSION,
@@ -88,17 +186,6 @@ def state_to_document(state: ProviderState) -> Dict[str, Any]:
         if candidate is None
         else {"reset_at": candidate.reset_at, "observed_at": candidate.observed_at},
     }
-
-
-def _require_epoch(doc: Dict[str, Any], key: str, provider: str) -> None:
-    value = doc[key]
-    if value is None:
-        return
-    if not _is_plain_int(value) or value < 0:
-        raise SchemaError(
-            f"{provider}: document key {key} must be null or a plain "
-            f"non-negative int, got {value!r}"
-        )
 
 
 def validate_document(doc: object, provider: str) -> Dict[str, Any]:
@@ -132,31 +219,10 @@ def validate_document(doc: object, provider: str) -> Dict[str, Any]:
         )
 
     for key in EPOCH_KEYS:
-        _require_epoch(doc, key, provider)
+        _check_epoch(provider, f"document key {key}", doc[key])
 
-    if type(doc[PENDING_KEY]) is not bool:
-        raise SchemaError(
-            f"{provider}: document key {PENDING_KEY} must be a plain bool, "
-            f"got {doc[PENDING_KEY]!r}"
-        )
-
-    window = doc[WINDOW_KEY]
-    if window is not None:
-        if not isinstance(window, str) or not window:
-            raise SchemaError(
-                f"{provider}: document key {WINDOW_KEY} must be null or a "
-                f"non-empty string, got {window!r}"
-            )
-        if "\n" in window or "\r" in window:
-            raise SchemaError(
-                f"{provider}: document key {WINDOW_KEY} must be single-line "
-                f"(raw slot round-trip), got {window!r}"
-            )
-        if _has_surrogate(window):
-            raise SchemaError(
-                f"{provider}: document key {WINDOW_KEY} contains surrogates "
-                "and is not UTF-8 representable"
-            )
+    _check_bool(provider, f"document key {PENDING_KEY}", doc[PENDING_KEY])
+    _check_window(provider, f"document key {WINDOW_KEY}", doc[WINDOW_KEY])
 
     candidate = doc[CANDIDATE_KEY]
     if candidate is None:
@@ -172,13 +238,9 @@ def validate_document(doc: object, provider: str) -> Dict[str, Any]:
             f"{provider}: {CANDIDATE_KEY} must carry exactly "
             f"{sorted(CANDIDATE_SUBKEYS)}, got {sorted(candidate_keys)}"
         )
-    for subkey in ("reset_at", "observed_at"):
-        value = candidate[subkey]
-        if not _is_plain_int(value) or value < 0:
-            raise SchemaError(
-                f"{provider}: {CANDIDATE_KEY}.{subkey} must be a plain "
-                f"non-negative int, got {value!r}"
-            )
+    _check_candidate_times(
+        provider, candidate["reset_at"], candidate["observed_at"]
+    )
     return doc
 
 
@@ -203,10 +265,13 @@ def document_to_state(doc: Dict[str, Any], provider: str) -> ProviderState:
 def serialize_state(state: ProviderState, provider: str) -> bytes:
     """ProviderState → FINAL document bytes, fully preflighted.
 
-    validate → dumps → strict UTF-8 encode, all before returning. The
-    caller can publish the result without any further value-level
-    failure being possible.
+    Pipeline (single rule source, no drift):
+      validate_state → state_to_document → validate_document →
+      dumps → strict UTF-8 encode — all before returning. The caller can
+      publish the result without any further value-level failure being
+      possible.
     """
+    validate_state(state, provider)
     document = state_to_document(state)
     validate_document(document, provider)
     text = json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2)
