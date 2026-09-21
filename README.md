@@ -191,7 +191,10 @@ either entry point (parity is test-pinned):
 ```bash
 uv run quota-sentinel --help
 uv run python -m quota_sentinel --help
-uv run quota-sentinel next-due codex | dump codex | json-dump codex | migrate
+uv run quota-sentinel next-due codex
+uv run quota-sentinel dump codex
+uv run quota-sentinel json-dump codex
+uv run quota-sentinel migrate
 ```
 
 `migrate` is the explicit Phase 2/3A bootstrap that seeds shadow JSON

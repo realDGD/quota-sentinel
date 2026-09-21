@@ -383,6 +383,36 @@ test/sandbox-local only.
 this phase onward are thin runtime call-throughs; none was needed (class C
 stays system Python by choice, see table).
 
+Registry / index policy (Phase 3A.5 residual): the committed `uv.lock` is
+resolved exclusively from public PyPI (`pypi.org` /
+`files.pythonhosted.org`). **Invariant: committed dependency metadata must
+not depend on untracked user-local uv configuration** — a generator's
+personal `~/.config/uv/uv.toml` mirror must never ride into the repository
+(initial leak: user-local cernet-first index bled 330 registry lines into
+the lock; relocked with `uv lock --no-config`, package versions verified
+100% identical). User mirrors remain a legitimate *deployment-time*
+override (`UV_INDEX`, personal uv.toml) and are not project policy.
+`pyproject.toml` carries no `[tool.uv]` index config at all, which also
+keeps the class-B antigravity isolation (`--no-project --no-config`) free
+of any project registry influence. `tests/uv-project-regression.py` UV8
+scans the committed lock and pyproject for mirror/private-registry/user-
+path fingerprints and fails on drift.
+
+Build backend reproducibility: uv does NOT record `build-system.requires`
+in `uv.lock`, so an unconstrained `hatchling` would float a fresh resolve
+on every editable build. The pin `hatchling==1.32.4` in `[build-system]`
+is therefore load-bearing (UV9 pins its presence) — 1.32.4 is the version
+this project has actually built with, verified by a clean-room
+`uv sync --locked`. It stays a build dependency — never moved into runtime
+`dependencies`.
+
+Runtime sync contract: `--no-sync` means the daemon runtime never checks
+or repairs a stale environment (UV10 proves the byte-signature of `.venv`
+is stable across a runtime launch). Dependency change ⇒ the operator must
+re-run `./install-launchagents.sh` (which does `uv sync --locked`);
+runtime failing on a broken env is the designed fail-loud behavior, not a
+bug to self-heal around.
+
 ## Shell freeze
 
 `quota-sentinel.sh` is in functional freeze: bug fixes, compatibility fixes,
