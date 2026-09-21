@@ -11,7 +11,10 @@ dependencies = [
 quota-sentinel = "quota_sentinel.__main__:main"
 
 [build-system]
-requires = ["hatchling"]
+# Exact-pinned: uv does NOT record build-system requires in uv.lock, so
+# the editable build would otherwise float a fresh hatchling resolve on
+# every sync. 1.32.4 is the version the project has actually built with.
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 # Flat layout lives at the repository root alongside the shell/launchd
