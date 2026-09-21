@@ -2529,6 +2529,22 @@ validate_run_requirements() {
   feishu_ready || die "Feishu enterprise-app credentials are not configured"
 }
 
+# Phase 1 strangler seam: the status next-due display reads scheduler state
+# through the Python ProviderStateStore. The store mirrors the shell getters
+# slot for slot (enforced by tests/state-store-parity-regression.zsh), and
+# the shell getter stays the automatic fallback, so routing the read through
+# Python can never change what status reports. Scheduler decisions, the
+# hot paths and every write still live entirely in shell — by design.
+status_next_due() {
+  local provider="$1" value
+  if value="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN" -m quota_sentinel \
+        --state-dir "$STATE_DIR" next-due "$provider" 2>/dev/null)"; then
+    print -r -- "$value"
+    return 0
+  fi
+  read_provider_next_due "$provider"
+}
+
 status() {
   validate_run_requirements "${PROVIDERS[@]}"
   print -r -- "ready"
@@ -2545,7 +2561,7 @@ status() {
   fi
   local p p_due
   for p in "${PROVIDERS[@]}"; do
-    p_due="$(read_provider_next_due "$p" || true)"
+    p_due="$(status_next_due "$p" || true)"
     if [[ "$p_due" =~ ^[0-9]+$ ]]; then
       print -r -- "next $p run: $(format_reset_time "$p_due")"
     else

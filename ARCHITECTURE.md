@@ -105,10 +105,35 @@ regression case.**
 | 4 | `run` → initial `run_retry_burst` | as #1 | run |
 | 5 | `run` → post-run sync (`last_window` + sync) | last_window + as #3 | run + quota (quota busy → sync skipped, fallback stands) |
 | 6 | `usage` → opportunistic sync after collection | as #3 | quota (collect) → **released** → run (non-blocking; busy → skip) |
-| 7 | bootstrap `migrate_legacy_state` (main, state-touching commands only) | seeds absent per-provider files from legacy single-provider files | none — idempotent, writes only files that do not exist, legacy sources are never consumed |
+| 7 | bootstrap `migrate_legacy_state` (main, state-touching commands only) | seeds absent per-provider files from legacy single-provider files | none — via `seed_provider_state_file` (temp + `link(2)` EEXIST publish): creation is atomic and non-destructive, so a cold-start migration racing a live writer can only skip, never clobber; legacy sources are never consumed |
 
 Reads (`read_provider_*`) are pure: no lazy migration, no repair writes. The
 legacy upgrade runs once at command entry (#7).
+
+## Python state store (strangler Phase 1)
+
+`quota_sentinel.state` provides the first Python-side view of scheduler
+state:
+
+* `ProviderState` models the eight slots structurally (transient
+  `reset_candidate` as an explicit `None`-able value); models know no file
+  names.
+* `FileStateStore` reads and writes exactly the shell's per-provider file
+  layout, with semantics mirrored slot-for-slot from the shell getters
+  (unset on missing/unparsable, never "repair"). `load()` is pure;
+  `commit(old → new)` re-checks disk state first (a stale caller fails
+  loudly rather than clobbering), publishes only changed slots, deletes
+  only the transient slots, and keeps `next_due_at` last so every crash
+  prefix of a commit remains at-least-once directional.
+* Only ONE shell path is wired through it today: the `status` next-due
+  display (`status_next_due`), with the shell getter as automatic fallback.
+  Scheduler policy, quota logic and **every state write** still run in the
+  shell unchanged. Parity is enforced by
+  `tests/state-store-parity-regression.zsh`.
+
+Future phases (JSON backend, scheduler decisions, quota adapters) grow out
+of this seam one boundary at a time — see the migration order in the
+project log, never a big-bang rewrite.
 
 ## Shell freeze
 
