@@ -131,9 +131,12 @@ class AuthoritativeStateStore(ProviderStateStore):
         provider: str,
         old_state: ProviderState,
         new_state: ProviderState,
+        always_publish: Sequence[str] = (),
     ) -> BackendAuthority:
         before = self.authority()
-        self.store_for(before).commit(provider, old_state, new_state)
+        self.store_for(before).commit(
+            provider, old_state, new_state, always_publish
+        )
         after = self.authority()
         if before != after:
             raise ConcurrentAuthorityChangeError(

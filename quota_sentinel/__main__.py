@@ -40,6 +40,7 @@ from quota_sentinel.state import (
 )
 from quota_sentinel.state.json_store import JsonStateStore
 from quota_sentinel.state.migration import migrate_all
+from quota_sentinel.scheduler import cli as scheduler_cli
 
 
 def default_state_dir() -> Path:
@@ -160,13 +161,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("providers", nargs="*", default=None,
                          help="override the default provider roster")
+    # Scheduler-domain verbs (Phase 3C bridge). Registered from their own
+    # module so the parser stays a table of contents, not a second API.
+    scheduler_cli.register(sub)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     state_dir = args.state_dir or default_state_dir()
+    args.state_dir = state_dir
     try:
+        handler = getattr(args, "handler", None)
+        if handler is not None:
+            return handler(args)
         if args.command == "next-due":
             return run_next_due(AuthoritativeStateStore(state_dir), args.provider)
         if args.command == "state-dump":

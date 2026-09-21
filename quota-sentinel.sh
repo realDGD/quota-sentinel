@@ -30,6 +30,7 @@ readonly FEISHU_APP_SECRET_SERVICE="quota-sentinel.feishu-app-secret"
 readonly FEISHU_USER_ID_SERVICE="quota-sentinel.feishu-user-id"
 readonly OPENCODE_API_KEY_SERVICE="quota-sentinel.opencode-go-api-key"
 readonly STATE_DIR="${QUOTA_SENTINEL_STATE_DIR:-$HOME/Library/Application Support/Quota-Sentinel}"
+readonly AUTHORITY_MANIFEST="$STATE_DIR/backend-authority.json"
 readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"
 readonly QUOTA_LOCK_FILE="$STATE_DIR/quota.lock"
 readonly CODEXBAR_CODEX_CACHE_FILE="$STATE_DIR/codexbar-codex-last-success.json"
@@ -41,12 +42,13 @@ readonly PI_OPENCODE_SNAPSHOT_FILE="$STATE_DIR/pi-opencode-quota.json"
 # The single source of truth for provider enumeration: scheduler loops, run
 # defaults and requirement validation all derive from this list.
 readonly PROVIDERS=(codex antigravity opencode)
-readonly RUN_INTERVAL_SECONDS=18060              # 5 hours 01 minute
-readonly RESET_BUFFER_SECONDS=240                # 4 minutes after reset
-readonly RESET_NEAR_MOVEMENT_SECONDS=300         # immediate same-window jitter
-readonly RESET_CONFIRM_MIN_AGE_SECONDS=60        # independent observation gap
-readonly RESET_CONFIRM_MATCH_SECONDS=30          # stable timestamp tolerance
-readonly MAX_WINDOW_FUTURE_SECONDS=21600         # 6 hours
+# Scheduler policy constants (run interval, reset buffer, near-movement
+# tolerance, candidate confirmation window, retry limits and intervals) are
+# OWNED by quota_sentinel.scheduler.policy and fetched from it by
+# scheduler_policy_config() below. The names stay available here because the
+# regression suites and log lines use them, but this script holds no second
+# copy of a single value — a shell literal would be a second source of truth
+# for the scheduler's behavior.
 readonly QUOTA_LOCK_WAIT_SECONDS=20
 readonly TIMER_RECHECK_SECONDS=60
 # Hard execution bounds: a hung model task or quota probe must never hold the
@@ -64,16 +66,13 @@ readonly ANTIGRAVITY_NATIVE_TIMEOUT_SECONDS="${QUOTA_SENTINEL_ANTIGRAVITY_NATIVE
 readonly OPENCODE_CODEXBAR_TIMEOUT_SECONDS="${QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT:-20}"
 readonly OPENCODE_NATIVE_TIMEOUT_SECONDS="${QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT:-15}"
 readonly CODEXBAR_KILL_GRACE_SECONDS="${QUOTA_SENTINEL_CODEXBAR_KILL_GRACE:-10}"
-# Retry policy: a model task only counts when it truly succeeds. A due task is
-# marked retry_pending BEFORE its first attempt and repaid by bursts — the
+# Retry cadence: a model task only counts when it truly succeeds. A due task
+# records its debt BEFORE its first attempt and is repaid by bursts — the
 # initial burst makes at most INITIAL_ATTEMPT_LIMIT total attempts, later
-# watchdog bursts at most WATCHDOG_ATTEMPT_LIMIT total attempts, with a fixed
-# interval between attempts. WATCHDOG_RETRY_GAP_SECONDS spaces watchdog bursts
-# apart (780s < the 15-min launchd grid, so no grid point is ever skipped).
-readonly RETRY_INTERVAL_SECONDS="${QUOTA_SENTINEL_RETRY_INTERVAL:-30}"
-readonly INITIAL_ATTEMPT_LIMIT="${QUOTA_SENTINEL_INITIAL_ATTEMPTS:-3}"
-readonly WATCHDOG_ATTEMPT_LIMIT="${QUOTA_SENTINEL_WATCHDOG_ATTEMPTS:-2}"
-readonly WATCHDOG_RETRY_GAP_SECONDS="${QUOTA_SENTINEL_WATCHDOG_RETRY_GAP:-780}"
+# watchdog bursts at most WATCHDOG_ATTEMPT_LIMIT, with a fixed interval
+# between attempts. WATCHDOG_RETRY_GAP_SECONDS spaces watchdog bursts apart
+# (780s < the 15-min launchd grid, so no grid point is ever skipped). The
+# values come from the Python policy via scheduler_policy_config().
 readonly RUN_WITH_TIMEOUT_HELPER="$SCRIPT_DIR/run_with_timeout.py"
 readonly ANTIGRAVITY_USAGE_HELPER="$SCRIPT_DIR/antigravity_usage.py"
 readonly LOG_DIR="${QUOTA_SENTINEL_LOG_DIR:-$SCRIPT_DIR/logs}"
@@ -108,7 +107,153 @@ typeset -gi RUN_LOCK_HELD=0
 typeset -gi QUOTA_LOCK_HELD=0
 
 usage() {
-  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|discover-feishu-user|status]"
+  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|cutover|status]"
+}
+
+# ---------------------------------------------------------------------------
+# Scheduler domain bridge (Phase 3C).
+#
+# Every scheduler DECISION and every state TRANSITION lives in the Python
+# package; this script owns processes, locks, model execution, quota fetching
+# and notifications. Bridge calls run on the system interpreter because the
+# import graph they touch is stdlib-only (pinned by
+# tests/uv-project-regression.py), so a decision costs a few milliseconds
+# instead of a uv/project startup.
+# ---------------------------------------------------------------------------
+# Fetch the policy constants once per process. A failure here is fatal on
+# purpose: running the scheduler with missing policy values must never fall
+# back to a shell default that could silently disagree with Python.
+scheduler_policy_config() {
+  local line key out
+  out="$(scheduler_bridge scheduler-config)" || {
+    die "cannot read scheduler policy constants from quota_sentinel.scheduler"
+  }
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%=*}"
+    typeset -g "$key=${line#*=}"
+  done <<<"$out"
+  # Retry-policy sanity: refuse configs that would never attempt or would
+  # spin. Validated here, where the values arrive, so a bad override fails
+  # loudly at start-up instead of mid-burst.
+  [[ "$RETRY_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+    die "QUOTA_SENTINEL_RETRY_INTERVAL must be a positive integer"
+  [[ "$INITIAL_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
+    die "QUOTA_SENTINEL_INITIAL_ATTEMPTS must be a positive integer"
+  [[ "$WATCHDOG_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
+    die "QUOTA_SENTINEL_WATCHDOG_ATTEMPTS must be a positive integer"
+  [[ "$WATCHDOG_RETRY_GAP_SECONDS" =~ ^[0-9]+$ ]] ||
+    die "QUOTA_SENTINEL_WATCHDOG_RETRY_GAP must be a non-negative integer"
+  return 0
+}
+
+scheduler_bridge() {
+  # -S skips site processing (~25ms of the ~90ms start-up). The bridge's
+  # import graph is stdlib-only by contract, pinned by
+  # tests/uv-project-regression.py, so there is nothing for site to add.
+  PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN" -S -m quota_sentinel \
+    --state-dir "$STATE_DIR" "$@"
+}
+
+# The manifest is the single durable ownership fact, so its ABSENCE is the
+# exact and cheapest test for "this deployment was never cut over".
+authority_manifest_exists() { [[ -e "$AUTHORITY_MANIFEST" ]] }
+
+# Authoritative backend name, or non-zero when the durable fact cannot be
+# read (a loud condition, never a silent fall back to legacy).
+authoritative_backend() {
+  local out
+  out="$(scheduler_bridge authority)" || return 1
+  print -r -- "${${out%%$'\n'*}#backend=}"
+}
+
+# 0 = legacy owns the state, 1 = JSON owns the state, 2 = unreadable.
+legacy_backend_active() {
+  authority_manifest_exists || return 0
+  local backend
+  backend="$(authoritative_backend)" || return 2
+  [[ "$backend" == "legacy" ]]
+}
+
+# Guard for the legacy slot accessors. They are the retired backend's API:
+# legal before the cutover, an internal error afterwards. The manifest check
+# costs nothing on a deployment that was never cut over, so the legacy hot
+# path stays exactly as fast as it was.
+require_legacy_backend() {
+  local rc=0
+  legacy_backend_active || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) die "state backend authority is unreadable; refusing to touch legacy state" ;;
+    *) die "internal error: legacy state access reached while the JSON backend is authoritative" ;;
+  esac
+}
+
+# Render the bridge's machine output as the run log's existing lines. The
+# Python side emits explicit records precisely so the log keeps the shape it
+# had when the shell diffed the values itself:
+#
+#   provider=<name>          the provider the following lines belong to
+#   change<TAB>p<TAB>slot<TAB>old<TAB>new   one durable slot changed
+#   log=info|warn<TAB>text   what to log, at which level
+#
+# The prefix is the log line's subject ("sched", "success commit"), so the
+# caller no longer has to know the provider before the bridge answers.
+bridge_apply_log() {
+  local prefix="$1" out="$2" line current=""
+  [[ -n "$out" ]] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      provider=*) current="${line#provider=}" ;;
+      change$'\t'*) log_bridge_state_change "$line" ;;
+      log=info$'\t'*) log_info "${prefix}${current:+ $current}: ${line#log=info$'\t'}" ;;
+      log=warn$'\t'*) log_warn "${prefix}${current:+ $current}: ${line#log=warn$'\t'}" ;;
+    esac
+  done <<<"$out"
+  return 0
+}
+
+log_bridge_state_change() {
+  local provider slot old new
+  local IFS=$'\t'
+  read -r _ provider slot old new <<<"$1" || true
+  [[ -n "$provider" && -n "$slot" ]] || return 0
+  log_info "state: $provider $slot ${old:-<unset>} -> ${new:-<unset>}"
+}
+
+# Run a bridge verb, render its payload into the log, and return the verb's
+# own exit code (the shell's control flow depends on it).
+bridge_run_logged() {
+  local prefix="$1"
+  shift
+  local out rc=0
+  out="$(scheduler_bridge "$@")" || rc=$?
+  bridge_apply_log "$prefix" "$out"
+  return $rc
+}
+
+# Multi-provider transition call: ONE bridge process performing one whole
+# transition per provider (batching the process, never the transaction).
+# Usage: bridge_multi <log-prefix> <provider...> -- <verb> [verb args...]
+bridge_multi() {
+  local prefix="$1"
+  shift
+  local -a providers=()
+  local provider out rc=0
+  while (( $# > 0 )) && [[ "$1" != "--" ]]; do
+    providers+=("$1")
+    shift
+  done
+  shift
+  (( ${#providers[@]} > 0 )) || return 0
+  local -a flags=()
+  for provider in "${providers[@]}"; do
+    flags+=(--provider "$provider")
+  done
+  # The verb must come first: argparse resolves the subcommand before flags.
+  out="$(scheduler_bridge "$@" "${flags[@]}")" || rc=$?
+  bridge_apply_log "$prefix" "$out"
+  return $rc
 }
 
 die() {
@@ -140,16 +285,6 @@ log_error() { log_line ERROR "$*"; }
 # Durations use whole seconds via /bin/date; every timed operation logs
 # "what / outcome / elapsed". now_epoch is a tiny readability helper.
 now_epoch() { /bin/date '+%s'; }
-
-# Retry-policy sanity: refuse configs that would never attempt or would spin.
-[[ "$RETRY_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
-  die "QUOTA_SENTINEL_RETRY_INTERVAL must be a positive integer"
-[[ "$INITIAL_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
-  die "QUOTA_SENTINEL_INITIAL_ATTEMPTS must be a positive integer"
-[[ "$WATCHDOG_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]] ||
-  die "QUOTA_SENTINEL_WATCHDOG_ATTEMPTS must be a positive integer"
-[[ "$WATCHDOG_RETRY_GAP_SECONDS" =~ ^[0-9]+$ ]] ||
-  die "QUOTA_SENTINEL_WATCHDOG_RETRY_GAP must be a non-negative integer"
 
 cleanup() {
   release_run_lock
@@ -229,6 +364,7 @@ provider_last_window_file() {
 # pre-check and the publish. A crash can only leave a stray temp file —
 # never a truncated, mixed or clobbered state file.
 seed_provider_state_file() {
+  require_legacy_backend
   local file="$1" value="$2" temp_file
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -249,6 +385,9 @@ seed_provider_state_file() {
 # non-destructive: every value is published through seed_provider_state_file,
 # which can create a missing slot but never replaces an existing one.
 migrate_legacy_state() {
+  # Bootstrap-only legacy upgrade. Skipped once JSON owns the state: at that
+  # point the legacy files are a rollback artifact and must not be re-seeded.
+  legacy_backend_active || return 0
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
@@ -321,6 +460,7 @@ migrate_legacy_state() {
 }
 
 read_provider_next_due() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_next_due_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -342,6 +482,7 @@ atomic_write_state_file() {
 }
 
 write_provider_next_due() {
+  require_legacy_backend
   local provider="$1" epoch="$2" file old=""
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid next-run timestamp: $epoch"
   file="$(provider_next_due_file "$provider")"
@@ -353,6 +494,7 @@ write_provider_next_due() {
 }
 
 read_provider_last_task() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_last_task_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -362,6 +504,7 @@ read_provider_last_task() {
 }
 
 write_provider_last_task() {
+  require_legacy_backend
   local provider="$1" epoch="$2" file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-task timestamp: $epoch"
   file="$(provider_last_task_file "$provider")"
@@ -369,6 +512,7 @@ write_provider_last_task() {
 }
 
 read_provider_last_attempt() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_last_attempt_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -378,6 +522,7 @@ read_provider_last_attempt() {
 }
 
 write_provider_last_attempt() {
+  require_legacy_backend
   local provider="$1" epoch="$2" file old=""
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-attempt timestamp: $epoch"
   file="$(provider_last_attempt_file "$provider")"
@@ -391,6 +536,7 @@ write_provider_last_attempt() {
 # retry_pending=1 means "this provider owes one due-but-unsucceeded task".
 # A missing file reads as 0, so the state only exists once a debt is recorded.
 read_provider_retry_pending() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_retry_pending_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -400,6 +546,7 @@ read_provider_retry_pending() {
 }
 
 write_provider_retry_pending() {
+  require_legacy_backend
   local provider="$1" value="$2" file old="0"
   [[ "$value" == "0" || "$value" == "1" ]] || die "Invalid retry-pending value: $value"
   file="$(provider_retry_pending_file "$provider")"
@@ -413,6 +560,7 @@ write_provider_retry_pending() {
 }
 
 read_provider_last_known_reset() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_last_known_reset_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -422,6 +570,7 @@ read_provider_last_known_reset() {
 }
 
 write_provider_last_known_reset() {
+  require_legacy_backend
   local provider="$1" epoch="$2" file
   [[ "$epoch" =~ ^[0-9]+$ ]] || die "Invalid last-known-reset timestamp: $epoch"
   file="$(provider_last_known_reset_file "$provider")"
@@ -432,6 +581,7 @@ write_provider_last_known_reset() {
 # the current trusted reset. Candidate and observation time share one atomic
 # file so a crash can only lose a promotion opportunity, never create one.
 read_provider_reset_candidate() {
+  require_legacy_backend
   local provider="$1" file value reset observed
   file="$(provider_reset_candidate_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -443,6 +593,7 @@ read_provider_reset_candidate() {
 }
 
 write_provider_reset_candidate() {
+  require_legacy_backend
   local provider="$1" reset="$2" observed="$3" file
   [[ "$reset" =~ ^[0-9]+$ ]] || die "Invalid reset candidate timestamp: $reset"
   [[ "$observed" =~ ^[0-9]+$ ]] || die "Invalid reset candidate observation: $observed"
@@ -451,6 +602,7 @@ write_provider_reset_candidate() {
 }
 
 clear_provider_reset_candidate() {
+  require_legacy_backend
   local provider="$1" file
   file="$(provider_reset_candidate_file "$provider")"
   rm -f -- "$file"
@@ -460,6 +612,7 @@ clear_provider_reset_candidate() {
 # Unlike last-known-reset-at it does not follow accepted near-window jitter, so
 # many individually small later movements cannot accumulate into starvation.
 read_provider_reset_anchor() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_reset_anchor_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -469,6 +622,7 @@ read_provider_reset_anchor() {
 }
 
 write_provider_reset_anchor() {
+  require_legacy_backend
   local provider="$1" reset="$2" file
   [[ "$reset" =~ ^[0-9]+$ ]] || die "Invalid reset anchor timestamp: $reset"
   file="$(provider_reset_anchor_file "$provider")"
@@ -476,12 +630,14 @@ write_provider_reset_anchor() {
 }
 
 clear_provider_reset_anchor() {
+  require_legacy_backend
   local provider="$1" file
   file="$(provider_reset_anchor_file "$provider")"
   rm -f -- "$file"
 }
 
 read_provider_last_window() {
+  require_legacy_backend
   local provider="$1" file value
   file="$(provider_last_window_file "$provider")"
   [[ -r "$file" ]] || return 1
@@ -491,6 +647,7 @@ read_provider_last_window() {
 }
 
 write_provider_last_window() {
+  require_legacy_backend
   local provider="$1" window_id="$2" file
   [[ -n "$window_id" ]] || return 1
   file="$(provider_last_window_file "$provider")"
@@ -498,21 +655,10 @@ write_provider_last_window() {
 }
 
 read_next_due() {
-  local provider p_due min_due=""
-  # Providers with an unpaid debt (retry_pending=1) are deliberately excluded:
-  # their stale past deadline would spin the precision timer once per second.
-  # Debt repayment is driven by the watchdog retry phase instead.
-  for provider in "${PROVIDERS[@]}"; do
-    provider_is_pending "$provider" && continue
-    p_due="$(read_provider_next_due "$provider" || true)"
-    [[ "$p_due" =~ ^[0-9]+$ ]] || continue
-    if [[ ! "$min_due" =~ ^[0-9]+$ ]] || (( p_due < min_due )); then
-      min_due="$p_due"
-    fi
-  done
-
-  [[ "$min_due" =~ ^[0-9]+$ ]] || return 1
-  print -r -- "$min_due"
+  # Rosters, pending-debt exclusion and the minimum are Python policy; this
+  # verb keeps the historical contract (prints the epoch, rc 1 when nothing
+  # is schedulable).
+  scheduler_bridge scheduler-next-due "${PROVIDERS[@]}"
 }
 
 acquire_run_lock() {
@@ -2570,43 +2716,26 @@ status() {
   done
 }
 
-five_hour_reset_at() {
-  "$JQ_BIN" -r '.fiveHour.resetAt // empty' "$1" 2>/dev/null
-}
-
 provider_fallback_due() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}" last_task
-  last_task="$(read_provider_last_task "$provider" || true)"
-  if [[ "$last_task" =~ ^[0-9]+$ ]]; then
-    print -r -- $(( last_task + RUN_INTERVAL_SECONDS ))
-  else
-    print -r -- "$now"
-  fi
-}
-
-# A trusted reset from before the most recent successful task belongs to the
-# previous generation. A reset still in the future after that success remains
-# authoritative (for example when a task was manually run before the window
-# reset), so last_task alone is never used as a hard reset ceiling.
-provider_current_trusted_reset() {
-  local provider="$1" trusted_reset last_task
-  trusted_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
-  [[ "$trusted_reset" =~ ^[0-9]+$ ]] || return 1
-  last_task="$(read_provider_last_task "$provider" 2>/dev/null || true)"
-  if [[ "$last_task" =~ ^[0-9]+$ ]] && (( trusted_reset <= last_task )); then
-    return 1
-  fi
-  print -r -- "$trusted_reset"
+  # No-quota deadline policy lives in quota_sentinel.scheduler.policy; this is
+  # the thin adapter that keeps the historical signature for callers/tests.
+  local provider="$1" now="${2:-$(/bin/date '+%s')}"
+  scheduler_bridge scheduler-fallback-due --provider "$provider" --now "$now"
 }
 
 valid_provider_reset_at() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file reset_at
+  # The Fresh trust gate and the plausibility window are policy, not plumbing:
+  # a stale probe must not be able to produce a reset here.
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file fresh=0 rc=0 out
   quota_file="$(provider_normalized_quota_file "$provider")"
-  provider_quota_is_fresh "$provider" || return 1
-  reset_at="$(five_hour_reset_at "$quota_file")"
-  [[ "$reset_at" =~ ^[0-9]+$ ]] || return 1
-  (( reset_at > now && reset_at <= now + MAX_WINDOW_FUTURE_SECONDS )) || return 1
-  print -r -- "$reset_at"
+  if provider_quota_is_fresh "$provider"; then fresh=1; fi
+  out="$(scheduler_bridge scheduler-valid-reset --provider "$provider" \
+        --now "$now" --quota-file "$quota_file" --fresh "$fresh")" || rc=$?
+  case "$rc" in
+    0) print -r -- "$out"; return 0 ;;
+    1) return 1 ;;
+    *) die "scheduler-valid-reset failed for $provider (rc=$rc)" ;;
+  esac
 }
 
 # Report why a provider's scheduler is temporarily write-blocked. A reset-based
@@ -2614,30 +2743,14 @@ valid_provider_reset_at() {
 # four-minute buffer matures. Pending/overdue task debt remains blocked until a
 # verified success writes a new fallback deadline.
 provider_schedule_block_reason() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}"
-  local pending next_due scheduled_reset
-
-  pending="$(read_provider_retry_pending "$provider" 2>/dev/null || true)"
-  if [[ "$pending" == "1" ]]; then
-    print -r -- "retry-pending"
-    return 0
-  fi
-
-  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
-  [[ "$next_due" =~ ^[0-9]+$ ]] || return 1
-  if (( now >= next_due )); then
-    print -r -- "overdue"
-    return 0
-  fi
-
-  scheduled_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
-  if [[ "$scheduled_reset" =~ ^[0-9]+$ ]] &&
-     (( next_due == scheduled_reset + RESET_BUFFER_SECONDS && now >= scheduled_reset )); then
-    print -r -- "reset-buffer"
-    return 0
-  fi
-
-  return 1
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" out rc=0
+  out="$(scheduler_bridge scheduler-block-reason --provider "$provider" \
+        --now "$now")" || rc=$?
+  case "$rc" in
+    0) print -r -- "$out"; return 0 ;;
+    1) return 1 ;;
+    *) die "scheduler-block-reason failed for $provider (rc=$rc)" ;;
+  esac
 }
 
 # Synchronize the scheduler only from live Native/CodexBar data. Before the
@@ -2645,122 +2758,36 @@ provider_schedule_block_reason() {
 # reset + four minutes. From that reset until successful execution, scheduler
 # writes are blocked; /usage may still display its newly fetched quota.
 sync_provider_deadline_from_quota() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}"
-  local reset_at reset_due block_reason existing_reset existing_due trusted_reset anchor_reset
-  local candidate_record candidate_reset candidate_observed candidate_delta confirmed_reset
-
-  reset_at="$(valid_provider_reset_at "$provider" "$now")" || return 1
-  reset_due=$(( reset_at + RESET_BUFFER_SECONDS ))
-
-  block_reason="$(provider_schedule_block_reason "$provider" "$now" 2>/dev/null || true)"
-  if [[ -n "$block_reason" ]]; then
-    existing_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
-    existing_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
-    log_info "sched $provider: sync blocked reason=$block_reason reset=$existing_reset due=$existing_due now=$now; fresh candidate reset=$reset_at deferred until success"
-    return 2
-  fi
-
-  trusted_reset="$(provider_current_trusted_reset "$provider" 2>/dev/null || true)"
-  if [[ ! "$trusted_reset" =~ ^[0-9]+$ ]]; then
-    # The first Fresh reset of a generation establishes a finite anchor. It may
-    # legitimately be much later than last_task+5h, as observed live when a
-    # provider window remained fixed after a manual early task.
-    clear_provider_reset_candidate "$provider"
-    clear_provider_reset_anchor "$provider"
-    write_provider_last_known_reset "$provider" "$reset_at"
-    write_provider_next_due "$provider" "$reset_due"
-    write_provider_reset_anchor "$provider" "$reset_at"
-    log_info "sched $provider: fresh reset established generation anchor reset=$reset_at due=$reset_due"
-    return 0
-  fi
-
-  # Upgrade an in-flight generation without changing its current deadline.
-  # Persisting the existing trusted reset (not the new observation) is what
-  # closes the cumulative-near-movement loophole on the very first probe after
-  # deployment.
-  anchor_reset="$(read_provider_reset_anchor "$provider" 2>/dev/null || true)"
-  if [[ ! "$anchor_reset" =~ ^[0-9]+$ ]]; then
-    anchor_reset="$trusted_reset"
-    write_provider_reset_anchor "$provider" "$anchor_reset"
-    log_info "sched $provider: reset anchor initialized from trusted reset=$anchor_reset"
-  fi
-
-  # Earlier resets and movement near the generation anchor preserve the
-  # original dynamic policy. The anchor deliberately does not move here:
-  # otherwise repeated +N-second observations could each remain under the
-  # tolerance while cumulatively pushing the deadline forever.
-  if (( reset_at <= anchor_reset + RESET_NEAR_MOVEMENT_SECONDS )); then
-    clear_provider_reset_candidate "$provider"
-    write_provider_last_known_reset "$provider" "$reset_at"
-    write_provider_next_due "$provider" "$reset_due"
-    return 0
-  fi
-
-  candidate_record="$(read_provider_reset_candidate "$provider" 2>/dev/null || true)"
-  if [[ "$candidate_record" == *:* ]]; then
-    candidate_reset="${candidate_record%%:*}"
-    candidate_observed="${candidate_record##*:}"
-    candidate_delta=$(( reset_at - candidate_reset ))
-    (( candidate_delta < 0 )) && candidate_delta=$(( -candidate_delta ))
-    if (( candidate_delta <= RESET_CONFIRM_MATCH_SECONDS &&
-          now - candidate_observed >= RESET_CONFIRM_MIN_AGE_SECONDS )); then
-      # Use the later of the two stable observations so the four-minute safety
-      # buffer is never shortened by small timestamp jitter.
-      confirmed_reset="$candidate_reset"
-      (( reset_at > confirmed_reset )) && confirmed_reset="$reset_at"
-      clear_provider_reset_candidate "$provider"
-      write_provider_last_known_reset "$provider" "$confirmed_reset"
-      write_provider_next_due "$provider" $(( confirmed_reset + RESET_BUFFER_SECONDS ))
-      write_provider_reset_anchor "$provider" "$confirmed_reset"
-      log_info "sched $provider: far reset promoted after stable observations old_reset=$trusted_reset new_reset=$confirmed_reset first_seen=$candidate_observed confirmed_at=$now"
-      return 0
-    fi
-    if (( candidate_delta <= RESET_CONFIRM_MATCH_SECONDS )); then
-      log_info "sched $provider: far reset awaiting independent confirmation trusted_reset=$trusted_reset candidate=$candidate_reset observed_at=$candidate_observed now=$now"
-      return 3
-    fi
-  fi
-
-  write_provider_reset_candidate "$provider" "$reset_at" "$now"
-  existing_reset="$(read_provider_last_known_reset "$provider" 2>/dev/null || true)"
-  existing_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
-  log_warn "sched $provider: far-later fresh reset deferred trusted_reset=$trusted_reset candidate=$reset_at observed_at=$now; preserved reset=$existing_reset due=$existing_due"
-  return 3
+  # Deadline calibration policy (anchor, near-movement tolerance, candidate
+  # confirmation, blocking) is Python; the return codes are unchanged so the
+  # callers that branch on them keep working: 0 applied, 1 no valid quota,
+  # 2 blocked, 3 deferred for independent confirmation.
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file fresh=0 rc=0
+  quota_file="$(provider_normalized_quota_file "$provider")"
+  if provider_quota_is_fresh "$provider"; then fresh=1; fi
+  bridge_run_logged "sched" \
+    scheduler-sync --provider "$provider" --now "$now" \
+    --quota-file "$quota_file" --fresh "$fresh" || rc=$?
+  case "$rc" in
+    0|1|2|3) return $rc ;;
+    *) die "scheduler-sync failed for $provider (rc=$rc)" ;;
+  esac
 }
 
 evaluate_provider() {
-  local provider="$1" now="${2:-$(/bin/date '+%s')}" next_due fallback_due fresh_candidate
-
-  # A matured deadline is a committed debt: this cycle's fresh quota may not
-  # cancel it (P1-1 starvation, reproduced live 2026-08-30 18:11 — a probe at
-  # due time re-anchored the window and pushed 18:11:35 to 23:15:38). Decide
-  # BEFORE any fresh sync and leave next_due_at untouched on this path.
-  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
-  if [[ "$next_due" =~ ^[0-9]+$ ]] && (( now >= next_due )); then
-    fresh_candidate="$(five_hour_reset_at "$(provider_normalized_quota_file "$provider")" 2>/dev/null || true)"
-    if [[ "$fresh_candidate" =~ ^[0-9]+$ ]]; then
-      log_info "sched $provider: matured debt due=$next_due; fresh candidate reset=$fresh_candidate ignored this round"
-    else
-      log_info "sched $provider: matured debt due=$next_due; no valid fresh data"
-    fi
-    return 0
-  fi
-
-  # Not due: Fresh may recalibrate earlier or later only before the scheduled
-  # reset. The shared sync layer blocks writes during its four-minute buffer.
-  # Stale cache/snapshots never write it.
-  sync_provider_deadline_from_quota "$provider" "$now" || true
-
-  # With no usable deadline, seed the no-quota fallback from the last real task.
-  # An existing deadline is preserved exactly when the current probe is stale.
-  next_due="$(read_provider_next_due "$provider" 2>/dev/null || true)"
-  if [[ ! "$next_due" =~ ^[0-9]+$ ]]; then
-    fallback_due="$(provider_fallback_due "$provider" "$now")"
-    next_due="$fallback_due"
-    write_provider_next_due "$provider" "$next_due"
-  fi
-
-  (( now >= next_due ))
+  # The due decision, including matured-debt protection and the no-quota
+  # fallback seed, is one Python transition. rc 0 = due, 1 = wait.
+  local provider="$1" now="${2:-$(/bin/date '+%s')}" quota_file fresh=0 rc=0
+  quota_file="$(provider_normalized_quota_file "$provider")"
+  if provider_quota_is_fresh "$provider"; then fresh=1; fi
+  bridge_run_logged "sched" \
+    scheduler-decide --provider "$provider" --now "$now" \
+    --quota-file "$quota_file" --fresh "$fresh" || rc=$?
+  case "$rc" in
+    0|1) return $rc ;;
+    2) return 2 ;;   # unpaid debt: skipped, never evaluated
+    *) die "scheduler-decide failed for $provider (rc=$rc)" ;;
+  esac
 }
 
 # The single success-commit path: only a verified model success may run this.
@@ -2775,18 +2802,27 @@ provider_final_result() {
 
 commit_provider_success() {
   local provider="$1" success_at="$2"
-  write_provider_last_attempt "$provider" "$success_at"
-  write_provider_last_task "$provider" "$success_at"
-  write_provider_retry_pending "$provider" 0
-  clear_provider_reset_candidate "$provider"
-  clear_provider_reset_anchor "$provider"
-  write_provider_next_due "$provider" $(( success_at + RUN_INTERVAL_SECONDS ))
-  case "$provider" in
-    codex) CODEX_RUN_RESULT="发送成功" ;;
-    antigravity) ANTIGRAVITY_RUN_RESULT="发送成功" ;;
-    opencode) OPENCODE_RUN_RESULT="发送成功" ;;
-  esac
-  log_info "success commit $provider: last_task=$success_at fallback_due=$(( success_at + RUN_INTERVAL_SECONDS )) retry_pending=0"
+  commit_provider_success_batch "$success_at" "$provider"
+}
+
+# One success commit per provider, in one bridge process. Postponing a
+# success commit to the end of the round it belongs to is safe in the only
+# direction that matters: a crash before it leaves retry_pending=1, so the
+# task is re-attempted (duplicate execution) rather than silently lost.
+commit_provider_success_batch() {
+  local success_at="$1"
+  shift
+  local provider
+  (( $# > 0 )) || return 0
+  for provider in "$@"; do
+    case "$provider" in
+      codex) CODEX_RUN_RESULT="发送成功" ;;
+      antigravity) ANTIGRAVITY_RUN_RESULT="发送成功" ;;
+      opencode) OPENCODE_RUN_RESULT="发送成功" ;;
+    esac
+  done
+  bridge_multi "success commit" "$@" -- \
+    scheduler-commit-success --now "$success_at"
 }
 
 # One retry burst for the given providers: parallel rounds, fixed interval
@@ -2808,19 +2844,27 @@ run_retry_burst() {
     # run_selected_providers and watchdog repayment via check_schedule) get
     # valid stdout/stderr targets before the first attempt launches.
     prepare_provider_env "$provider"
-    write_provider_retry_pending "$provider" 1
     case "$provider" in
       codex) CODEX_RUN_RESULT="发送失败" ;;
       antigravity) ANTIGRAVITY_RUN_RESULT="发送失败" ;;
       opencode) OPENCODE_RUN_RESULT="发送失败" ;;
     esac
   done
+  # Debt and first attempt are ONE transition per provider: retry_pending is
+  # raised before any model process exists, so a crash mid-burst still owes
+  # the task. Batched into one bridge process, never into one transaction.
+  bridge_multi "state" "${attempted[@]}" -- \
+    scheduler-begin-attempt --now "$(now_epoch)"
 
   for (( round = 1; ${#remain[@]} > 0 && round <= limit; round++ )); do
     round_providers=("${remain[@]}")
     pids=()
+    if (( round > 1 )); then
+      # Round 1's attempt stamp is part of begin-attempt above.
+      bridge_multi "state" "${round_providers[@]}" -- \
+        scheduler-record-attempt --now "$(now_epoch)"
+    fi
     for provider in "${round_providers[@]}"; do
-      write_provider_last_attempt "$provider" "$(now_epoch)"
       log_info "run: attempt $provider phase=$phase round=$round/$limit"
       case "$provider" in
         codex) run_codex "$phase" "$round" "$limit" & pids+=($!) ;;
@@ -2830,15 +2874,23 @@ run_retry_burst() {
     done
 
     still=()
+    succeeded=()
     widx=1
     for provider in "${round_providers[@]}"; do
       if wait "${pids[$widx]}"; then
-        commit_provider_success "$provider" "$(now_epoch)"
+        succeeded+=("$provider")
       else
         still+=("$provider")
       fi
       (( widx += 1 ))
     done
+    # Commit the round's successes together. Postponing a success commit to
+    # the end of the round it belongs to is safe in the only direction that
+    # matters: a crash before it leaves retry_pending=1, so the task is
+    # re-attempted (duplicate execution) rather than silently lost.
+    if (( ${#succeeded[@]} > 0 )); then
+      commit_provider_success_batch "$(now_epoch)" "${succeeded[@]}"
+    fi
     remain=("${still[@]}")
 
     if (( ${#remain[@]} > 0 && round < limit )); then
@@ -2920,6 +2972,23 @@ run_and_reschedule_selected() {
   acquire_run_lock || die "Another model run is already in progress"
   run_selected_providers "${targets[@]}"
   release_run_lock
+}
+
+# The explicit production ownership switch (Phase 3B). Operator-invoked, and
+# the installer calls it between booting the old agent out and booting the new
+# one in, so no legacy writer can still be alive while ownership moves. It is
+# deliberately NOT implicit in check/wait/run/usage: switching the source of
+# truth is an upgrade step, not a side effect of a scheduler tick.
+run_cutover() {
+  acquire_run_lock || die "Another model run is already in progress"
+  local rc=0
+  # Seed the pre-cutover legacy slots first (idempotent, non-destructive);
+  # they are the source of truth this cutover reads.
+  migrate_legacy_state
+  bridge_run_logged "cutover" scheduler-ensure-authority || rc=$?
+  release_run_lock
+  (( rc == 0 )) || die "state backend cutover failed (rc=$rc)"
+  print -r -- "state backend cutover complete"
 }
 
 usage_busy_message() {
@@ -3057,18 +3126,20 @@ send_test_card() {
 }
 
 provider_is_pending() {
-  [[ "$(read_provider_retry_pending "$1" 2>/dev/null || true)" == "1" ]]
+  local out
+  out="$(scheduler_bridge scheduler-pending --provider "$1")"
+  [[ -n "$out" ]]
 }
 
 # A pending debt is repaid by watchdog bursts, spaced at least
 # WATCHDOG_RETRY_GAP_SECONDS apart (measured from the last real attempt) so
-# the launchd 15-min grid and the precision timer never double-burst.
+# the launchd 15-min grid and the precision timer never double-burst. Both
+# the gap rule and the pending test are Python policy.
 provider_retry_due() {
-  provider_is_pending "$1" || return 1
-  local last_attempt
-  last_attempt="$(read_provider_last_attempt "$1" 2>/dev/null || true)"
-  [[ "$last_attempt" =~ ^[0-9]+$ ]] || return 0
-  (( $(now_epoch) - last_attempt >= WATCHDOG_RETRY_GAP_SECONDS ))
+  local out
+  out="$(scheduler_bridge scheduler-retry-due --provider "$1" \
+        --now "$(now_epoch)" --gap "$WATCHDOG_RETRY_GAP_SECONDS")"
+  [[ -n "$out" ]]
 }
 
 check_schedule() {
@@ -3084,9 +3155,11 @@ check_schedule() {
   # Phase A — repay pending debts first: a fresh probe must never push a
   # due-but-unsucceeded task into the future. No quota lock is held here, so
   # 30s retry sleeps and model timeouts never block /usage.
-  for p in "${PROVIDERS[@]}"; do
-    provider_retry_due "$p" && retry_pending_list+=("$p")
-  done
+  local retry_out
+  retry_out="$(scheduler_bridge scheduler-retry-due \
+    --now "$(now_epoch)" --gap "$WATCHDOG_RETRY_GAP_SECONDS" "${PROVIDERS[@]}")"
+  retry_pending_list=("${(@f)retry_out}")
+  retry_pending_list=("${retry_pending_list[@]:#}")
   if (( ${#retry_pending_list[@]} > 0 )); then
     log_info "check: pending debt on ${retry_pending_list[*]}; watchdog retry burst first"
     # || true: burst exhaustion (rc=1) is an expected outcome — the debt
@@ -3108,15 +3181,39 @@ check_schedule() {
   # Phase C — evaluate only providers without a pending debt. A provider that
   # already went through this round's watchdog burst (success OR failure) is
   # never re-evaluated as due in the same check.
+  # One bridge process decides the whole roster: each provider still gets its
+  # own transition and its own commit, but the interpreter start-up is paid
+  # once instead of once per provider.
+  local -a decide_flags=()
   for p in "${PROVIDERS[@]}"; do
-    if provider_is_pending "$p"; then
-      log_info "check: $p pending (debt unpaid); normal due evaluation skipped"
-      continue
-    fi
-    if evaluate_provider "$p"; then
-      due_providers+=("$p")
+    decide_flags+=(--quota "$p=$(provider_normalized_quota_file "$p")")
+    if provider_quota_is_fresh "$p"; then
+      decide_flags+=(--fresh "$p=1")
+    else
+      decide_flags+=(--fresh "$p=0")
     fi
   done
+  local decide_out line current="" verdict="" decide_rc=0
+  decide_out="$(scheduler_bridge scheduler-decide-all --now "$(now_epoch)" \
+    "${decide_flags[@]}" "${PROVIDERS[@]}")" || decide_rc=$?
+  (( decide_rc == 0 )) || die "scheduler-decide-all failed (rc=$decide_rc)"
+  while IFS= read -r line; do
+    case "$line" in
+      provider=*) current="${line#provider=}"; verdict="" ;;
+      decision=*) verdict="${line#decision=}" ;;
+      change$'\t'*) log_bridge_state_change "$line" ;;
+      log=info$'\t'*) log_info "sched $current: ${line#log=info$'\t'}" ;;
+      log=warn$'\t'*) log_warn "sched $current: ${line#log=warn$'\t'}" ;;
+      end=*)
+        case "$verdict" in
+          run-now) due_providers+=("$current") ;;
+          wait) : ;;
+          retry) log_info "check: $current pending (debt unpaid); normal due evaluation skipped" ;;
+          *) die "scheduler-decide-all returned an unknown verdict for $current: $verdict" ;;
+        esac
+        ;;
+    esac
+  done <<<"$decide_out"
   release_quota_lock
 
   elapsed=$(( $(now_epoch) - t0 ))
@@ -3131,10 +3228,16 @@ check_schedule() {
 
   if (( ${#due_providers[@]} == 0 )); then
     due_log=""
-    for p in "${PROVIDERS[@]}"; do
-      p_due="$(read_provider_next_due "$p" 2>/dev/null || true)"
-      due_log+="$p next $(format_reset_time "$p_due" 2>/dev/null || echo unset), "
-    done
+    local deadlines_out
+    deadlines_out="$(scheduler_bridge scheduler-deadlines "${PROVIDERS[@]}")"
+    while IFS=$'\t' read -r p p_due; do
+      [[ -n "$p" ]] || continue
+      if [[ "$p_due" =~ ^[0-9]+$ ]]; then
+        due_log+="$p next $(format_reset_time "$p_due" 2>/dev/null || echo unset), "
+      else
+        due_log+="$p next unset, "
+      fi
+    done <<<"$deadlines_out"
     log_info "check: nothing due (${due_log%, }) (${elapsed}s)"
     release_run_lock
     return 0
@@ -3212,6 +3315,9 @@ main() {
     usage)
       send_usage_notification
       ;;
+    cutover)
+      run_cutover
+      ;;
     card-preview)
       card_preview "${2:-both}"
       ;;
@@ -3236,6 +3342,8 @@ main() {
       ;;
   esac
 }
+
+scheduler_policy_config
 
 if [[ "${PI_SOURCE_ONLY:-0}" != "1" ]]; then
   trap cleanup EXIT

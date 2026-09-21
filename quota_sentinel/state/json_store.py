@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from .models import ProviderState
 from .schema import (
@@ -115,7 +115,11 @@ class JsonStateStore(ProviderStateStore):
         provider: str,
         old_state: ProviderState,
         new_state: ProviderState,
+        always_publish: Sequence[str] = (),
     ) -> None:
+        # ``always_publish`` is accepted for interface parity and needs no
+        # handling here: a v1 document materializes EVERY slot on every
+        # publish, so a forced slot is already satisfied by any write.
         # Phase 1: defensive stale detection only — NOT concurrency.
         current = self.load(provider)  # loud on missing/corrupt
         if current != old_state:

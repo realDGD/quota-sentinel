@@ -58,7 +58,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Optional
+from typing import Callable, List, NamedTuple, Optional, Sequence
 
 from .models import ProviderState, ResetCandidate
 
@@ -266,6 +266,7 @@ class ProviderStateStore:
         provider: str,
         old_state: ProviderState,
         new_state: ProviderState,
+        always_publish: Sequence[str] = (),
     ) -> None:
         raise NotImplementedError
 
@@ -313,6 +314,7 @@ class FileStateStore(ProviderStateStore):
         provider: str,
         old_state: ProviderState,
         new_state: ProviderState,
+        always_publish: Sequence[str] = (),
     ) -> None:
         # ---- phase 1: detect already-stale input (defensive only) ----
         current = self.load(provider)
@@ -323,11 +325,24 @@ class FileStateStore(ProviderStateStore):
 
         # ---- phase 2: build + validate the ENTIRE mutation plan -------
         # No filesystem mutation may happen in this phase.
+        #
+        # ``always_publish`` names slots a transition must MATERIALIZE even
+        # when the value is unchanged. It exists because "the file is absent"
+        # and "the file says 0" are the same business state but not the same
+        # on-disk state: the shell's success commit always left an explicit
+        # retry_pending=0 behind, and silently stopping that would change a
+        # durable contract that operators and regressions both read.
+        forced = set(always_publish)
+        unknown = sorted(forced - {attribute for attribute, _, _ in SLOTS})
+        if unknown:
+            raise StateStoreError(
+                f"{provider}: cannot force-publish unknown slots {unknown}"
+            )
         plan: List[_Mutation] = []
         for attribute, suffix, codec in SLOTS:
             old_value = getattr(old_state, attribute)
             new_value = getattr(new_state, attribute)
-            if old_value == new_value:
+            if old_value == new_value and attribute not in forced:
                 continue
             path = self._path(provider, suffix)  # validates name; pure
             if new_value is None:

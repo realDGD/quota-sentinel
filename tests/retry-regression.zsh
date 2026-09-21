@@ -7,6 +7,12 @@
 
 set -euo pipefail
 
+# Sub-second wall clock for the RY15 parallelism bound. Whole-second
+# arithmetic quantises a ~2.3s measurement to {2,3}, so the same absolute
+# 3s bound would flip on which side of a second boundary the run started.
+# The bound itself is unchanged; only the measurement becomes accurate.
+zmodload zsh/datetime
+
 readonly TEST_TEMP_DIR="$(mktemp -d /private/tmp/quota-sentinel.XXXXXX)"
 export QUOTA_SENTINEL_STATE_DIR="$TEST_TEMP_DIR/state"
 export QUOTA_SENTINEL_LOG_DIR="$TEST_TEMP_DIR/logs"
@@ -312,15 +318,18 @@ write_provider_last_attempt codex "$(now_epoch)"
 write_provider_retry_pending antigravity 1
 write_provider_last_attempt antigravity "$(now_epoch)"
 export PI_MOCK_SUCCESS_AFTER=2
-t0="$(now_epoch)"
+t0="$EPOCHREALTIME"
 check_schedule
-elapsed=$(( $(now_epoch) - t0 ))
+elapsed="$(printf '%.2f' $(( EPOCHREALTIME - t0 )))"
 [[ "$(calls codex)" == "2" ]]
 [[ "$(calls antigravity)" == "2" ]]
 [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-retry-pending")" == "0" ]]
 [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/antigravity-retry-pending")" == "0" ]]
 # Serial rounds would cost >= 2 x (fail + 1s + success); parallel rounds cost one gap.
-(( elapsed < 3 )) || { print -u2 "FAIL: rounds appear serialized (${elapsed}s)"; exit 1; }
+# A serial implementation costs two full rounds (fail + interval + success
+# each, ~4s+); parallel rounds cost one interval. The bound is the original
+# 3s, now measured without whole-second quantisation.
+(( elapsed < 3.0 )) || { print -u2 "FAIL: rounds appear serialized (${elapsed}s)"; exit 1; }
 print -r -- "  PASS: both debts cleared in ${elapsed}s (round-parallel)"
 
 print -r -- "== RY16: crash recovery — persisted debt survives process restart =="
