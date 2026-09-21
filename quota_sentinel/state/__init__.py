@@ -20,12 +20,23 @@ from .store import (
     StaleStateError,
     StateStoreError,
 )
+from .json_store import JsonStateStore, document_filename
+from .migration import (
+    ACTION_EXISTS,
+    ACTION_SEEDED,
+    DEFAULT_PROVIDERS,
+    migrate_all,
+    migrate_provider,
+    seed_document_if_absent,
+)
 
 __all__ = [
     "ProviderState",
     "ResetCandidate",
     "ProviderStateStore",
     "FileStateStore",
+    "JsonStateStore",
+    "document_filename",
     "StateStoreError",
     "StaleStateError",
     "SCHEMA_VERSION",
@@ -38,4 +49,10 @@ __all__ = [
     "serialize_state",
     "parse_document_bytes",
     "deserialize_state",
+    "DEFAULT_PROVIDERS",
+    "migrate_provider",
+    "migrate_all",
+    "seed_document_if_absent",
+    "ACTION_SEEDED",
+    "ACTION_EXISTS",
 ]

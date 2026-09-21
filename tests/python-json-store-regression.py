@@ -28,6 +28,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quota_sentinel.state import (
+    ACTION_EXISTS,
+    ACTION_SEEDED,
+    DEFAULT_PROVIDERS,
     SCHEMA_VERSION,
     DocumentCorruptError,
     FileStateStore,
@@ -39,7 +42,9 @@ from quota_sentinel.state import (
     StateStoreError,
     deserialize_state,
     document_to_state,
+    migrate_provider,
     parse_document_bytes,
+    seed_document_if_absent,
     serialize_state,
     state_to_document,
     validate_document,
@@ -391,6 +396,204 @@ class JsonStoreTests(unittest.TestCase):
             with self.subTest(provider=bad):
                 with self.assertRaises(ValueError):
                     self.store.document_path(bad)
+
+
+class MigrationTests(unittest.TestCase):
+    """M1-M6: legacy per-slot files -> shadow v1 JSON documents."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+        self.file_store = FileStateStore(self.state_dir)
+        self.json_store = JsonStateStore(self.state_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_legacy(self, provider: str, **values) -> ProviderState:
+        """Write legacy slot files through FileStateStore's own writers."""
+        desired = ProviderState(**values)
+        current = self.file_store.load(provider)
+        self.file_store.commit(provider, current, desired)
+        return desired
+
+    # M1 + M6: legacy -> JSON, explicit nulls, transient candidate.
+    def test_m1_full_migration(self) -> None:
+        legacy = self._write_legacy(
+            "codex",
+            last_attempt_at=100, last_task_at=90, next_due_at=500,
+            retry_pending=True, last_known_reset=80,
+            last_triggered_window="80", reset_anchor=80,
+            reset_candidate=ResetCandidate(900, 850),
+        )
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
+        doc = json.loads((self.state_dir / "codex-state.json").read_text())
+        self.assertEqual(set(doc), set(EXPECTED_KEYS))       # all materialized
+        self.assertEqual(doc["reset_candidate"],
+                         {"reset_at": 900, "observed_at": 850})
+        self.assertEqual(self.json_store.load("codex"), legacy)
+        self.assertEqual(self.file_store.load("codex"), legacy)
+
+    def test_m6_absent_candidate_becomes_explicit_null(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
+        doc = json.loads((self.state_dir / "codex-state.json").read_text())
+        self.assertIn("reset_candidate", doc)
+        self.assertIsNone(doc["reset_candidate"])
+
+    def test_m1_fresh_empty_dir_seeds_all_null_document(self) -> None:
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
+        self.assertEqual(self.json_store.load("codex"), ProviderState())
+        self.assertEqual(
+            oct(os.stat(self.state_dir).st_mode & 0o777), "0o700"
+        )
+        self.assertEqual(
+            oct(os.stat(self.state_dir / "codex-state.json").st_mode & 0o777),
+            "0o600",
+        )
+
+    # M2: idempotent — reruns change nothing.
+    def test_m2_idempotent(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        first = migrate_provider(self.state_dir, "codex")
+        bytes1 = (self.state_dir / "codex-state.json").read_bytes()
+        second = migrate_provider(self.state_dir, "codex")
+        bytes2 = (self.state_dir / "codex-state.json").read_bytes()
+        self.assertEqual(first, ACTION_SEEDED)
+        self.assertEqual(second, ACTION_EXISTS)
+        self.assertEqual(bytes1, bytes2)
+
+    # M3: JSON wins forever — legacy drift after seeding must not touch it.
+    def test_m3_json_exists_legacy_never_overwrites(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
+        sentinel = ProviderState(next_due_at=424242, last_known_reset=1)
+        self.json_store.commit("codex", self.json_store.load("codex"), sentinel)
+        legacy_before = self.file_store.load("codex")
+        # legacy still says 500; JSON now says 424242; migration must skip.
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_EXISTS)
+        self.assertEqual(self.json_store.load("codex"), sentinel)
+        self.assertEqual(self.file_store.load("codex"), legacy_before)
+
+    # M4: migration racing a JSON writer — seed-if-absent, no clobber.
+    def test_m4_migration_race_seed_never_clobbers(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        payload = serialize_state(self.file_store.load("codex"), "codex")
+        path = self.json_store.document_path("codex")
+        # Pre-publish a current writer's document, THEN let migration try:
+        winner = ProviderState(next_due_at=31337)
+        _publish_atomic(path, serialize_state(winner, "codex"))
+        results = [migrate_provider(self.state_dir, "codex"),
+                   seed_document_if_absent(path, payload)]
+        self.assertEqual(results[0], ACTION_EXISTS)
+        self.assertFalse(results[1])
+        self.assertEqual(self.json_store.load("codex"), winner)
+
+    def test_m4b_concurrent_migrations_exactly_one_seed(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        barrier = threading.Barrier(4)
+        outcomes = []
+
+        def worker() -> None:
+            barrier.wait()
+            outcomes.append(migrate_provider(self.state_dir, "codex"))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(outcomes.count(ACTION_SEEDED), 1)
+        self.assertEqual(outcomes.count(ACTION_EXISTS), 3)
+        # exactly one complete document, valid, temp debris cleaned:
+        self.assertEqual(self.json_store.load("codex").next_due_at, 500)
+        self.assertEqual(
+            [p.name for p in (self.state_dir).iterdir() if ".tmp." in p.name], []
+        )
+
+    # M5: corrupt legacy values travel through FileStateStore semantics
+    # (unset), are NOT repaired, and the raw legacy files stay intact.
+    def test_m5_legacy_garbage_not_repaired(self) -> None:
+        (self.state_dir.parent.mkdir(exist_ok=True))
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "codex-next-due-at").write_text("garbage\n")
+        (self.state_dir / "codex-last-task-at").write_text("77\n")
+        self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
+        doc = json.loads((self.state_dir / "codex-state.json").read_text())
+        self.assertIsNone(doc["next_due_at"])       # garbage → unset, as interpreted
+        self.assertEqual(doc["last_task_at"], 77)
+        # raw legacy file untouched — no repair, no consumption:
+        self.assertEqual(
+            (self.state_dir / "codex-next-due-at").read_text(), "garbage\n"
+        )
+
+    # Legacy files never deleted/moved by migration (rollback guarantee).
+    def test_legacy_files_survive(self) -> None:
+        self._write_legacy("codex", next_due_at=500, retry_pending=True)
+        before = sorted(p.name for p in self.state_dir.iterdir())
+        migrate_provider(self.state_dir, "codex")
+        after = sorted(p.name for p in self.state_dir.iterdir())
+        self.assertEqual(after, sorted(before + ["codex-state.json"]))
+
+
+class BackendParityTests(unittest.TestCase):
+    """§32: for every canonical shape a writer can produce,
+    FileStateStore.load == JsonStateStore.load after migration."""
+
+    SHAPES = {
+        "all-unset": {},
+        "fresh-generation": dict(
+            last_attempt_at=100, last_task_at=100, next_due_at=600,
+            last_known_reset=500, reset_anchor=500,
+        ),
+        "debt-pending": dict(
+            last_attempt_at=200, next_due_at=50, retry_pending=True,
+        ),
+        "success-committed": dict(
+            last_attempt_at=300, last_task_at=300, next_due_at=21060,
+            retry_pending=False, last_known_reset=250,
+        ),
+        "candidate-in-flight": dict(
+            last_attempt_at=400, last_task_at=400, next_due_at=900,
+            last_known_reset=700, reset_anchor=700,
+            reset_candidate=ResetCandidate(1400, 1200),
+        ),
+        "zero-epochs": dict(next_due_at=0, last_known_reset=0, reset_anchor=0),
+        "window-epoch": dict(next_due_at=800, last_triggered_window="777"),
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_backend_loads_agree_after_migration(self) -> None:
+        file_store = FileStateStore(self.state_dir)
+        json_store = JsonStateStore(self.state_dir)
+        for provider in DEFAULT_PROVIDERS:
+            for shape, values in self.SHAPES.items():
+                with self.subTest(provider=provider, shape=shape):
+                    desired = ProviderState(**values)
+                    file_store.commit(
+                        provider, file_store.load(provider), desired
+                    )
+                    migrate_provider(self.state_dir, provider)
+                    self.assertEqual(
+                        json_store.load(provider), file_store.load(provider)
+                    )
+                    # and the JSON text carries every key explicitly:
+                    doc = json.loads(
+                        (self.state_dir / f"{provider}-state.json").read_text()
+                    )
+                    self.assertEqual(set(doc), set(EXPECTED_KEYS))
+                # next shape: remove the shadow doc so migration re-seeds
+                (self.state_dir / f"{provider}-state.json").unlink()
+                for p in self.state_dir.glob(f"{provider}-*"):
+                    if p.name.endswith("-state.json"):
+                        continue
+                    p.unlink()
 
 
 if __name__ == "__main__":

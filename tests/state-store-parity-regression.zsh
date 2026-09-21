@@ -190,4 +190,50 @@ printf '\377\376\n' >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
 rm -f "$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
 print -r -- "SP4 (non-canonical-value registry: agreements + 2 registered divergences): passed"
 
+# ---- SP5: shadow JSON via real shell writes (Phase 2 e2e) ---------------------
+# Start from a clean dir so only shell writers populate legacy state.
+rm -rf "$QUOTA_SENTINEL_STATE_DIR"
+mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+write_provider_last_task codex 1234
+write_provider_next_due codex 5678
+write_provider_retry_pending codex 1
+write_provider_reset_candidate codex 9000 8800
+
+# default roster must equal the shell's PROVIDERS array (line-by-line):
+mig="$(py migrate)"
+for p in "${PROVIDERS[@]}"; do
+  print -r -- "$mig" | grep -Fqx "${p}: seeded" || {
+    print -u2 -- "SP5: migrate missing exact line '${p}: seeded' in: $mig"; exit 1;
+  }
+done
+(( $(print -r -- "$mig" | sed -n '$=') == ${#PROVIDERS[@]} )) || {
+  print -u2 -- "SP5: migrate line count != roster size"; exit 1;
+}
+
+# json-dump == slot-file dump for shell-written state:
+json_dump="$(py json-dump codex)"
+slot_dump="$(py dump codex)"
+[[ "$json_dump" == "$slot_dump" ]] || {
+  print -u2 -- "SP5: backend dumps differ:
+$json_dump
+---
+$slot_dump"; exit 1;
+}
+
+# legacy files untouched (rollback path), JSON complete-materialized:
+[[ -e "$QUOTA_SENTINEL_STATE_DIR/codex-last-task-at" ]]
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-state.json" | "$JQ_BIN" -r 'keys|length')" == "9" ]]
+
+# idempotency: second migrate skips, JSON wins over later legacy drift:
+py migrate | grep -q '^codex: json-exists$'
+write_provider_next_due codex 7000
+[[ "$(py json-dump codex | awk -F= '/^next_due_at/{print $2}')" == "5678" ]]
+[[ "$(read_provider_next_due codex)" == "7000" ]]
+# a provider with empty legacy gets an explicitly all-null shadow document:
+py json-dump opencode | grep -q '^next_due_at=unset$'
+
+# no temp debris anywhere:
+[[ -z "$(find "$QUOTA_SENTINEL_STATE_DIR" -name '*tmp*' -print -quit)" ]]
+print -r -- "SP5 (shadow JSON via real shell writes: parity, idempotent, json-wins): passed"
+
 print -r -- "state-store parity regression: all cases passed"
