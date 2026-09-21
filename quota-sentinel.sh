@@ -219,25 +219,51 @@ provider_last_window_file() {
   print -r -- "$STATE_DIR/${provider}-last-triggered-window"
 }
 
+# Seed-if-absent primitive for the bootstrap legacy migration ONLY.
+# Unlike the transition writer (atomic_write_state_file publishes with mv -f
+# and must overwrite), a legacy seed may create state but must NEVER replace
+# what the scheduler already wrote: a concurrent cold start could otherwise
+# clobber fresh state with a stale legacy value. Publishing a completed temp
+# file with link(2) is one atomic step that fails with EEXIST when the target
+# exists, so there is no check-then-write window between the caller's
+# pre-check and the publish. A crash can only leave a stray temp file —
+# never a truncated, mixed or clobbered state file.
+seed_provider_state_file() {
+  local file="$1" value="$2" temp_file
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  temp_file="${file}.tmp.$$.seed"
+  print -r -- "$value" >"$temp_file" || return 1
+  chmod 600 "$temp_file"
+  if ! ln "$temp_file" "$file" 2>/dev/null && [[ ! -e "$file" ]]; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  rm -f -- "$temp_file"
+  return 0
+}
+
 # Bootstrap-only legacy upgrade step. Runs exactly once from main() for every
 # dispatching command; read_provider_* getters stay side-effect free so state
-# reads can rely on a pure load/commit boundary. Idempotent: every write is
-# guarded by the target file being absent.
+# reads can rely on a pure load/commit boundary. Idempotent and
+# non-destructive: every value is published through seed_provider_state_file,
+# which can create a missing slot but never replaces an existing one.
 migrate_legacy_state() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  # Migrate last-task-at. Writes go through the shared atomic writer so a
-  # crash mid-migration can never leave a truncated state file behind.
+  # Migrate last-task-at. Values are published through the seed-if-absent
+  # primitive so a crash mid-migration can never leave a truncated state
+  # file behind, and a concurrent scheduler write is never clobbered.
   if [[ -r "$STATE_DIR/last-task-at" ]]; then
     local legacy_task
     legacy_task="$(<"$STATE_DIR/last-task-at")"
     if [[ "$legacy_task" =~ ^[0-9]+$ ]]; then
       if [[ ! -r "$STATE_DIR/codex-last-task-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/codex-last-task-at" "$legacy_task"
+        seed_provider_state_file "$STATE_DIR/codex-last-task-at" "$legacy_task"
       fi
       if [[ ! -r "$STATE_DIR/antigravity-last-task-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/antigravity-last-task-at" "$legacy_task"
+        seed_provider_state_file "$STATE_DIR/antigravity-last-task-at" "$legacy_task"
       fi
     fi
   fi
@@ -248,10 +274,10 @@ migrate_legacy_state() {
     legacy_due="$(<"$STATE_DIR/next-due-at")"
     if [[ "$legacy_due" =~ ^[0-9]+$ ]]; then
       if [[ ! -r "$STATE_DIR/codex-next-due-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/codex-next-due-at" "$legacy_due"
+        seed_provider_state_file "$STATE_DIR/codex-next-due-at" "$legacy_due"
       fi
       if [[ ! -r "$STATE_DIR/antigravity-next-due-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/antigravity-next-due-at" "$legacy_due"
+        seed_provider_state_file "$STATE_DIR/antigravity-next-due-at" "$legacy_due"
       fi
     fi
   fi
@@ -264,16 +290,16 @@ migrate_legacy_state() {
       local c_win="${legacy_window%%:*}"
       local a_win="${legacy_window##*:}"
       if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-triggered-window" ]]; then
-        atomic_write_state_file "$STATE_DIR/codex-last-triggered-window" "$c_win"
+        seed_provider_state_file "$STATE_DIR/codex-last-triggered-window" "$c_win"
       fi
       if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-triggered-window" ]]; then
-        atomic_write_state_file "$STATE_DIR/antigravity-last-triggered-window" "$a_win"
+        seed_provider_state_file "$STATE_DIR/antigravity-last-triggered-window" "$a_win"
       fi
       if [[ -n "$c_win" && ! -r "$STATE_DIR/codex-last-known-reset-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/codex-last-known-reset-at" "$c_win"
+        seed_provider_state_file "$STATE_DIR/codex-last-known-reset-at" "$c_win"
       fi
       if [[ -n "$a_win" && ! -r "$STATE_DIR/antigravity-last-known-reset-at" ]]; then
-        atomic_write_state_file "$STATE_DIR/antigravity-last-known-reset-at" "$a_win"
+        seed_provider_state_file "$STATE_DIR/antigravity-last-known-reset-at" "$a_win"
       fi
     fi
   fi
@@ -288,7 +314,7 @@ migrate_legacy_state() {
       [[ -r "$STATE_DIR/${m_provider}-last-task-at" ]]; then
       m_task="$(<"$STATE_DIR/${m_provider}-last-task-at")"
       if [[ "$m_task" =~ ^[0-9]+$ ]]; then
-        atomic_write_state_file "$STATE_DIR/${m_provider}-last-attempt-at" "$m_task"
+        seed_provider_state_file "$STATE_DIR/${m_provider}-last-attempt-at" "$m_task"
       fi
     fi
   done

@@ -10,6 +10,9 @@
 #              directions (promotes after confirmation age, holds before it)
 #   SU-M1..M3  migration is idempotent, getters are pure, and the CLI
 #              command-entry bootstrap still migrates a legacy deployment
+#   SU-M4      bootstrap seeding is non-destructive: it can never replace
+#              current scheduler state, even when a cold-start migration
+#              races a live state writer (TOCTOU stress)
 # Fully isolated: temp state, temp logs, stubbed probes and Feishu transport.
 # Zero real model calls, zero quota consumption, zero network.
 
@@ -135,6 +138,59 @@ m1_sig2="$(state_signature)"
 [[ -r "$QUOTA_SENTINEL_STATE_DIR/last-task-at" ]]   # legacy sources never consumed
 [[ "$(read_provider_last_task codex)" == "987654" ]]
 print -r -- "SU-M1 (migration idempotent, legacy sources kept): passed"
+
+# ---- SU-M4: bootstrap seeding is non-destructive (no check-then-clobber) -----
+# Primitive contract: create-if-absent is one atomic act (link(2)/EEXIST),
+# so a cold-start migration racing a live scheduler writer can only skip —
+# it can never replace published state.
+seed_provider_state_file "$QUOTA_SENTINEL_STATE_DIR/m4-seeded" "seedy"
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/m4-seeded")" == "seedy" ]]
+[[ "$(stat -f '%Lp' "$QUOTA_SENTINEL_STATE_DIR/m4-seeded")" == "600" ]]
+seed_provider_state_file "$QUOTA_SENTINEL_STATE_DIR/m4-seeded" "other"
+[[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/m4-seeded")" == "seedy" ]]   # existing kept
+rm -f "$QUOTA_SENTINEL_STATE_DIR/m4-seeded"
+# Migration-level: current state published before bootstrap must survive.
+reset_state
+print -r -- "987654" >"$QUOTA_SENTINEL_STATE_DIR/last-task-at"
+print -r -- "876543" >"$QUOTA_SENTINEL_STATE_DIR/next-due-at"
+write_provider_next_due codex 4242424242
+write_provider_next_due opencode 4242424242
+migrate_legacy_state
+[[ "$(read_provider_next_due codex)" == "4242424242" ]]   # legacy value rejected
+[[ "$(read_provider_next_due opencode)" == "4242424242" ]]
+[[ "$(read_provider_last_task codex)" == "987654" ]]      # absent slot still seeded
+# Concurrency stress with a deterministic tail: four cold-start migrations run
+# while a writer publishes current state (mv -f path) until the very end.
+# Whatever the interleaving wins mid-run, the FINAL state after quiescence
+# must be the writer's latest value and must be stable under another
+# migration — and no temp debris may survive the races.
+m4_writer_stop="$TEST_TEMP_DIR/m4.stop"
+zsh -c '
+  source "$1"
+  i=0
+  while [[ ! -e "$2" ]]; do
+    (( i += 1 ))
+    write_provider_next_due codex $(( 3000000 + i ))
+    "$SLEEP_BIN" 0.02
+  done
+' _ "$SCRIPT_PATH" "$m4_writer_stop" &
+m4_writer=$!
+for _ in {1..4}; do
+  zsh -c 'source "$1"; migrate_legacy_state' _ "$SCRIPT_PATH" &
+done
+"$SLEEP_BIN" 1.2
+for _ in {1..4}; do
+  zsh -c 'source "$1"; migrate_legacy_state' _ "$SCRIPT_PATH"
+done
+: >"$m4_writer_stop"
+wait "$m4_writer"
+m4_final="$(read_provider_next_due codex)"
+[[ "$m4_final" =~ ^[0-9]+$ ]] && (( m4_final > 3000000 ))   # writer value intact
+m4_after_sig="$(state_signature)"
+migrate_legacy_state
+[[ "$(state_signature)" == "$m4_after_sig" ]]               # never clobbered later
+[[ -z "$(find "$QUOTA_SENTINEL_STATE_DIR" -name '*tmp*' -print -quit)" ]]
+print -r -- "SU-M4 (seeding atomic, non-destructive under race): passed"
 
 # ---- SU-M2: every getter is pure (no writes, no mtime churn) -----------------
 m2_before="$(state_signature)"
