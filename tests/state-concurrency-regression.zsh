@@ -265,7 +265,18 @@ print -r -- "SU-U3 (trace: quota released before single non-blocking run attempt
 reset_state
 zsh -c '
   source "$1"
-  acquire_run_lock || exit 3
+  # Bounded retry, not a single attempt: the contract under test is that the
+  # two sides SERIALIZE, not that the writer wins a start-up race against a
+  # foreground /usage loop that is already running. Sourcing now costs one
+  # scheduler-policy bridge call, so a lone non-blocking attempt can lose to
+  # the first /usage iteration; retrying keeps the interleaving (and makes it
+  # denser, since every one of the 15 commits still happens).
+  tries=0
+  until acquire_run_lock; do
+    (( tries += 1 ))
+    (( tries < 200 )) || exit 3
+    "$SLEEP_BIN" 0.05
+  done
   i=0
   while (( i < 15 )); do
     (( i += 1 ))
