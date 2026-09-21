@@ -39,6 +39,7 @@ from quota_sentinel.scheduler.observation import (
 )
 from quota_sentinel.state import (
     AuthoritativeStateStore,
+    initialize_authority,
     BackendAuthority,
     BACKEND_JSON,
     FileStateStore,
@@ -608,6 +609,9 @@ class TransitionPersistenceTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name) / "state"
         self.state_dir.mkdir(parents=True)
+        # Every deployment has an authority manifest; the runtime requires
+        # it, so a throwaway legacy deployment gets one too.
+        initialize_authority(self.state_dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -639,6 +643,7 @@ class TransitionPersistenceTests(unittest.TestCase):
         # Start over on the JSON backend with the same input state.
         other = Path(self._tmp.name) / "json-state"
         other.mkdir()
+        initialize_authority(other)
         self.state_dir = other
         cutover_to_json(other, providers=[provider])
         routed = self._exercise(provider)

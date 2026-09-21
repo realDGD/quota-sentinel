@@ -40,6 +40,7 @@ from quota_sentinel.state import (
     ResetCandidate,
     StateStoreError,
     StaleStateError,
+    initialize_authority,
 )
 
 
@@ -322,6 +323,8 @@ class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
+        # The CLI requires an initialized authority manifest.
+        initialize_authority(self.state_dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -797,15 +800,20 @@ class MalformedValueParityTests(unittest.TestCase):
 
 
 class ScheduleStateContractSpecTests(unittest.TestCase):
-    """§12: FileStateStore is intentionally NOT wired into
-    task_orchestrator.ScheduleState yet. This class records the contract
-    the future unification must preserve, and today's deliberate parser
-    differences — so they are known, not discovered later.
+    """The unification this class was written to anticipate has happened:
+    task_orchestrator.ScheduleState now reads through the authority router
+    instead of parsing legacy slot files itself.
+
+    Two things are pinned here: the aggregate contract that had to SURVIVE
+    the unification (it belongs to the orchestrator, not the store), and
+    the one parser divergence the unification RESOLVED rather than
+    preserved.
     """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
+        initialize_authority(self.state_dir)
         self.store = FileStateStore(self.state_dir)
         import task_orchestrator
         self.ScheduleState = task_orchestrator.ScheduleState
@@ -832,18 +840,24 @@ class ScheduleStateContractSpecTests(unittest.TestCase):
             write_slot(self.state_dir, p, "retry-pending", "1")
         self.assertIsNone(self.ScheduleState(self.state_dir).next_due())
 
-    def test_parser_divergence_is_registered(self) -> None:
-        # ScheduleState parses int(raw) after .strip(): it accepts
-        # " 5 " and "+5" and "5_0"; the shell regex and FileStateStore do
-        # NOT. Recorded so unification decides explicitly which side wins
-        # instead of silently changing wake behavior.
+    def test_parser_divergence_is_resolved_by_the_store(self) -> None:
+        # Before unification ScheduleState did int(raw.strip()) and read
+        # "5_0" as 50 while the shell's regex and the store read it as
+        # unset — two readers, two answers for the same byte. There is now
+        # one reader, so the divergence is RESOLVED in favour of the
+        # stricter, shell-matching parser: a malformed slot is unset, not a
+        # number no producer would ever have written.
         write_slot(self.state_dir, "codex", "next-due-at", "5_0")
         for p in ("antigravity", "opencode"):
             (self.state_dir / f"{p}-next-due-at").write_text("999999999\n")
-        self.assertEqual(
-            self.ScheduleState(self.state_dir).snapshot()["codex"], 50
+        self.assertIsNone(
+            self.ScheduleState(self.state_dir).snapshot()["codex"]
         )
         self.assertIsNone(self.store.load("codex").next_due_at)
+        # The well-formed providers are unaffected...
+        self.assertEqual(
+            self.ScheduleState(self.state_dir).next_due(), 999999999
+        )
 
 
 if __name__ == "__main__":

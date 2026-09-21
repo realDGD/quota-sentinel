@@ -12,6 +12,13 @@ export FEISHU_USER_ID="test-user"
 export FEISHU_DISABLE_CHART=1
 source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+initialize_test_authority
+
 trap cleanup EXIT
 ensure_temp_dir
 
@@ -28,6 +35,7 @@ typeset -g CAPTURED_USAGE_MSG=""
 reset_scheduler_state() {
   rm -rf "$QUOTA_SENTINEL_STATE_DIR"
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  initialize_test_authority
   LAST_ATTEMPTED=()
   TOTAL_RUNS=0
   # Each case parks the provider it does not exercise; do the same for OpenCode

@@ -86,6 +86,12 @@ export QUOTA_SENTINEL_CODEXBAR_BIN="$BIN_DIR/codexbar"
 export PI_SOURCE_ONLY=1
 source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+
 trap cleanup EXIT
 ensure_temp_dir
 
@@ -112,7 +118,10 @@ assert_log_contains() {
 }
 
 print -r -- "== R1: CodexBar live timeout -> cache fallback; scheduler untouched (C2+C4) =="
-reset_state() { rm -rf "$QUOTA_SENTINEL_STATE_DIR"; mkdir -p "$QUOTA_SENTINEL_STATE_DIR"; }
+reset_state() {
+  rm -rf "$QUOTA_SENTINEL_STATE_DIR"; mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  initialize_test_authority
+}
 reset_state
 # Seed a valid cache via the real cache writer.
 live_fixture="$TEST_TEMP_DIR/live.json"

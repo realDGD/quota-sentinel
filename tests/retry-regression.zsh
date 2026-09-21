@@ -81,6 +81,12 @@ export PI_MOCK_CALLS_DIR="$TEST_TEMP_DIR/calls"
 export PI_SOURCE_ONLY=1
 source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+
 trap cleanup EXIT
 ensure_temp_dir
 
@@ -101,6 +107,7 @@ send_feishu_message() {
 reset_state() {
   rm -rf "$QUOTA_SENTINEL_STATE_DIR"
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  initialize_test_authority
   rm -rf "$PI_MOCK_CALLS_DIR"
   mkdir -p "$PI_MOCK_CALLS_DIR"
   # OpenCode is parked far in the future: this suite exercises codex and

@@ -41,6 +41,13 @@ trap cleanup EXIT
 
 source "$SCRIPT_PATH"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+initialize_test_authority
+
 trap cleanup EXIT
 ensure_temp_dir
 
@@ -77,6 +84,7 @@ send_feishu_message() {
 reset_state() {
   rm -rf "$QUOTA_SENTINEL_STATE_DIR"
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  initialize_test_authority
 }
 
 # Path|mtime|size|md5 per state file; tmp-leak detection folded in.
@@ -365,6 +373,9 @@ print -r -- '{"openai-codex":{"token":"x"},"antigravity":{"token":"x"},"opencode
   >"$TEST_TEMP_DIR/cli-auth.json"
 cli_state="$TEST_TEMP_DIR/cli-state"
 mkdir -p "$cli_state"
+env QUOTA_SENTINEL_STATE_DIR="$cli_state" PI_SOURCE_ONLY=1 \
+  /bin/zsh -c 'source "$1"; authority_initialize >/dev/null' _ "$SCRIPT_PATH" ||
+  { print -u2 -- "could not initialize the throwaway CLI deployment"; exit 1; }
 print -r -- "987654" >"$cli_state/last-task-at"
 print -r -- "876543" >"$cli_state/next-due-at"
 print -r -- "100000:200000" >"$cli_state/last-triggered-window"

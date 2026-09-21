@@ -26,6 +26,13 @@ export FEISHU_USER_ID="test-user"
 export FEISHU_DISABLE_CHART=1
 source "$SCRIPT_PATH"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+initialize_test_authority
+
 trap 'rm -rf "$TEST_TEMP_DIR"' EXIT
 ensure_temp_dir
 
@@ -54,6 +61,7 @@ seed_realistic_state() {
   local provider="$1" base="$2"
   rm -rf "$QUOTA_SENTINEL_STATE_DIR"
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+  initialize_test_authority
   migrate_legacy_state
   write_provider_last_attempt "$provider" "$(( base + 1 ))"
   write_provider_last_task "$provider" "$base"
@@ -105,9 +113,12 @@ py dump codex >/dev/null
 for p in "${PROVIDERS[@]}"; do py dump "$p" >/dev/null; done
 [[ "$(sp2_sig)" == "$sp2_before" ]]
 # A missing state dir must not be created either.
+# SP2 drives the read path against a directory that must NOT exist: a
+# missing manifest is a loud error there, and "loud error" must still mean
+# "created nothing", so the directory is asserted absent afterwards.
 rm -rf "$TEST_TEMP_DIR/noexist"
 PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN" -m quota_sentinel \
-  --state-dir "$TEST_TEMP_DIR/noexist" next-due codex >/dev/null || true
+  --state-dir "$TEST_TEMP_DIR/noexist" next-due codex >/dev/null 2>&1 || true
 [[ ! -e "$TEST_TEMP_DIR/noexist" ]]
 print -r -- "SP2 (store load creates nothing, mutates nothing): passed"
 
@@ -194,6 +205,7 @@ print -r -- "SP4 (non-canonical-value registry: agreements + 2 registered diverg
 # Start from a clean dir so only shell writers populate legacy state.
 rm -rf "$QUOTA_SENTINEL_STATE_DIR"
 mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
+initialize_test_authority
 write_provider_last_task codex 1234
 write_provider_next_due codex 5678
 write_provider_retry_pending codex 1

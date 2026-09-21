@@ -8,6 +8,13 @@ export QUOTA_SENTINEL_LOG_DIR="$TEST_TEMP_DIR/logs"
 export PI_SOURCE_ONLY=1
 source "${0:A:h}/../quota-sentinel.sh"
 LAST_TEMP_DIR="$TEST_TEMP_DIR"
+
+# A throwaway deployment this suite builds is an INITIALIZED deployment:
+# the authority manifest is required at runtime, so every state dir gets one
+# (legacy backend), exactly as the installer leaves it on an upgraded host.
+initialize_test_authority() { authority_initialize >/dev/null; }
+initialize_test_authority
+
 trap cleanup EXIT
 
 write_provider_next_due codex 300

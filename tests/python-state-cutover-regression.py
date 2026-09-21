@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quota_sentinel.state import (
+    initialize_authority,
     ACTION_EXISTS,
     ACTION_SEEDED,
     DEFAULT_PROVIDERS,
@@ -354,11 +355,18 @@ class CutoverPreparationTests(unittest.TestCase):
 # ---- Phase 3A P3 (§31): CLI edge converts ValueErrors to typed errors -------
 class CliErrorSurfaceTests(unittest.TestCase):
     """The CLI converts library ValueErrors (bad provider names) into
-    concise typed non-zero exits; the library itself keeps raising."""
+    concise typed non-zero exits; the library itself keeps raising.
+
+    The deployment is initialized first so these assertions exercise the
+    ERROR SURFACE they are about. Without a manifest every verb fails
+    earlier with the (correct, but different) "authority is missing"
+    error, which would mask the behaviour under test.
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
+        initialize_authority(self.dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()

@@ -129,22 +129,56 @@ json backend     <state_dir>/<provider>-state.json   one v1 document per provide
 
 * Atomic (temp-write/fsync/rename), versioned, and strict: an unknown version
   or backend is a loud error.
-* **Absent manifest = this deployment was never cut over = legacy is
-  authoritative.** That is a bootstrap rule with a mechanical trigger, not an
-  inference from content.
+* **REQUIRED once the deployment is initialized, and absence is CORRUPTION.**
+  It is materialized by an explicit lifecycle step — the installer, or
+  `quota-sentinel.sh init-authority` / `authority-initialize` — and from then
+  on the runtime never accepts a missing manifest. The earlier protocol read
+  absence as "never cut over, so legacy"; that made a deleted manifest
+  silently resurrect stale legacy state (retry debt, deadlines, candidates,
+  anchors) out from under an advanced JSON backend, so absence is now only
+  meaningful to `initialize_authority` and to nothing else.
 * A *damaged* manifest is never defaulted to either side: `read_authority`
   raises, mutations fail closed, readers fail loudly. Guessing here would let
   a legacy writer create a second, diverging source of truth.
 * `epoch` increments on every durable switch, so "the same authority" is
   distinguishable from "a different authority that looks similar".
 
+### Initialization, and why it is not a runtime side effect
+
+```text
+uninitialized state dir
+   │  installer, or `init-authority` / `authority-initialize`   (lifecycle)
+   ▼
+backend-authority.json = {backend: legacy, epoch: 0}
+   │  every later command
+   ▼
+manifest present  ──►  normal operation
+manifest missing  ──►  loud AuthorityMissingError
+```
+
+The distinction that matters is not "has this file existed before" — that is
+not knowable from the state directory — but **which lifecycle action is
+running**. Initialization is therefore an explicit step that never runs
+inside a command path, which is exactly what makes a later disappearance
+detectable instead of self-healing.
+
+Two consequences, both deliberate:
+
+* `initialize_authority` is idempotent (an existing manifest is returned
+  untouched, never rewritten) and refuses to publish over a corrupt one:
+  re-initializing over corruption would destroy the only ownership fact.
+* Initialization reads NO scheduler state and does NOT look at whether JSON
+  documents exist. Phase 2 shadow documents may predate the protocol by
+  months, so their presence cannot be evidence of a cutover.
+
 `AuthoritativeStateStore` is the only authority → backend mapping in the
 codebase. Production code never branches on the backend itself.
 
-* Writers (`commit`) hold `run.lock`; the cutover holds the same lock, so a
-  flip cannot interleave with a mutation. The router still re-reads the fact
-  after committing and raises `ConcurrentAuthorityChangeError` if it moved —
-  a precondition violation must be loud.
+* Writers (`commit`) hold `run.lock`; the lifecycle verbs acquire it
+  themselves (see below), so a flip cannot interleave with a mutation. The
+  router still re-reads the fact after committing and raises
+  `ConcurrentAuthorityChangeError` if it moved — a precondition violation
+  must be loud.
 * Readers (`load`, `load_all`) mostly do NOT hold the lock (`status`, the
   timer's deadline scan, `/usage`). They use a generation guard: read the
   fact, read the state, read the fact again; accept only when both agree, else
@@ -155,7 +189,25 @@ codebase. Production code never branches on the backend itself.
 
 ### Cutover and rollback
 
-`cutover` (the explicit operator verb) runs under `run.lock`:
+Both are OPERATOR verbs, and both acquire `run.lock` themselves. The shell
+entry points (`./quota-sentinel.sh cutover|rollback|init-authority`) take the
+lock and then call the internal bridge verbs; the Python entry points
+(`uv run quota-sentinel cutover|rollback|authority-initialize`) take it
+through `quota_sentinel.state.runlock`, which executes **the same
+`/usr/bin/shlock` with the same arguments on the same file** as the shell.
+That is not a second lock: a Python holder and a shell holder exclude each
+other exactly as two shell holders do, which is why these verbs are safe to
+run standalone.
+
+The `scheduler-*` bridge verbs deliberately do NOT acquire the lock — the
+shell already holds it, and acquiring it again from a different process would
+deadlock against its own caller. They are labelled `INTERNAL BRIDGE API` in
+`--help`, are not documented as operator commands, and
+`tests/python-architecture-audit-regression.py` (AR10) fails if that changes.
+A CLI cannot verify a lock it did not take, so no such check is faked: the
+safety comes from the public surface not needing one.
+
+`cutover` runs under `run.lock`:
 
 ```text
 read the durable fact            already json -> idempotent no-op
@@ -168,9 +220,14 @@ re-read the fact and confirm
 
 The whole roster switches in ONE epoch; there is no state in which Codex is
 JSON while antigravity is still legacy. Every crash prefix resolves
-mechanically: before the flip the authority is still legacy (refreshed
-documents are harmless shadows), and the flip itself is one atomic
-replacement, so readers see the complete old or the complete new manifest.
+mechanically, and — since the manifest is materialized before the cutover
+begins — it resolves from a manifest that is always present: before the flip
+it reads `legacy` at epoch N (refreshed documents are harmless shadows), and
+the flip itself is one atomic replacement, so readers see the complete old or
+the complete new manifest. `cutover` also refuses outright when the
+deployment was never initialized: a virgin deployment must be initialized
+first, so that "no manifest" can never be read as "legacy" by a command that
+was only trying to switch backends.
 `tests/python-authority-regression.py` injects a crash at every checkpoint,
 including inside the manifest publish, and asserts that ownership is always
 determinable, that no legacy byte ever changes, and that no torn document or
@@ -185,7 +242,14 @@ the retired backend once JSON owns the state.
 `rollback` is the inverse switch and refuses unless it is a PURE UNDO (every
 document still equal to its legacy file). Once JSON has advanced, "roll back"
 would discard authoritative state — a human decision with a human-sized
-backup, not an automatic one.
+backup, not an automatic one. Deleting the legacy files destroys that
+artifact permanently, so `rollback` becomes impossible; the README says so
+where the cleanup is documented.
+
+`migrate` (the Phase 2 seed) carries the same rule one layer down: it refuses
+under JSON authority, because "repair" a missing document from the retired
+legacy files would resurrect exactly the state the missing-manifest rule
+exists to protect.
 
 ### Failure policy on the authoritative backend
 
@@ -195,7 +259,9 @@ DocumentCorruptError        bytes are not UTF-8 JSON
 SchemaError                 parsed but violates v1
 ```
 
-None of these may be answered with a default `ProviderState()`. Mutations fail
+None of these may be answered with a default `ProviderState()`, and neither
+may an ABSENT manifest (`AuthorityMissingError`, a
+`FAIL CLOSED on state mutation` condition like the rest). Mutations fail
 closed, tasks are not marked complete, deadlines do not advance, and the
 failure is loud. Recovery is deliberately minimal: restore the document (from
 a backup, or by re-running the cutover from the untouched legacy files) —
@@ -295,7 +361,9 @@ All entries funnel through `quota_sentinel.scheduler.service` →
 | 4 | `run` → initial `run_retry_burst` | as #1 | run |
 | 5 | `run` → post-run sync (`scheduler-last-window` + `scheduler-sync`) | last_window + as #3 | run + quota (quota busy → sync skipped, fallback stands) |
 | 6 | `usage` → opportunistic sync after collection | as #3 | quota (collect) → **released** → run (non-blocking; busy → skip) |
-| 7 | `cutover` → `scheduler-ensure-authority` | the authority manifest, after refreshing every document | run |
+| 7 | `cutover` → `scheduler-cutover` | the authority manifest, after refreshing every document | run (the shell entry point acquires it; the public CLI acquires it through `runlock`) |
+| 7b | `rollback` → `scheduler-rollback` | the authority manifest, after proving a pure undo | run (same) |
+| 7c | `init-authority` → `scheduler-initialize-authority` | the authority manifest, ONLY when absent | run (same) |
 | 8 | bootstrap `migrate_legacy_state` (state-touching commands only) | seeds absent per-provider legacy files | none — `seed_provider_state_file` publishes by `link(2)` EEXIST, so creation is atomic and non-destructive; skipped entirely once JSON is authoritative |
 
 Reads are pure: no lazy migration, no repair writes. `/usage` never runs a
@@ -503,8 +571,9 @@ bug to self-heal around.
 
 `quota-sentinel.sh` keeps exactly four responsibilities:
 
-1. **CLI compatibility layer** — `check|wait|run|usage|cutover|status|…`
-   argument handling and the legacy verb surface.
+1. **CLI compatibility layer** — `check|wait|run|usage|status` plus the
+   authority lifecycle verbs (`init-authority`, `cutover`, `rollback`), which
+   it runs while holding `run.lock`.
 2. **Model runner adapter** — provider CLI invocation, `auth.json`/settings
    handling, provider environment, process groups, timeouts, and the retry
    burst's process management. Python decides *whether* to run and *what the
@@ -533,11 +602,20 @@ new scheduler policy branches are not.
 Upgrading an existing deployment:
 
 ```text
-1. ./install-launchagents.sh --load   renders the plists, boots the old agent
-                                      out and starts the new one
+1. ./install-launchagents.sh --load   uv sync, retire the legacy watchdog and
+                                      timer agents, render the plists,
+                                      initialize the authority manifest,
+                                      restart the listener
 2. ./quota-sentinel.sh cutover        under run.lock, verified, atomic
 3. legacy slot files remain on disk, untouched, as the rollback artifact
 ```
+
+The installer retires the legacy schedulers BEFORE it starts the listener, so
+the post-condition is "only the listener/orchestrator is loaded" rather than
+"the operator remembered to stop the old ones". It initializes the manifest
+before any agent is restarted, which is safe because initialization only
+records the authority already in effect and starts no process; and it never
+cuts over, so upgrading and switching ownership stay separate actions.
 
 Step 1 must include the restart (`--load`, or an explicit `launchctl
 bootout`) because the ONE unsafe state is a still-running process from the
@@ -547,6 +625,15 @@ NEW code is safe either way — every state access goes through the router,
 which re-reads the durable fact on every operation — so ordering step 2
 before or after the new agent starts does not matter, and `cutover` takes
 `run.lock`, so it cannot interleave with an in-flight `check` or `run`.
+
+### Losing the manifest
+
+The recovery path is deliberately manual and loud rather than automatic:
+`read_authority` raises `AuthorityMissingError` with the two readings of the
+situation ("never initialized" vs "the fact was lost") and the remedy for
+each. There is no repair subsystem, because a heuristic that recreates the
+ownership fact is indistinguishable from the silent legacy fallback this
+design removed. See the README for the operator procedure.
 
 An automatic cleanup of legacy files is deliberately NOT provided: deleting a
 user's state is their decision, and the files are harmless once retired.

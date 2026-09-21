@@ -199,7 +199,11 @@ an Authorization header supplied to curl over stdin.
 ./quota-sentinel.sh run [codex|antigravity|opencode|all]
 ./quota-sentinel.sh card-preview [all|both|codex|antigravity|opencode|usage]
 ./quota-sentinel.sh send-test-card [all|both|codex|antigravity|opencode|usage|progress]
+
+# state-backend lifecycle (each acquires the scheduler's run.lock)
+./quota-sentinel.sh init-authority
 ./quota-sentinel.sh cutover
+./quota-sentinel.sh rollback
 ```
 
 - `check`: 15-minute watchdog probe. Independently evaluates each provider's 5h quota state without model invocations, and triggers only the provider(s) due for execution.
@@ -207,8 +211,11 @@ an Authorization header supplied to curl over stdin.
 - `run [codex|antigravity|opencode|all]`: Runs specified provider (or all three) and updates its schedule.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
-- `cutover`: one-time upgrade that makes the JSON state backend authoritative
-  (see [Upgrading from the legacy state backend](#upgrading-from-the-legacy-state-backend)).
+- `init-authority`: one-time upgrade step that materializes the authority
+  manifest for a deployment that predates it.
+- `cutover`: makes the JSON state backend authoritative.
+- `rollback`: returns ownership to the legacy backend (pure undo only).
+  See [Upgrading from the legacy state backend](#upgrading-from-the-legacy-state-backend).
 
 The Python side has its own verbs, equivalent under either entry point (parity
 is test-pinned):
@@ -226,31 +233,53 @@ uv run quota-sentinel authority
 uv run quota-sentinel dump codex          # legacy slot files
 uv run quota-sentinel json-dump codex     # v1 JSON document
 
-# state-backend lifecycle
-uv run quota-sentinel migrate             # seed shadow documents (never overwrites)
-uv run quota-sentinel cutover             # make JSON authoritative (needs run.lock)
-uv run quota-sentinel rollback            # back to legacy, pure undo only
+# lifecycle — these acquire run.lock themselves, so they are safe to run
+# directly; ./quota-sentinel.sh <verb> is the equivalent shell entry point
+uv run quota-sentinel authority-initialize
+uv run quota-sentinel cutover
+uv run quota-sentinel rollback
+uv run quota-sentinel migrate             # legacy deployments only
 ```
 
 `next-due` and `state-dump` read through whichever backend the durable
 authority manifest selects, so `status` reports the live state without
 knowing which backend that is. `authority` prints the manifest itself.
 
+> **The `scheduler-*` verbs are an INTERNAL BRIDGE API.** They are what
+> `quota-sentinel.sh` calls *while it already holds `run.lock`*, and they do
+> not acquire it themselves — a second acquisition from a different process
+> would deadlock against its own caller. Their `--help` says so. Use the
+> lifecycle verbs above (or the shell) instead; the repo-wide audit fails if
+> any document presents a bridge verb as an operator command.
+
 ### Upgrading from the legacy state backend
 
-Nothing changes until you ask for it: without a `backend-authority.json`
-manifest the per-slot files stay authoritative and every command behaves
-exactly as before.
+Every deployment has an **authority manifest**
+(`<state-dir>/backend-authority.json`), and the runtime requires it. The
+installer creates it, so the normal upgrade is:
 
 ```bash
-./install-launchagents.sh --load  # sync, render, restart the agent
+./install-launchagents.sh --load  # sync, retire old agents, restart listener
 ./quota-sentinel.sh cutover       # one-time ownership switch (run.lock held)
 ```
+
+Both steps are needed:
+- `--load` retires the legacy watchdog/timer agents, restarts the listener,
+  and initializes the manifest as `legacy epoch 0`;
+- `cutover` is the separate, explicit ownership switch. The installer never
+  performs it, so you can upgrade the code, watch the existing backend
+  behave, and move ownership when you choose.
 
 The restart matters: a process still running the PREVIOUS version does not
 know the manifest exists and would keep writing the legacy slots after the
 switch. New code is safe in either order, because every state access re-reads
 the durable fact.
+
+If you do not use the installer, initialize once by hand:
+
+```bash
+./quota-sentinel.sh init-authority   # one-time, idempotent, run.lock held
+```
 
 `cutover` reads the CURRENT slot files, writes and verifies one JSON document
 per provider, and only then publishes the ownership fact — a single atomic
@@ -260,18 +289,56 @@ left byte-for-byte untouched afterwards and act as the rollback artifact;
 `rollback` returns ownership to them and refuses once JSON state has advanced,
 because that would discard authoritative state.
 
-To reclaim the space after you are satisfied with the new backend, delete the
-per-provider files yourself (`<provider>-last-attempt-at`, `-last-task-at`,
-`-next-due-at`, `-retry-pending`, `-last-known-reset-at`, `-reset-anchor`,
-`-reset-candidate`, `-last-triggered-window`) — the project deliberately does
-not delete user state for you. Keep `backend-authority.json`: it is the
-ownership fact, not a rollback artifact.
+All three lifecycle commands take the scheduler's `run.lock` themselves
+(same `shlock` protocol, same file), so they cannot interleave with an
+in-flight `check` or model run.
+
+#### If the authority manifest goes missing
+
+**Do not hand-create it, and do not re-run `init-authority` to "fix" it.**
+A missing manifest is not "never cut over" — it means the single ownership
+fact was lost. The runtime says so and refuses to touch state, because
+guessing `legacy` would silently roll the scheduler back to deadlines and
+retry debt the authoritative backend has already moved past.
+
+Recover it the way you would any lost durable fact:
+
+1. stop the agents (`launchctl bootout gui/$(id -u)/quota-sentinel.feishu-listener`);
+2. decide which backend actually holds the current state by inspecting
+   `<provider>-state.json` and the legacy slot files side by side;
+3. restore `backend-authority.json` from a backup if you have one —
+   otherwise re-run `./quota-sentinel.sh init-authority` **only if you have
+   confirmed the deployment never cut over**, since that writes `legacy`;
+4. restart the agent.
+
+#### Deleting the legacy files
+
+After a cutover the per-slot files are a frozen rollback artifact. If you are
+satisfied with the JSON backend you may delete them yourself — the project
+deliberately does not:
+
+```text
+<provider>-last-attempt-at   <provider>-last-task-at   <provider>-next-due-at
+<provider>-retry-pending     <provider>-last-known-reset-at
+<provider>-reset-anchor      <provider>-reset-candidate
+<provider>-last-triggered-window
+```
+
+> **Deleting them permanently destroys your rollback artifact**: `rollback`
+> will then refuse (it needs both sides to prove a pure undo), and the only
+> way back to the legacy backend is gone.
+>
+> **Never delete `backend-authority.json`.** It is the ownership fact, not a
+> rollback artifact, and losing it stops the scheduler exactly as described
+> above.
 
 ## Local Task Orchestrator
 
 The Feishu listener process also hosts a lightweight local task orchestrator.
 It replaces the two independent scheduling LaunchAgents with one durable
-control loop while leaving all deadline policy inside `quota-sentinel.sh`:
+control loop, and it reads scheduler state through the authoritative backend
+router rather than the legacy slot files — so a cutover cannot leave it
+waking on deadlines the scheduler has already moved past:
 
 - runs one `check` at startup, matching the previous `RunAtLoad` behavior;
 - keeps the same quarter-hour watchdog grid (`:00`, `:15`, `:30`, `:45`);

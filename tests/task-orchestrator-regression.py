@@ -22,6 +22,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from quota_sentinel.state import initialize_authority
+
 from task_orchestrator import (
     CHECK_COMMAND_TIMEOUT_SECONDS,
     CommandResult,
@@ -85,6 +89,11 @@ class TaskOrchestratorTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state_dir = self.root / "state"
         self.state_dir.mkdir()
+        # A real deployment always has an authority manifest. The throwaway
+        # one this suite builds is an initialized LEGACY deployment —
+        # exactly what the installer leaves on an upgraded host — so the
+        # router selects the legacy slot files this suite writes.
+        initialize_authority(self.state_dir)
         self.clock = FakeClock(100.0)
         self.runner = FakeRunner()
         self.store = TaskStore(self.state_dir / "tasks.sqlite3")
@@ -214,6 +223,51 @@ class TaskOrchestratorTest(unittest.TestCase):
 
         self.write_pending("antigravity", 1)
         self.assertIsNone(self.state.next_due())
+
+    def test_reads_the_authoritative_backend_after_a_cutover(self) -> None:
+        """The listener must follow the authority fact.
+
+        The legacy slot files are a frozen rollback artifact after a
+        cutover. Computing wake times from them would leave the listener
+        sleeping until a deadline that already moved — or waking for one
+        the scheduler has superseded. This is the regression for exactly
+        that stale read.
+        """
+        from quota_sentinel.state import cutover_to_json, write_authority, BackendAuthority, BACKEND_JSON
+
+        self.write_due("codex", 500)
+        # The whole roster switches in one epoch, so the deployment stays
+        # readable as a unit (a per-provider cutover would leave the other
+        # providers without documents, which is itself a loud condition).
+        cutover_to_json(self.state_dir)
+        self.assertEqual(self.state.next_due(), 500)
+
+        # A legacy write after the flip must be INVISIBLE to the listener.
+        self.write_due("codex", 999)
+        self.assertEqual(
+            self.state.snapshot()["codex"], 500,
+            "the listener read the retired legacy backend",
+        )
+        self.assertEqual(self.state.next_due(), 500)
+
+        # Only a transition through the authoritative backend moves it.
+        from quota_sentinel.scheduler import service
+        service.commit_success(self.state_dir, "codex", 1000)
+        self.assertEqual(self.state.next_due(), 1000 + 18060)
+
+    def test_uninitialized_authority_yields_no_deadline_and_logs(self) -> None:
+        """A missing manifest is loud and safe: no deadlines, watchdog
+        grid still runs check, and the retired backend is never read."""
+        from quota_sentinel.state import AUTHORITY_FILENAME
+
+        self.write_due("codex", 500)
+        (self.state_dir / AUTHORITY_FILENAME).unlink()
+        with self.assertLogs("task_orchestrator", level="ERROR") as captured:
+            self.assertIsNone(self.state.next_due())
+        self.assertIsNone(self.state.snapshot()["codex"])
+        self.assertTrue(
+            any("authoritative backend" in line for line in captured.output)
+        )
 
     def test_nonzero_check_is_recorded_without_crashing_engine(self) -> None:
         self.runner.result = CommandResult(

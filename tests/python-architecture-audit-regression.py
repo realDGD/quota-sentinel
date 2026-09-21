@@ -542,6 +542,213 @@ class QuotaAdapterAgreement(unittest.TestCase):
         self.assertEqual(monthly, ["opencode"])
 
 
+class LifecycleLockOwnership(unittest.TestCase):
+    """AR10/AR13: operator-visible mutations go through run.lock.
+
+    A CLI cannot verify that a caller holds a lock it did not take, so the
+    safety property cannot be "the verb checks". It has to be structural:
+    the OPERATOR surface either acquires the lock itself, or does not exist;
+    the verbs the shell calls while already holding it are labelled
+    INTERNAL so nothing presents them as standalone operator commands.
+    """
+
+    def _parser(self):
+        sys.path.insert(0, str(REPO))
+        from quota_sentinel.__main__ import build_parser
+        return build_parser()
+
+    def _help_entries(self) -> dict:
+        parser = self._parser()
+        return {
+            action.dest: (action.help or "")
+            for action in parser._subparsers._group_actions[0]._choices_actions
+        }
+
+    def test_ar10_every_scheduler_bridge_verb_is_marked_internal(self):
+        entries = self._help_entries()
+        scheduler_verbs = {k: v for k, v in entries.items()
+                           if k.startswith("scheduler-")}
+        self.assertGreater(len(scheduler_verbs), 10)
+        offenders = sorted(
+            name for name, help_text in scheduler_verbs.items()
+            if not help_text.startswith("INTERNAL BRIDGE API")
+        )
+        self.assertEqual(
+            offenders, [],
+            "these verbs mutate state under a lock the caller must already "
+            "hold; the help surface must say so",
+        )
+
+    def test_ar10b_public_lifecycle_verbs_acquire_the_lock_themselves(self):
+        """The operator lifecycle verbs must be safe STANDALONE.
+
+        Their handlers run inside the run.lock context manager, so an
+        operator typing one cannot interleave a backend switch with an
+        in-flight scheduler run.
+        """
+        main_source = (REPO / "quota_sentinel" / "__main__.py").read_text(
+            encoding="utf-8"
+        )
+        for verb in ("cutover", "rollback", "authority-initialize"):
+            with self.subTest(verb=verb):
+                self.assertIn(f'"{verb}"', main_source)
+        # The lock helper is a context manager around the switch itself.
+        self.assertIn("def _lifecycle_lock(", main_source)
+        self.assertIn("with _lifecycle_lock(", main_source)
+        self.assertIn("acquire_run_lock(", main_source)
+        # ... and the underlying primitive is the shell's own binary.
+        runlock_source = (
+            REPO / "quota_sentinel" / "state" / "runlock.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('SHLOCK_BIN = "/usr/bin/shlock"', runlock_source)
+        self.assertIn('RUN_LOCK_FILENAME = "run.lock"', runlock_source)
+
+    def test_ar10c_public_docs_do_not_advertise_internal_verbs(self):
+        """Repo-wide: no document may present an INTERNAL verb as an
+        operator command. That combination is exactly how the lock gets
+        bypassed by a well-meaning human."""
+        offenders = []
+        for rel in tracked_files():
+            if not rel.endswith((".md", ".sh", ".zsh")):
+                continue
+            path = REPO / rel
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                stripped = line.strip()
+                if "scheduler-" not in stripped:
+                    continue
+                # A documented invocation of a bridge verb.
+                looks_like_a_command = (
+                    stripped.startswith("uv run quota-sentinel")
+                    or stripped.startswith("./quota-sentinel.sh scheduler-")
+                )
+                if looks_like_a_command:
+                    offenders.append(f"{rel}:{lineno}: {stripped}")
+        self.assertEqual(
+            offenders, [],
+            "internal bridge verbs must not be documented as operator "
+            "commands; use ./quota-sentinel.sh <lifecycle verb>",
+        )
+
+    def test_ar10d_documented_operator_lifecycle_is_the_lock_safe_one(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        for verb in ("cutover", "rollback"):
+            with self.subTest(verb=verb):
+                self.assertIn(f"./quota-sentinel.sh {verb}", readme)
+        self.assertIn("./quota-sentinel.sh init-authority", readme)
+
+
+class AuthorityNeverDefaultsToLegacy(unittest.TestCase):
+    """AR11: absence is a lifecycle input, never a runtime default."""
+
+    def test_ar11_absent_manifest_raises_and_creates_nothing(self):
+        import tempfile
+        from quota_sentinel.state import (
+            AuthorityMissingError,
+            AuthoritativeStateStore,
+            authority_path,
+            read_authority,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir()
+            with self.assertRaises(AuthorityMissingError):
+                read_authority(state_dir)
+            with self.assertRaises(AuthorityMissingError):
+                AuthoritativeStateStore(state_dir).load("codex")
+            self.assertFalse(authority_path(state_dir).exists())
+
+    def test_ar11b_bootstrap_authority_has_exactly_one_producer(self):
+        """The legacy default may be CONSTRUCTED only by the initializer.
+
+        If another module could conjure `bootstrap_authority()` on a
+        missing manifest, absence would silently become legacy again.
+        """
+        allowed = {"quota_sentinel/state/authority.py"}
+        offenders = []
+        for path in python_sources():
+            rel = str(path.relative_to(REPO))
+            if rel in allowed or "/quota/" in rel:
+                continue
+            if "bootstrap_authority(" in path.read_text(encoding="utf-8"):
+                offenders.append(rel)
+        self.assertEqual(offenders, [])
+
+    def test_ar11c_no_reader_catches_a_missing_manifest_as_legacy(self):
+        authority_source = (
+            REPO / "quota_sentinel" / "state" / "authority.py"
+        ).read_text(encoding="utf-8")
+        # The ONLY FileNotFoundError handler in the authority module is the
+        # one that raises AuthorityMissingError. A second one — or any
+        # return of the bootstrap authority from a READ — would put the
+        # silent legacy default back.
+        self.assertEqual(
+            authority_source.count("except FileNotFoundError"), 1
+        )
+        read_body = authority_source[
+            authority_source.index("def read_authority("):
+            authority_source.index("def write_authority(")
+        ]
+        self.assertIn("except FileNotFoundError as exc:", read_body)
+        self.assertIn("AuthorityMissingError", read_body)
+        self.assertNotIn("return bootstrap_authority()", read_body)
+        # The initializer is the one function allowed to construct it.
+        init_body = authority_source[
+            authority_source.index("def initialize_authority("):
+        ]
+        self.assertIn("bootstrap_authority()", init_body)
+
+
+class InstallerUpgradeSafety(unittest.TestCase):
+    """AR12: the installer retires the legacy agents before starting new ones."""
+
+    INSTALLER = (REPO / "install-launchagents.sh").read_text(encoding="utf-8")
+
+    def test_ar12_retired_labels_are_declared_and_booted_out(self):
+        self.assertIn("RETIRED_LABELS=(quota-sentinel quota-sentinel.timer)",
+                      self.INSTALLER)
+        self.assertIn('for label in "${RETIRED_LABELS[@]}"', self.INSTALLER)
+        self.assertIn('"$LAUNCHCTL_BIN" bootout "$DOMAIN/$label"',
+                      self.INSTALLER)
+
+    def test_ar12b_retired_labels_are_booted_out_before_the_listener(self):
+        retired_at = self.INSTALLER.index('for label in "${RETIRED_LABELS[@]}"')
+        active_at = self.INSTALLER.index('for label in "${ACTIVE_LABELS[@]}"')
+        self.assertLess(
+            retired_at, active_at,
+            "a legacy scheduler must be stopped before the new listener "
+            "starts, or two scheduling entry points coexist",
+        )
+
+    def test_ar12c_installer_initializes_authority_but_never_cuts_over(self):
+        """Upgrading the code and moving ownership stay separate actions.
+
+        The installer may initialize the manifest (the runtime requires it),
+        but it must never switch a deployment to JSON: an operator needs the
+        chance to install, watch the existing backend, and only then cut
+        over.
+        """
+        self.assertIn("authority-initialize", self.INSTALLER)
+        self.assertNotIn("scheduler-cutover", self.INSTALLER)
+        self.assertNotIn("scheduler-rollback", self.INSTALLER)
+        # No invocation of the cutover/rollback CLI either, in any form.
+        for line in self.INSTALLER.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            with self.subTest(line=stripped):
+                self.assertNotIn(" cutover", stripped)
+                self.assertNotIn(" rollback", stripped)
+
+    def test_ar12d_launchctl_is_overridable_so_upgrades_are_testable(self):
+        self.assertIn("QUOTA_SENTINEL_LAUNCHCTL_BIN", self.INSTALLER)
+        self.assertIn("QUOTA_SENTINEL_STATE_DIR", self.INSTALLER)
+
+
 class DocumentationPointers(unittest.TestCase):
     """The docs must name the real owners, not the pre-migration ones."""
 
