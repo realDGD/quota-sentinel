@@ -34,6 +34,22 @@ fi
 
 command -v plutil >/dev/null || { print -ru2 -- "plutil not found"; exit 1; }
 
+# The listener LaunchAgent runs inside the project's uv environment with
+# --frozen --no-sync, i.e. it NEVER resolves or syncs at start (no network,
+# no lock drift, no self-mutating daemon). The environment is therefore a
+# SETUP obligation of this installer: verify uv, then sync strictly from
+# the committed lockfile before any agent is rendered or loaded.
+readonly UV_BIN="${QUOTA_SENTINEL_UV_BIN:-/opt/homebrew/bin/uv}"
+[[ -x "$UV_BIN" ]] || {
+  print -ru2 -- "uv not found at $UV_BIN — install it first (brew install uv)"
+  exit 1
+}
+"$UV_BIN" sync --locked --project "$REPO_DIR" >/dev/null || {
+  print -ru2 -- "uv sync --locked failed: environment missing, incomplete, or pyproject/uv.lock drifted; fix before installing agents"
+  exit 1
+}
+print -r -- "synced     $REPO_DIR/.venv (uv.lock verified)"
+
 mkdir -p "$LOG_DIR" "$AGENT_DIR"
 chmod 700 "$LOG_DIR"
 

@@ -1,8 +1,7 @@
-# /// script
-# dependencies = [
-#   "lark-oapi>=1.4.0",
-# ]
-# ///
+# Runs in the PROJECT uv environment (needs lark-oapi, provided by
+# pyproject.toml): `uv run --frozen --no-sync python
+# tests/feishu-listener-regression.py`. No PEP 723 block — the project
+# lock is the single dependency source of truth.
 
 import json
 import os

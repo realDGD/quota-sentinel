@@ -1,8 +1,10 @@
-# /// script
-# dependencies = [
-#   "lark-oapi>=1.4.0",
-# ]
-# ///
+# Runtime: uv-managed PROJECT environment (pyproject.toml + uv.lock are the
+# single dependency source of truth; this script deliberately carries NO
+# PEP 723 block). The LaunchAgent starts it with
+#   uv run --project <repo> --frozen --no-sync python feishu_listener.py
+# so the daemon can never re-resolve the lock or mutate its own environment;
+# install-launchagents.sh performs `uv sync --locked` as the setup phase.
+# In-process this host also runs task_orchestrator (the "when" layer).
 
 import json
 import logging

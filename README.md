@@ -185,6 +185,19 @@ an Authorization header supplied to curl over stdin.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
 
+The Python state store has its own read/bootstrap verbs, equivalent under
+either entry point (parity is test-pinned):
+
+```bash
+uv run quota-sentinel --help
+uv run python -m quota_sentinel --help
+uv run quota-sentinel next-due codex | dump codex | json-dump codex | migrate
+```
+
+`migrate` is the explicit Phase 2/3A bootstrap that seeds shadow JSON
+documents from the authoritative legacy slot files; the scheduler itself
+still runs entirely in the shell.
+
 ## Local Task Orchestrator
 
 The Feishu listener process also hosts a lightweight local task orchestrator.
@@ -404,30 +417,45 @@ are gitignored.
 Render and install them for wherever this checkout lives:
 
 ```bash
-./install-launchagents.sh          # render + copy into ~/Library/LaunchAgents
+brew install uv                # once; the listener runtime needs uv
+./install-launchagents.sh          # uv sync --locked + render + copy into ~/Library/LaunchAgents
 ./install-launchagents.sh --load   # ... and bootstrap the active listener
 ```
 
+The installer first verifies uv and syncs the project environment strictly
+from `uv.lock` (`uv sync --locked`) — this is the only network-using setup
+step. The listener agent itself then starts with
+`uv run --project <repo> --frozen --no-sync python feishu_listener.py`:
+it cannot re-resolve the lock, mutate the environment, or hit the network
+at runtime, and the explicit `--project` keeps startup correct even though
+launchd's `WorkingDirectory` is `/private/tmp`.
+
 The script substitutes the real paths, validates each file with `plutil
 -lint`, and refuses to install anything containing an unrendered
-placeholder. It is idempotent — re-run it after moving the checkout.
+placeholder. It is idempotent — re-run it after moving the checkout or
+after dependency changes.
 
 ## Tests
 
 The suites under `tests/` are standalone scripts with no test runner to
-install. Run them from the repository root so the checkout is importable:
+install. The Python side lives in the project's uv environment
+(`pyproject.toml` + `uv.lock`; the only third-party dependency is
+`lark-oapi`, needed by the Feishu listener suite). After the installer (or
+a manual `uv sync --locked`), the canonical runs from the repository root
+are:
 
 ```bash
 for t in tests/*.zsh; do zsh "$t" || echo "FAIL $t"; done
-for t in tests/*.py;  do PYTHONPATH=. python3 "$t" || echo "FAIL $t"; done
+for t in tests/*.py; do PYTHONPATH=. uv run --frozen --no-sync python "$t" || echo "FAIL $t"; done
 ```
 
-`tests/feishu-listener-regression.py` additionally needs `lark-oapi`, which
-is declared in its own PEP 723 header, so run that one through uv:
-
-```bash
-PYTHONPATH=. uv run tests/feishu-listener-regression.py
-```
+The stdlib-only Python suites also pass under plain system `python3`
+(`PYTHONPATH=. python3 tests/...`); `tests/feishu-listener-regression.py`
+must run in the project environment so it exercises the real `lark_oapi`
+imports instead of any globally installed copy. `tests/uv-project-
+regression.py` is the environment guard itself: lock check, CLI/module
+entry-point parity, LaunchAgent-style `--project --frozen --no-sync`
+startup from a foreign working directory, and an offline runtime proof.
 
 ## License
 

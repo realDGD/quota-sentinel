@@ -8,6 +8,11 @@
   <array>
     <string>/opt/homebrew/bin/uv</string>
     <string>run</string>
+    <string>--project</string>
+    <string>__REPO_DIR__</string>
+    <string>--frozen</string>
+    <string>--no-sync</string>
+    <string>python</string>
     <string>__REPO_DIR__/feishu_listener.py</string>
   </array>
   <key>EnvironmentVariables</key>

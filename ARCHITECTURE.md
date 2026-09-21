@@ -344,6 +344,45 @@ reader/writer flips; no production switch was implemented in 3A):
 7. When — if ever — may legacy files be deleted? (Answer is very likely
    "not in Phase 3B"; removal needs its own reviewed step.)
 
+## Python runtime / dependency ownership (Phase 3A.5)
+
+Packaging/runtime only: the same code and behavior, now with a managed
+project environment. No scheduler, state, or ownership semantics live here.
+
+```text
+pyproject.toml   = project metadata + direct dependency source of truth
+uv.lock          = committed resolution (reproducible; verified via uv lock
+                   --check and uv sync --locked)
+uv               = environment/runtime manager for the PROJECT class below
+PEP 723          = retired: no inline metadata blocks remain anywhere
+Homebrew/system
+Python           = NOT a dependency owner for the project package
+requires-python  = >=3.9, an evidence floor (system 3.9.6 runs every suite);
+                   no .python-version pin: uv chooses the interpreter
+```
+
+Interpreter strategy — three deliberate classes, not one uniform rule:
+
+| Class | Runner | Members | Why |
+|---|---|---|---|
+| A. project | `uv run --frozen --no-sync` | `feishu_listener.py` (+ in-process `task_orchestrator`), `quota-sentinel` console script / `python -m quota_sentinel`, Python test suites | the only third-party dependency (`lark-oapi`) lives here; daemon must never resolve/sync/network at start |
+| B. isolated | `uv run --offline --no-project --no-config python -B …` | `antigravity_usage.py` | deliberate supply-chain boundary: must stay outside the project even now that a root pyproject exists — `--no-project` is load-bearing and pinned by tests/antigravity-native-regression.py |
+| C. system | `/usr/bin/python3` (`PYTHON3_BIN`, retained) | `run_with_timeout.py`, `opencode_usage.py`, native-probe python check, `python -m quota_sentinel` status seam | stdlib-only, invoked on shell/scheduler hot paths; must not gain uv startup latency, cache, or environment coupling; the >=3.9 floor keeps class C and the uv project env behaviorally identical for this code |
+
+LaunchAgent lifecycle: setup phase (`install-launchagents.sh`) verifies uv
+and runs `uv sync --locked` — the ONLY network-capable step; the agent
+runtime then runs `uv run --project <repo> --frozen --no-sync` (explicit
+`--project` because launchd's `WorkingDirectory` is `/private/tmp`, which
+would not discover the repo; `--frozen` forbids lock re-resolution,
+`--no-sync` forbids environment mutation). A missing environment therefore
+fails loudly at daemon start (err log) instead of self-healing — by design.
+Cache: production uses the default user cache; `UV_CACHE_DIR` overrides are
+test/sandbox-local only.
+
+`quota-sentinel.sh` diff-zero for logic: the only allowed shell changes from
+this phase onward are thin runtime call-throughs; none was needed (class C
+stays system Python by choice, see table).
+
 ## Shell freeze
 
 `quota-sentinel.sh` is in functional freeze: bug fixes, compatibility fixes,
