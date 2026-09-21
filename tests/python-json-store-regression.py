@@ -20,7 +20,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,6 +44,8 @@ from quota_sentinel.state import (
     state_to_document,
     validate_document,
 )
+from quota_sentinel.state.json_store import JsonStateStore
+from quota_sentinel.state.store import _publish_atomic
 from quota_sentinel.state.schema import EXPECTED_KEYS, VERSION_KEY
 
 FULL_STATE = ProviderState(
@@ -200,6 +204,193 @@ class SchemaCodecTests(unittest.TestCase):
         with self.assertRaises(SchemaError) as ctx:
             validate_document({}, "antigravity")
         self.assertIn("antigravity", str(ctx.exception))
+
+
+class JsonStoreTests(unittest.TestCase):
+    """J10-J13 + commit contract on the whole-document backend."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = JsonStateStore(self.state_dir)
+        self.path = self.state_dir / "codex-state.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _bootstrap(self, state: ProviderState) -> None:
+        """Create the document the way the store expects (migration
+        seeding happens in commit 3; here direct atomic write)."""
+        _publish_atomic(self.path, serialize_state(state, "codex"))
+
+    def test_load_absent_raises_missing_and_creates_nothing(self) -> None:
+        missing_dir = self.state_dir / "never-created"
+        store = JsonStateStore(missing_dir)
+        with self.assertRaises(MissingStateDocumentError):
+            store.load("codex")
+        self.assertFalse(missing_dir.exists())          # load stays pure
+        with self.assertRaises(MissingStateDocumentError):
+            store.commit("codex", ProviderState(), FULL_STATE)
+        self.assertFalse(self.path.exists())            # commit never creates
+
+    def test_commit_load_round_trip_and_single_publish(self) -> None:
+        self._bootstrap(ProviderState())
+        publishes = []
+        self.store.on_document_committed = lambda p: publishes.append(p)
+        self.store.commit("codex", self.store.load("codex"), FULL_STATE)
+        self.assertEqual(publishes, ["codex"])          # whole-doc: one per commit
+        self.assertEqual(self.store.load("codex"), FULL_STATE)
+
+    def test_whole_document_atomic_under_concurrent_reader(self) -> None:
+        # J10: a reader racing 40 commits must NEVER observe torn JSON,
+        # corruption, or schema damage — only complete old or complete
+        # new documents.
+        a, b = FULL_STATE, ProviderState(
+            **{**FULL_STATE.__dict__, "next_due_at": FULL_STATE.next_due_at + 1}
+        )
+        self._bootstrap(a)
+        stop = threading.Event()
+        damage: list = []
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    self.store.load("codex")
+                except MissingStateDocumentError:
+                    damage.append("missing")
+                except (DocumentCorruptError, SchemaError) as exc:
+                    damage.append(exc)
+                except StateStoreError:
+                    pass                                  # transient IO: ok
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            current = a
+            for i in range(40):
+                nxt = b if current == a else a
+                nxt = replace(nxt, last_task_at=9000 + i)
+                self.store.commit("codex", self.store.load("codex"), nxt)
+                current = nxt
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        self.assertEqual(damage, [], "reader saw a non-complete document")
+
+    def test_business_value_failure_leaves_old_document_untouched(self) -> None:
+        # J9 store part: unrepresentable text refuses AFTER the old doc
+        # exists — and the old COMPLETE document must survive intact.
+        self._bootstrap(FULL_STATE)
+        before = self.path.read_bytes()
+        bad = ProviderState(
+            **{**FULL_STATE.__dict__, "last_attempt_at": 42,
+               "last_triggered_window": "\ud800"}
+        )
+        with self.assertRaises(StateStoreError):
+            self.store.commit("codex", FULL_STATE, bad)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.store.load("codex"), FULL_STATE)
+        self.assertEqual(
+            [p.name for p in self.state_dir.iterdir() if ".tmp." in p.name], []
+        )
+
+    def test_publish_failure_leaves_old_document_and_no_temp(self) -> None:
+        # Filesystem-phase failure: os.replace explodes AFTER the temp
+        # file exists — old document intact, temp cleaned, typed error.
+        self._bootstrap(FULL_STATE)
+        before = self.path.read_bytes()
+        import quota_sentinel.state.store as store_module
+        real_replace = os.replace
+
+        def failing_replace(*args):
+            raise PermissionError("injected publish failure")
+
+        os.replace = failing_replace
+        store_module.os.replace = failing_replace
+        try:
+            with self.assertRaises(StateStoreError):
+                self.store.commit("codex", FULL_STATE, ProviderState())
+        finally:
+            os.replace = real_replace
+            store_module.os.replace = real_replace
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(
+            [p.name for p in self.state_dir.iterdir() if ".tmp." in p.name], []
+        )
+
+    def test_corrupt_document_is_loud_never_defaulted(self) -> None:
+        # §33: whole-document corruption must fail loudly, both on load
+        # and (therefore) on commit. NO silent all-unset reading.
+        self.path.write_bytes(b'{"schema_version": 1, "truncat')
+        with self.assertRaises(DocumentCorruptError):
+            self.store.load("codex")
+        self.path.write_bytes(
+            json.dumps({"schema_version": 1}).encode("utf-8")
+        )
+        with self.assertRaises(SchemaError):
+            self.store.load("codex")
+        with self.assertRaises(StateStoreError):
+            self.store.commit("codex", ProviderState(), FULL_STATE)
+
+    def test_stale_detection_defensive_not_cas(self) -> None:
+        self._bootstrap(FULL_STATE)
+        stale = ProviderState()
+        with self.assertRaises(StaleStateError):
+            self.store.commit("codex", stale, FULL_STATE)
+
+        # And the residual race the check does NOT cover: an external
+        # write landing between our stale check and our publish gets
+        # silently clobbered. Injected by wrapping the module-level
+        # serialize step (phase 2) so the external publish happens after
+        # the check (phase 1) and before ours (phase 3). This is WHY
+        # production writers must serialize on run.lock.
+        import quota_sentinel.state.json_store as json_module
+
+        variant = ProviderState(
+            **{**FULL_STATE.__dict__, "last_task_at": 7}
+        )
+        real_serialize = json_module.serialize_state
+
+        def racing_serialize(state, provider):
+            payload = real_serialize(state, provider)
+            _publish_atomic(self.path, real_serialize(variant, provider))
+            return payload
+
+        json_module.serialize_state = racing_serialize
+        try:
+            self.store.commit("codex", FULL_STATE, ProviderState())  # succeeds
+        finally:
+            json_module.serialize_state = real_serialize
+        # Our publish landed LAST and clobbered the concurrent writer —
+        # the store detected nothing:
+        self.assertEqual(self.store.load("codex"), ProviderState())
+
+    def test_noop_commit_writes_nothing(self) -> None:
+        self._bootstrap(FULL_STATE)
+        before = (self.path.read_bytes(), os.stat(self.path).st_mtime_ns)
+        self.store.commit("codex", FULL_STATE, FULL_STATE)
+        self.assertEqual(
+            (self.path.read_bytes(), os.stat(self.path).st_mtime_ns), before
+        )
+
+    def test_document_path_and_modes(self) -> None:
+        # J12/J16: <provider>-state.json under 0600; dir normalized 0700.
+        os.chmod(self.state_dir, 0o755)
+        self._bootstrap(FULL_STATE)
+        self.store.commit(  # triggers ensure-dir through the write path
+            "codex", FULL_STATE, ProviderState()
+        )
+        self.assertEqual(
+            self.state_dir / "codex-state.json", self.path
+        )
+        self.assertEqual(oct(os.stat(self.path).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(self.state_dir).st_mode & 0o777), "0o700")
+
+    def test_invalid_provider_names_rejected(self) -> None:
+        for bad in ("../evil", "a b", "", "/tmp/pwn"):
+            with self.subTest(provider=bad):
+                with self.assertRaises(ValueError):
+                    self.store.document_path(bad)
 
 
 if __name__ == "__main__":
