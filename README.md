@@ -392,3 +392,23 @@ Only the listener/orchestrator LaunchAgent may be loaded during normal
 operation. Loading either legacy scheduler at the same time would create a
 second scheduling entry point, even though the shell run lock still prevents
 duplicate model execution.
+
+### Installing
+
+launchd does not expand `~` or `$HOME` inside `ProgramArguments`, so these
+plists require literal absolute paths. To keep local paths out of the
+repository, only `*.plist.template` files are committed, carrying
+`__REPO_DIR__` and `__LOG_DIR__` placeholders; the rendered `*.plist` files
+are gitignored.
+
+Render and install them for wherever this checkout lives:
+
+```bash
+./install-launchagents.sh          # render + copy into ~/Library/LaunchAgents
+./install-launchagents.sh --load   # ... and bootstrap the active listener
+```
+
+The script substitutes the real paths, validates each file with `plutil
+-lint`, and refuses to install anything containing an unrendered
+placeholder. It is idempotent — re-run it after moving the checkout.
+

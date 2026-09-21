@@ -1,6 +1,13 @@
 import { writeFile } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { fetchAccountUsage } from "/Users/__USER__/.pi/agent/npm/node_modules/pi-antigravity/src/usage/usage.ts";
+
+// pi-antigravity lives in the Pi runtime's own node_modules, which is not on
+// this file's module resolution path (a bare specifier does not resolve from
+// the checkout). It is therefore imported dynamically from a $HOME-derived
+// path so no absolute local path is committed. The import happens inside the
+// handler's try/catch, so an unresolvable path degrades to an error snapshot
+// instead of preventing the extension from loading.
+const PI_ANTIGRAVITY_USAGE_MODULE = `${process.env.HOME ?? ""}/.pi/agent/npm/node_modules/pi-antigravity/src/usage/usage.ts`;
 
 type Quota = { remainingPercent: number; resetAt: number };
 
@@ -26,6 +33,7 @@ export default function captureAntigravityQuota(pi: ExtensionAPI) {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider("antigravity");
       if (!apiKey) throw new Error("Antigravity credentials unavailable");
 
+      const { fetchAccountUsage } = await import(PI_ANTIGRAVITY_USAGE_MODULE);
       const usage = await fetchAccountUsage(apiKey);
       const group = usage.groups.find((item) => /gemini/i.test(item.displayName));
       const fiveHourBucket = group?.buckets.find(

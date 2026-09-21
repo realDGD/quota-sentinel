@@ -38,5 +38,10 @@ venv/
 *.db
 *.snapshot
 
+# Rendered LaunchAgents — contain this machine's absolute paths.
+# The *.plist.template sources are committed; render with
+# ./install-launchagents.sh
+*.plist
+
 # Pre-publication audit notes (local reference only)
 PRE-PUBLISH-AUDIT.md

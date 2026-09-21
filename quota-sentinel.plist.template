@@ -6,34 +6,34 @@
   <string>quota-sentinel</string>
   <key>ProgramArguments</key>
   <array>
-		<string>/Users/__USER__/code/Quota-Sentinel/quota-sentinel.sh</string>
-		<string>check</string>
-	</array>
-	<key>Disabled</key>
-	<true/>
-	<key>RunAtLoad</key>
-	<false/>
+    <string>__REPO_DIR__/quota-sentinel.sh</string>
+    <string>check</string>
+  </array>
+  <key>Disabled</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <false/>
   <key>WorkingDirectory</key>
   <string>/private/tmp</string>
-	<key>StartCalendarInterval</key>
-	<array>
-		<dict>
-			<key>Minute</key>
-			<integer>0</integer>
-		</dict>
-		<dict>
-			<key>Minute</key>
-			<integer>15</integer>
-		</dict>
-		<dict>
-			<key>Minute</key>
-			<integer>30</integer>
-		</dict>
-		<dict>
-			<key>Minute</key>
-			<integer>45</integer>
-		</dict>
-	</array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <dict>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+    <dict>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Minute</key>
+      <integer>45</integer>
+    </dict>
+  </array>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

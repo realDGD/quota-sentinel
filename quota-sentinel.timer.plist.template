@@ -6,7 +6,7 @@
   <string>quota-sentinel.timer</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/__USER__/code/Quota-Sentinel/quota-sentinel.sh</string>
+    <string>__REPO_DIR__/quota-sentinel.sh</string>
     <string>wait</string>
   </array>
   <key>Disabled</key>
