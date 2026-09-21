@@ -533,11 +533,20 @@ new scheduler policy branches are not.
 Upgrading an existing deployment:
 
 ```text
-1. install the new version; the installer boots the old agent out first, so
-   no process that still believes in the legacy backend can be alive
-2. run `quota-sentinel.sh cutover` — under run.lock, verified, atomic
+1. ./install-launchagents.sh --load   renders the plists, boots the old agent
+                                      out and starts the new one
+2. ./quota-sentinel.sh cutover        under run.lock, verified, atomic
 3. legacy slot files remain on disk, untouched, as the rollback artifact
 ```
+
+Step 1 must include the restart (`--load`, or an explicit `launchctl
+bootout`) because the ONE unsafe state is a still-running process from the
+previous version: old code does not know the authority manifest exists and
+would keep writing the legacy slots after the switch. A process running the
+NEW code is safe either way — every state access goes through the router,
+which re-reads the durable fact on every operation — so ordering step 2
+before or after the new agent starts does not matter, and `cutover` takes
+`run.lock`, so it cannot interleave with an in-flight `check` or `run`.
 
 An automatic cleanup of legacy files is deliberately NOT provided: deleting a
 user's state is their decision, and the files are harmless once retired.

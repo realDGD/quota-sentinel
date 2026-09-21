@@ -243,9 +243,14 @@ manifest the per-slot files stay authoritative and every command behaves
 exactly as before.
 
 ```bash
-./install-launchagents.sh        # syncs the environment and restarts the agent
-./quota-sentinel.sh cutover      # one-time ownership switch (run.lock held)
+./install-launchagents.sh --load  # sync, render, restart the agent
+./quota-sentinel.sh cutover       # one-time ownership switch (run.lock held)
 ```
+
+The restart matters: a process still running the PREVIOUS version does not
+know the manifest exists and would keep writing the legacy slots after the
+switch. New code is safe in either order, because every state access re-reads
+the durable fact.
 
 `cutover` reads the CURRENT slot files, writes and verifies one JSON document
 per provider, and only then publishes the ownership fact — a single atomic
