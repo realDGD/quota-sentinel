@@ -214,8 +214,9 @@ Schema v1 (`schema.py`):
   is auto-repaired;
 * `commit` = whole-document transaction: defensive stale check (NOT a
   CAS — same rule as the file store: production writers must run inside
-  `run.lock`), full validation + final-bytes serialization before any
-  filesystem operation, then ONE temp/fsync/atomic-replace publish.
+  `run.lock`), full validation + final-bytes serialization before the
+  first filesystem mutation (the stale check reads; reads are pure),
+  then ONE temp/fsync/atomic-replace publish.
   Business-value failure ⇒ old document byte-identical; crash or
   filesystem failure ⇒ readers see old-complete or new-complete, never
   half JSON. That single-unit atomicity is precisely what the per-slot
@@ -273,13 +274,25 @@ Contract:
   Mechanical proof comes with Phase 3B wiring, where the caller is
   the lock holder.
 * Validation pipeline (single rule source, no drift), one contiguous
-  contract phrase: validate_state -> state_to_document -> validate_document -> deterministic UTF-8 bytes — entirely before any filesystem operation.
+  contract phrase: validate_state -> state_to_document -> validate_document -> deterministic UTF-8 bytes — the whole preflight completes before the first filesystem mutation. (Pure READS of legacy and shadow happen earlier, by design; "before any filesystem operation" would be false.)
 * POSTCONDITION on success: legacy slot files byte-identical; the
   document decodes (through the ordinary loud loader) to EXACTLY the
   legacy ProviderState; idempotent re-runs write nothing.
-* On ANY failure (domain, schema, publish, verification): legacy
-  untouched and authoritative, shadow old-complete-or-absent.
-  Rollback from a Phase 3A failure is literally "do nothing".
+* Failure contract — the safety invariant is "legacy stays untouched
+  and authoritative", NOT "the shadow keeps its old value". Branch by
+  whether the publish itself succeeded:
+  1. in every failure, legacy remains untouched and authoritative;
+  2. in every failure, the shadow never becomes authoritative;
+  3. failure before the successful publish (domain/schema/serialization,
+     or a filesystem failure inside the atomic replace): the shadow
+     remains old-complete or absent;
+  4. failure AFTER a successful publish (verification mismatch): the
+     shadow may hold the newly-published complete document — that is
+     not an ownership change and needs no rollback (do NOT add shadow
+     rollback to satisfy older wording);
+  5. no failure may ever leave torn JSON;
+  6. rollback of authoritative ownership is unnecessary, because
+     ownership never changed from legacy.
 
 Phase 3A PREPARED is NOT JSON AUTHORITATIVE. Ownership after a
 successful prepare is exactly ownership before it: legacy files

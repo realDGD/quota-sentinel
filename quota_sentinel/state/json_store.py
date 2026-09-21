@@ -23,9 +23,10 @@ Contract, deliberately parallel to FileStateStore:
 * ``commit`` is plan-then-execute over the WHOLE document: defensive
   stale detection (NOT a CAS — production writers must serialize via
   the shell's run.lock), full validation + serialization to FINAL BYTES
-  before any filesystem operation, then a single temp-write/fsync/
-  atomic-replace publish. Business-value failures therefore cannot leave
-  a half-mutated document; the only mid-write crash window resolves to
+  before the first filesystem mutation (the stale check is itself a
+  pure read), then a single temp-write/fsync/atomic-replace publish.
+  Business-value failures therefore cannot leave a half-mutated
+  document; the only mid-write crash window resolves to
   old-complete-or-new-complete.
 
 * ``state_dir`` write-side ownership matches FileStateStore: the store

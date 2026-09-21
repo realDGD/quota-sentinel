@@ -169,9 +169,13 @@ def validate_state(state: object, provider: str) -> ProviderState:
 
 
 def state_to_document(state: ProviderState) -> Dict[str, Any]:
-    """Project an ALREADY-validated domain model onto a complete v1
-    document. Callers must run validate_state() first; validate_document()
-    then re-checks the projected shape independently."""
+    """INTERNAL projection helper — deliberately NOT part of the package's
+    public API (Option A boundary, Phase 3A residual): it assumes
+    validate_state() already passed and will fail untyped (AttributeError)
+    on lookalike candidates if called directly. The public persistence
+    path is serialize_state(), which enforces the full
+    validate_state -> projection -> document-validation chain; public
+    decode paths are document_to_state() and deserialize_state()."""
     candidate = state.reset_candidate
     return {
         VERSION_KEY: SCHEMA_VERSION,

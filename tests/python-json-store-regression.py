@@ -46,7 +46,6 @@ from quota_sentinel.state import (
     parse_document_bytes,
     seed_document_if_absent,
     serialize_state,
-    state_to_document,
     validate_document,
     validate_state,
 )

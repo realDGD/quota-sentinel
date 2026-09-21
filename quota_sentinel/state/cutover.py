@@ -36,11 +36,22 @@ POSTCONDITION on success:
     * idempotent: preparing twice against unchanged legacy writes nothing
       the second time.
 
-Failure semantics: any domain/schema/serialization failure happens
-before any filesystem mutation; a filesystem failure leaves the shadow
-document old-complete-or-new-complete (single atomic replace), and in
-every failure case legacy is untouched and stays authoritative —
-rollback from Phase 3A failure is literally "do nothing".
+Failure semantics — the real invariant is "legacy stays untouched and
+authoritative", NOT "the shadow keeps its old value". Branch by whether
+the publish itself succeeded:
+  * domain/schema/serialization failure: surfaces before the first
+    filesystem MUTATION (pure reads of legacy + shadow happen earlier,
+    by design); the shadow stays old-complete or absent;
+  * filesystem failure inside the single atomic publish: the shadow
+    stays old-complete (never torn);
+  * VERIFICATION failure happens AFTER a successful publish: the shadow
+    may hold the newly-published COMPLETE document. That is not an
+    ownership change and needs no rollback — do not "fix" the old
+    wording by adding shadow rollback;
+  * in every branch: legacy untouched and authoritative, no torn JSON,
+    the shadow never becomes authoritative, and no result is returned.
+Rollback from Phase 3A failure is literally "do nothing" — ownership
+never changed away from legacy.
 """
 from __future__ import annotations
 
@@ -100,8 +111,9 @@ def prepare_provider_cutover(state_dir: Path, provider: str) -> CutoverPreparati
     # 1. Source of truth: CURRENT authoritative state, pure read.
     legacy_state = file_store.load(provider)
 
-    # 2. Full preflight to FINAL bytes (validate_state -> document ->
-    #    strict UTF-8). Zero filesystem contact yet.
+    # 2. Full serialization preflight (validate_state -> document ->
+    #    strict UTF-8). No filesystem MUTATION has occurred yet; the
+    #    reads above are pure by contract.
     payload = serialize_state(legacy_state, provider)
 
     # 3. Compare against the existing shadow semantically, if usable.

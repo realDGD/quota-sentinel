@@ -11,7 +11,6 @@ from .schema import (
     document_to_state,
     parse_document_bytes,
     serialize_state,
-    state_to_document,
     validate_document,
     validate_state,
 )
@@ -49,7 +48,6 @@ __all__ = [
     "SchemaError",
     "DocumentCorruptError",
     "MissingStateDocumentError",
-    "state_to_document",
     "document_to_state",
     "validate_document",
     "validate_state",

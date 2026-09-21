@@ -18,6 +18,7 @@ plus mode/roster/legacy-immutability invariants.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from quota_sentinel.state import (
     ResetCandidate,
     StateStoreError,
     migrate_provider,
+    serialize_state,
 )
 from quota_sentinel.state.cutover import (
     CutoverPreparation,
@@ -232,6 +234,83 @@ class CutoverPreparationTests(unittest.TestCase):
         with self.assertRaises(StateStoreError):
             self.jsons.load("codex")
 
+    # ---- C11: verification failure AFTER a successful publish ------------------
+    def test_c11_post_publish_verification_failure_contract(self) -> None:
+        # R1 residual: the disproven old wording promised "shadow stays
+        # old-complete-or-absent on ANY failure". The truthful branch:
+        # publish SUCCEEDS, verification then fails -> the shadow may
+        # hold the NEW-complete document, legacy stays untouched and
+        # authoritative, nothing torn, no rollback needed.
+        #
+        # Mechanical proof of "publish already happened": (a) spy counts
+        # exactly one real _publish_atomic call that returned without
+        # error, (b) the on-disk document equals serialize_state(LEGACY)
+        # byte-for-byte, while (c) a lying verification load forces the
+        # mismatch. Distinguished from C8/C9: those fail PRE-publish and
+        # assert old/absent shadow; this fails POST-publish.
+        import quota_sentinel.state.cutover as cutover_module
+
+        # Arrange: shadow currently equals STALE, legacy currently LEGACY.
+        self.write_legacy("codex", STALE)
+        prepare_provider_cutover(self.state_dir, "codex")   # shadow = STALE
+        self.write_legacy("codex", LEGACY)                   # legacy drifts on
+        doc_before = self.doc_path("codex").read_bytes()
+        self.assertEqual(
+            json.loads(doc_before)["next_due_at"], STALE.next_due_at
+        )
+        legacy_sig = self.slot_signature()
+
+        publish_calls = {"n": 0}
+        real_publish = cutover_module._publish_atomic
+
+        def spy_publish(path, payload):
+            real_publish(path, payload)          # let it actually succeed
+            publish_calls["n"] += 1
+
+        loads = {"n": 0}
+        real_load = JsonStateStore.load
+
+        def lying_load(self, provider):
+            loads["n"] += 1
+            state = real_load(self, provider)
+            if loads["n"] >= 2:                  # verification read lies
+                return ProviderState(
+                    **{**state.__dict__,
+                       "next_due_at": (state.next_due_at or 0) + 1}
+                )
+            return state                         # usable-shadow read honest
+
+        cutover_module._publish_atomic = spy_publish
+        JsonStateStore.load = lying_load
+        try:
+            with self.assertRaises(StateStoreError) as ctx:
+                prepare_provider_cutover(self.state_dir, "codex")
+        finally:
+            JsonStateStore.load = real_load
+            cutover_module._publish_atomic = real_publish
+
+        # prepare refused loudly, returned nothing (raises, no result):
+        self.assertIn("cutover verification failed", str(ctx.exception))
+        # (a) publish happened exactly once and completed:
+        self.assertEqual(publish_calls["n"], 1)
+        self.assertGreaterEqual(loads["n"], 2)
+        # (b) shadow now holds the NEW, COMPLETE, semantic-current doc —
+        #     allowed by the corrected contract; NOT old-complete:
+        doc_after = self.doc_path("codex").read_bytes()
+        self.assertNotEqual(doc_after, doc_before)
+        self.assertEqual(
+            doc_after, serialize_state(LEGACY, "codex")
+        )
+        self.assertEqual(self.jsons.load("codex"), LEGACY)   # parses & matches
+        # (c) legacy byte-identical and authoritative (ownership never
+        #     moved — no durable fact changed):
+        self.assertEqual(self.slot_signature(), legacy_sig)
+        self.assertEqual(self.files.load("codex"), LEGACY)
+        # (d) no torn JSON, no temp debris:
+        self.assertEqual(
+            [p.name for p in self.state_dir.iterdir() if ".tmp." in p.name], []
+        )
+
     # ---- invariants: modes, roster, legacy immutability, result shape ---------
     def test_modes_and_dir_ownership_on_write(self) -> None:
         fresh = self.state_dir / "sub"
@@ -320,6 +399,39 @@ class CliErrorSurfaceTests(unittest.TestCase):
             store.document_path("../evil")
 
 
+# ---- Phase 3A Option A: projection helper stays internal ---------------------
+class PublicApiSurfaceTests(unittest.TestCase):
+    """serialize_state is the public persistence pipeline; the raw
+    projection is internal (it requires a pre-validated state and fails
+    untyped on lookalikes if misused — which is why it leaves the
+    package API rather than duplicating validation)."""
+
+    def test_projection_not_public(self) -> None:
+        import quota_sentinel.state as pkg
+        import quota_sentinel.state.schema as schema_module
+
+        self.assertFalse(hasattr(pkg, "state_to_document"))
+        self.assertNotIn("state_to_document", pkg.__all__)
+        # still reachable as the schema module's internal step:
+        self.assertTrue(hasattr(schema_module, "state_to_document"))
+        # the safe public pipeline remains:
+        for name in ("serialize_state", "validate_state",
+                     "deserialize_state", "document_to_state"):
+            self.assertTrue(hasattr(pkg, name), name)
+            self.assertIn(name, pkg.__all__)
+
+    def test_public_serialize_keeps_typed_boundary(self) -> None:
+        # The public path's guarantee is unchanged by the narrowing:
+        from quota_sentinel.state import ProviderState as PS
+        from quota_sentinel.state import SchemaError, serialize_state
+        with self.assertRaises(SchemaError):
+            serialize_state(
+                PS(**{**PS().__dict__,
+                      "reset_candidate": {"reset_at": 1, "observed_at": 2}}),
+                "codex",
+            )
+
+
 # ---- ARCHITECTURE.md contract phrases must survive doc edits -----------------
 class ArchitectureDocGuardTests(unittest.TestCase):
     """The Phase 3A contract lives in ARCHITECTURE.md. These guards fail
@@ -372,6 +484,29 @@ class ArchitectureDocGuardTests(unittest.TestCase):
     def test_migrate_vs_prepare_contradiction_table(self) -> None:
         self.assertIn("the exact opposite of Phase 2 `migrate_provider`",
                       self.arch)
+
+    # Phase 3A residual contract (R3): mutation-not-operation, and the
+    # branch-4 failure truth must be pinned; the disproven blanket claim
+    # must not return.
+    def test_failure_contract_branches_pinned(self) -> None:
+        self.assertIn(
+            "the whole preflight completes before the first filesystem "
+            "mutation", self.arch,
+        )
+        self.assertIn(
+            "failure AFTER a successful publish (verification mismatch)",
+            self.arch,
+        )
+        self.assertIn(
+            "the newly-published complete document", self.arch,
+        )
+        self.assertIn(
+            "rollback of authoritative ownership is unnecessary",
+            self.arch,
+        )
+        # The old blanket (false) claim must be gone from normative text:
+        self.assertNotIn("shadow old-complete-or-absent", self.arch)
+        self.assertNotIn("On ANY failure (domain", self.arch)
 
 
 if __name__ == "__main__":
