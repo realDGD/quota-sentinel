@@ -41,6 +41,7 @@ from quota_sentinel.state import (
 from quota_sentinel.state.json_store import JsonStateStore
 from quota_sentinel.state.migration import migrate_all
 from quota_sentinel.scheduler import cli as scheduler_cli
+from quota_sentinel.notifications import plan as notification_plan
 
 
 def default_state_dir() -> Path:
@@ -103,6 +104,36 @@ def run_cutover(state_dir: Path, providers: Optional[List[str]]) -> int:
     return 0
 
 
+def run_notification_plan(args: argparse.Namespace) -> int:
+    """The selection policy behind one notification.
+
+    Prints machine records, not prose: the shell reads ``layout`` and
+    ``providers`` and keeps owning transport and rendering.
+    """
+    providers = args.providers or []
+    if args.event == "task":
+        plan = notification_plan.plan_task(providers)
+    elif args.event == "usage":
+        plan = notification_plan.plan_usage(providers)
+    elif args.event == "recovery":
+        plan = notification_plan.plan_recovery(providers)
+    else:  # pragma: no cover - argparse constrains the choices
+        print(f"quota_sentinel: unknown notification event {args.event!r}",
+              file=sys.stderr)
+        return 3
+    if plan is None:
+        # "Nothing to report" is a legitimate answer, not an error: the
+        # caller must be able to distinguish it from a failed plan.
+        print("layout=silent")
+        print("providers=")
+        print("reason=nothing to report")
+        return 0
+    print(f"layout={plan.layout.value}")
+    print(f"providers={','.join(plan.providers)}")
+    print(f"reason={plan.reason}")
+    return 0
+
+
 def run_rollback(state_dir: Path, providers: Optional[List[str]]) -> int:
     result = rollback_to_legacy(state_dir, providers or None)
     if not result.changed:
@@ -154,6 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="print scheduler slots from whichever backend is authoritative",
     )
     state_dump.add_argument("provider")
+    notify = sub.add_parser(
+        "notification-plan",
+        help="the selection policy for one notification (layout + roster)",
+    )
+    notify.add_argument(
+        "--event", required=True, choices=("task", "usage", "recovery")
+    )
+    notify.add_argument("providers", nargs="*", default=None)
+    notify.set_defaults(handler=run_notification_plan)
+
     migrate = sub.add_parser(
         "migrate",
         help="seed shadow JSON documents from legacy slot files "

@@ -50,6 +50,28 @@ monthly cap is appended to its own block as a grey display-only line.
 Each provider is successful only when Pi exits normally and its model replies
 exactly `1`. Quota collection is reported independently.
 
+## Architecture at a glance
+
+Python owns the system's decisions; the shell owns processes and the system
+boundary. See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants.
+
+```text
+quota_sentinel/ (Python)
+  state/       authoritative scheduler state + the durable backend authority
+  scheduler/   due decisions, deadline calibration, retry debt, transitions
+  quota/       provider adapters: fallback ladder, capabilities, normalisation
+
+quota-sentinel.sh (zsh)
+  model runner, quota tier execution, Feishu transport, locks, install glue
+```
+
+The shell asks Python for every scheduler decision and every state
+transition through a small CLI bridge; it holds no scheduler policy of its
+own. Two durable state backends exist — the historical per-slot files and one
+versioned JSON document per provider — and a single durable fact
+(`backend-authority.json`) says which one is authoritative. A deployment that
+has never run `cutover` keeps using the slot files exactly as before.
+
 ## Quota Data Sources & Architecture
 
 1. **Codex Quota**:
@@ -177,6 +199,7 @@ an Authorization header supplied to curl over stdin.
 ./quota-sentinel.sh run [codex|antigravity|opencode|all]
 ./quota-sentinel.sh card-preview [all|both|codex|antigravity|opencode|usage]
 ./quota-sentinel.sh send-test-card [all|both|codex|antigravity|opencode|usage|progress]
+./quota-sentinel.sh cutover
 ```
 
 - `check`: 15-minute watchdog probe. Independently evaluates each provider's 5h quota state without model invocations, and triggers only the provider(s) due for execution.
@@ -184,22 +207,60 @@ an Authorization header supplied to curl over stdin.
 - `run [codex|antigravity|opencode|all]`: Runs specified provider (or all three) and updates its schedule.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
+- `cutover`: one-time upgrade that makes the JSON state backend authoritative
+  (see [Upgrading from the legacy state backend](#upgrading-from-the-legacy-state-backend)).
 
-The Python state store has its own read/bootstrap verbs, equivalent under
-either entry point (parity is test-pinned):
+The Python side has its own verbs, equivalent under either entry point (parity
+is test-pinned):
 
 ```bash
 uv run quota-sentinel --help
 uv run python -m quota_sentinel --help
+
+# reads (follow the authoritative backend automatically)
 uv run quota-sentinel next-due codex
-uv run quota-sentinel dump codex
-uv run quota-sentinel json-dump codex
-uv run quota-sentinel migrate
+uv run quota-sentinel state-dump codex
+uv run quota-sentinel authority
+
+# per-backend diagnostics, for inspecting one side explicitly
+uv run quota-sentinel dump codex          # legacy slot files
+uv run quota-sentinel json-dump codex     # v1 JSON document
+
+# state-backend lifecycle
+uv run quota-sentinel migrate             # seed shadow documents (never overwrites)
+uv run quota-sentinel cutover             # make JSON authoritative (needs run.lock)
+uv run quota-sentinel rollback            # back to legacy, pure undo only
 ```
 
-`migrate` is the explicit Phase 2/3A bootstrap that seeds shadow JSON
-documents from the authoritative legacy slot files; the scheduler itself
-still runs entirely in the shell.
+`next-due` and `state-dump` read through whichever backend the durable
+authority manifest selects, so `status` reports the live state without
+knowing which backend that is. `authority` prints the manifest itself.
+
+### Upgrading from the legacy state backend
+
+Nothing changes until you ask for it: without a `backend-authority.json`
+manifest the per-slot files stay authoritative and every command behaves
+exactly as before.
+
+```bash
+./install-launchagents.sh        # syncs the environment and restarts the agent
+./quota-sentinel.sh cutover      # one-time ownership switch (run.lock held)
+```
+
+`cutover` reads the CURRENT slot files, writes and verifies one JSON document
+per provider, and only then publishes the ownership fact — a single atomic
+replace. Every crash point is recoverable: before the flip the slot files are
+still authoritative, and the flip itself is all-or-nothing. The slot files are
+left byte-for-byte untouched afterwards and act as the rollback artifact;
+`rollback` returns ownership to them and refuses once JSON state has advanced,
+because that would discard authoritative state.
+
+To reclaim the space after you are satisfied with the new backend, delete the
+per-provider files yourself (`<provider>-last-attempt-at`, `-last-task-at`,
+`-next-due-at`, `-retry-pending`, `-last-known-reset-at`, `-reset-anchor`,
+`-reset-candidate`, `-last-triggered-window`) — the project deliberately does
+not delete user state for you. Keep `backend-authority.json`: it is the
+ownership fact, not a rollback artifact.
 
 ## Local Task Orchestrator
 
@@ -221,8 +282,9 @@ control loop while leaving all deadline policy inside `quota-sentinel.sh`:
 
 The orchestrator decides only **when to invoke `check`**. Fresh/stale quota
 authority, reset+4 calibration, provider-specific scheduler-write blocking,
-5h01 fallback, pending debt, retries, and successful-task state commits remain
-implemented exclusively by the shell scheduler and are unchanged.
+5h01 fallback, pending debt, retries, and successful-task state commits are
+implemented exclusively by `quota_sentinel.scheduler`; the shell only drives
+the process side of a run and hands each outcome back to Python.
 
 Task executions and post-run deadline snapshots are stored in
 `~/Library/Application Support/Quota-Sentinel/task-orchestrator.sqlite3`
@@ -458,7 +520,22 @@ must run in the project environment so it exercises the real `lark_oapi`
 imports instead of any globally installed copy. `tests/uv-project-
 regression.py` is the environment guard itself: lock check, CLI/module
 entry-point parity, LaunchAgent-style `--project --frozen --no-sync`
-startup from a foreign working directory, and an offline runtime proof.
+startup from a foreign working directory, an offline runtime proof, and the
+rule that the shell's scheduler bridge stays stdlib-only on system Python.
+
+Suites worth knowing by name:
+
+| Suite | What it pins |
+| --- | --- |
+| `tests/state-store-parity-regression.zsh` | shell getters vs the Python store, value for value |
+| `tests/python-authority-regression.py` | the durable authority protocol, the router's read guard, and the cutover crash matrix |
+| `tests/state-authority-regression.zsh` | the operator-visible cutover lifecycle through the real shell |
+| `tests/python-scheduler-regression.py` | every scheduler transition, the observation reader, and that the shell holds no policy value of its own |
+| `tests/retry-regression.zsh`, `tests/p1-deadline-regression.zsh`, `tests/dynamic-schedule-regression.zsh` | the black-box scheduler contract: retry debt, matured-debt protection, dynamic reset calibration |
+| `tests/state-concurrency-regression.zsh` | write/read interleavings across processes |
+
+A new test may be added freely; an existing assertion is only changed when
+the contract itself changed, and the reason is recorded in the commit.
 
 ## License
 

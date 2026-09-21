@@ -189,6 +189,19 @@ require_legacy_backend() {
   esac
 }
 
+# Notification selection policy (Phase 5). Transport and card rendering stay
+# here; WHETHER to notify, for whom, and in which layout comes from
+# quota_sentinel.notifications.plan, so those rules exist in one place next
+# to the scheduler events that produce them.
+notification_plan_field() {
+  local field="$1" event="$2"
+  shift 2
+  local out rc=0
+  out="$(scheduler_bridge notification-plan --event "$event" "$@")" || rc=$?
+  (( rc == 0 )) || die "notification-plan failed for $event (rc=$rc)"
+  print -r -- "$(print -r -- "$out" | sed -n "s/^${field}=//p")"
+}
+
 # Render the bridge's machine output as the run log's existing lines. The
 # Python side emits explicit records precisely so the log keeps the shape it
 # had when the shell diffed the values itself:
@@ -2911,18 +2924,19 @@ dispatch_task_notification() {
   (( ${#attempted[@]} > 0 )) || return 0
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
     dispatch_notification "$(task_notification_message "${attempted[@]}")"
+    return 0
+  fi
+  local layout card_payload
+  layout="$(notification_plan_field layout task "${attempted[@]}")"
+  if [[ "$layout" == "stacked" ]]; then
+    card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "task" "${attempted[@]}")" || card_payload=""
   else
-    local card_payload
-    if provider_list_includes opencode "${attempted[@]}"; then
-      card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "task" "${attempted[@]}")" || card_payload=""
-    else
-      card_payload="$(build_feishu_v2_task_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "${attempted[@]}")" || card_payload=""
-    fi
-    if [[ -n "$card_payload" ]]; then
-      dispatch_notification "$card_payload"
-    else
-      dispatch_notification "$(task_notification_message "${attempted[@]}")"
-    fi
+    card_payload="$(build_feishu_v2_task_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "${attempted[@]}")" || card_payload=""
+  fi
+  if [[ -n "$card_payload" ]]; then
+    dispatch_notification "$card_payload"
+  else
+    dispatch_notification "$(task_notification_message "${attempted[@]}")"
   fi
 }
 
@@ -3021,10 +3035,12 @@ send_usage_notification() {
   if [[ "${FEISHU_DISABLE_CHART:-0}" == "1" ]]; then
     notification="$(usage_notification_message "$codex_quota" "$antigravity_quota" "$opencode_quota")"
   else
-    local card_payload
-    # The /usage card always covers the full provider roster, so it uses the
-    # stacked layout now that a third provider exists.
-    card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "usage" "${PROVIDERS[@]}")" || card_payload=""
+    local card_payload usage_roster
+    # The /usage card always covers the full provider roster — a rule owned
+    # by quota_sentinel.notifications.plan, which is also the roster's
+    # declared owner.
+    usage_roster="${(s:,:)$(notification_plan_field providers usage "${PROVIDERS[@]}")}"
+    card_payload="$(build_feishu_v2_stacked_payload "$(feishu_user_id 2>/dev/null || true)" "quota-sentinel-$(/bin/date '+%s')" "usage" ${=usage_roster})" || card_payload=""
     if [[ -n "$card_payload" ]]; then
       notification="$card_payload"
     else
