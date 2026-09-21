@@ -80,7 +80,10 @@ def run_migrate(state_dir: Path, providers: Optional[List[str]]) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python3 -m quota_sentinel")
+    # Stable product prog: identical help text whether invoked as the
+    # console script or `python -m quota_sentinel` (parity is pinned by
+    # tests/uv-project-regression.py).
+    parser = argparse.ArgumentParser(prog="quota-sentinel")
     parser.add_argument("--state-dir", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (

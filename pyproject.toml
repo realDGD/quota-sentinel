@@ -1,0 +1,23 @@
+[project]
+name = "quota-sentinel"
+version = "0.1.0"
+description = "macOS-first local AI quota scheduler and Feishu notifier"
+requires-python = ">=3.9"
+dependencies = [
+    "lark-oapi>=1.4.0",
+]
+
+[project.scripts]
+quota-sentinel = "quota_sentinel.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat layout lives at the repository root alongside the shell/launchd
+# assets by design (Phase 3A.5: no src/ migration). Only quota_sentinel/
+# is an installed package; the root-level helper scripts (task_orchestrator,
+# feishu_listener, run_with_timeout, *_usage) stay path-executed modules,
+# exactly as before this file existed.
+[tool.hatch.build.targets.wheel]
+packages = ["quota_sentinel"]
