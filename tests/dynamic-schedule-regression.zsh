@@ -272,11 +272,15 @@ sync_provider_deadline_from_quota codex "$rollover_now" || sync_rc=$?
 [[ "$(read_provider_next_due codex)" == "$old_due" ]]
 print -r -- "Case 10b (reset buffer blocks newer Fresh calibration): passed"
 
-# 11. Legacy state migration remains compatible.
+# 11. Legacy state migration remains compatible. Migration is now a bootstrap
+# step (main() entry) instead of a lazy getter side effect, so the upgrade
+# trigger is the explicit migrate_legacy_state call below; the observable
+# contract (legacy files → per-provider files, getters pure) is unchanged.
 reset_scheduler_state
 print -r -- "987654" >"$QUOTA_SENTINEL_STATE_DIR/last-task-at"
 print -r -- "876543" >"$QUOTA_SENTINEL_STATE_DIR/next-due-at"
 print -r -- "100000:200000" >"$QUOTA_SENTINEL_STATE_DIR/last-triggered-window"
+migrate_legacy_state
 [[ "$(read_provider_last_task codex)" == "987654" ]]
 [[ "$(read_provider_last_task antigravity)" == "987654" ]]
 [[ "$(read_provider_next_due codex)" == "876543" ]]

@@ -219,6 +219,10 @@ provider_last_window_file() {
   print -r -- "$STATE_DIR/${provider}-last-triggered-window"
 }
 
+# Bootstrap-only legacy upgrade step. Runs exactly once from main() for every
+# dispatching command; read_provider_* getters stay side-effect free so state
+# reads can rely on a pure load/commit boundary. Idempotent: every write is
+# guarded by the target file being absent.
 migrate_legacy_state() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -292,7 +296,6 @@ migrate_legacy_state() {
 
 read_provider_next_due() {
   local provider="$1" file value
-  migrate_legacy_state
   file="$(provider_next_due_file "$provider")"
   [[ -r "$file" ]] || return 1
   value="$(<"$file")"
@@ -325,7 +328,6 @@ write_provider_next_due() {
 
 read_provider_last_task() {
   local provider="$1" file value
-  migrate_legacy_state
   file="$(provider_last_task_file "$provider")"
   [[ -r "$file" ]] || return 1
   value="$(<"$file")"
@@ -342,7 +344,6 @@ write_provider_last_task() {
 
 read_provider_last_attempt() {
   local provider="$1" file value
-  migrate_legacy_state
   file="$(provider_last_attempt_file "$provider")"
   [[ -r "$file" ]] || return 1
   value="$(<"$file")"
@@ -387,7 +388,6 @@ write_provider_retry_pending() {
 
 read_provider_last_known_reset() {
   local provider="$1" file value
-  migrate_legacy_state
   file="$(provider_last_known_reset_file "$provider")"
   [[ -r "$file" ]] || return 1
   value="$(<"$file")"
@@ -457,7 +457,6 @@ clear_provider_reset_anchor() {
 
 read_provider_last_window() {
   local provider="$1" file value
-  migrate_legacy_state
   file="$(provider_last_window_file "$provider")"
   [[ -r "$file" ]] || return 1
   value="$(<"$file")"
@@ -2904,13 +2903,6 @@ send_usage_notification() {
   prepare_quota_probe
   collect_effective_quotas
 
-  # /usage never runs a model and never touches last-task/last-window, but its
-  # already-fetched live quota is authoritative enough to refresh deadlines.
-  local p
-  for p in "${PROVIDERS[@]}"; do
-    sync_provider_deadline_from_quota "$p" || true
-  done
-
   codex_quota="$(codex_quota_message)" || true
   antigravity_quota="$(antigravity_quota_message)" || true
   opencode_quota="$(opencode_quota_message)" || true
@@ -2929,6 +2921,25 @@ send_usage_notification() {
     fi
   fi
   release_quota_lock
+
+  # /usage never runs a model and never touches last-task/last-window, but its
+  # already-fetched live quota is authoritative enough to refresh deadlines.
+  # Scheduler state is serialized by run.lock, so this opportunistic sync runs
+  # only while the scheduler is idle, and it is attempted strictly AFTER
+  # quota.lock was released: the sanctioned nesting order is run→quota, and
+  # waiting on run.lock while holding quota.lock would invert it (ABBA).
+  # The attempt is non-blocking; a busy skip costs nothing because the lock
+  # holder is about to leave fresher state than this probe could provide.
+  if acquire_run_lock; then
+    local p
+    for p in "${PROVIDERS[@]}"; do
+      sync_provider_deadline_from_quota "$p" || true
+    done
+    release_run_lock
+  else
+    log_info "usage: scheduler busy; deadline sync skipped"
+  fi
+
   dispatch_notification "$notification"
   log_info "usage: completed ($(( $(now_epoch) - t0 ))s)"
 }
@@ -3119,6 +3130,15 @@ main() {
   local command="${1:-run}"
   MAIN_T0="$(now_epoch)"
   log_info "command: $command ${2:-} (pid $$)"
+
+  # State-touching commands bootstrap the legacy upgrade exactly once here.
+  # This is the same command set the lazy getter migration used to serve;
+  # pure display/debug verbs never touch provider state files.
+  case "$command" in
+    check|wait|run|usage|status)
+      migrate_legacy_state
+      ;;
+  esac
 
   case "$command" in
     check)
