@@ -133,4 +133,58 @@ sp3_expect="$(print -r -- "next codex run: $(format_reset_time $(( base_now + 10
 print -r -- "$sp3_out" | grep -Fqx "$sp3_expect"
 print -r -- "SP3 (status via store matches shell formatting exactly): passed"
 
+# ---- SP4: malformed-value registry (Phase 1.1) --------------------------------
+# Every pathological file content gets BOTH sides' verdict asserted
+# explicitly. "SAME" cases prove agreement; DIVERGENCE cases are deliberate
+# strictness decisions for content no project writer can produce — they are
+# pinned here so the difference is known forever, never discovered.
+epoch_verdicts=()
+for v in "" "garbage" "42" "42
+43" " 42" "42 " "42"$'\r' "+5" "-5" "5_0" "٤٢" "007"; do
+  rm -f "$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at"
+  printf '%s\n' "$v" >"$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at"
+  s="$(read_provider_next_due codex 2>/dev/null || echo unset)"
+  p="$(py_slot codex next_due_at)"
+  epoch_verdicts+=("[$v] shell=$s python=$p")
+done
+# Agreements on all reject-cases, canonical agreement on "42":
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[42] shell=42 python=42'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[garbage] shell=unset python=unset'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[ 42] shell=unset python=unset'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[+5] shell=unset python=unset'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[-5] shell=unset python=unset'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[5_0] shell=unset python=unset'
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq $'[٤٢] shell=unset python=unset'
+# CRLF: shell keeps the CR and rejects; python must NOT normalize it away:
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq $'[42\r] shell=unset python=unset'
+# DIVERGENCE #1 (registered): zero-padded epoch — shell echoes raw bytes,
+# store canonicalizes to the integer value. Both are valid epochs to the
+# scheduler (arithmetic equality); display divergence is accepted.
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '[007] shell=007 python=7'
+# Multi-line garbage (the "[42 / 43]" pair of verdict lines): both reject.
+printf '%s\n' "${epoch_verdicts[@]}" | grep -Fq '43] shell=unset python=unset'
+
+# Compound slot:
+rm -f "$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+printf '%s\n' "5:6" >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+[[ "$(read_provider_reset_candidate codex)" == "5:6" && "$(py_slot codex reset_candidate)" == "5:6" ]]
+# DIVERGENCE #2 (registered): multi-colon garbage — the shell slices
+# first:last ("5:6:7" → "5:7" = a valid-looking candidate!); the store
+# rejects to None. Writers only emit one colon; strictness here prevents a
+# corrupt file from being silently interpreted as a candidate.
+printf '%s\n' "5:6:7" >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+[[ "$(read_provider_reset_candidate codex 2>/dev/null || echo unset)" == "5:7" ]]
+[[ "$(py_slot codex reset_candidate)" == "unset" ]]
+# Padded compound: both reject.
+printf '%s\n' " 5:6 " >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+[[ "$(read_provider_reset_candidate codex 2>/dev/null || echo unset)" == "unset" ]]
+[[ "$(py_slot codex reset_candidate)" == "unset" ]]
+# Corrupt encoding bytes: shell treats as unparsable value; store unsets
+# the slot ONLY (other slots still readable — asserted in the python suite).
+printf '\377\376\n' >"$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+[[ "$(read_provider_reset_candidate codex 2>/dev/null || echo unset)" == "unset" ]]
+[[ "$(py_slot codex reset_candidate)" == "unset" ]]
+rm -f "$QUOTA_SENTINEL_STATE_DIR/codex-reset-candidate"
+print -r -- "SP4 (malformed-value registry: agreements + 2 registered divergences): passed"
+
 print -r -- "state-store parity regression: all cases passed"

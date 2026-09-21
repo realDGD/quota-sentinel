@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """Behavioural tests for quota_sentinel.state (ProviderState + FileStateStore).
 
-The store must behave slot-for-slot like the shell getters/writers over the
-same files (that agreement is proven end-to-end by
-tests/state-store-parity-regression.zsh). Locked down here:
+The store must behave like the shell getters/writers over the same files
+for every value the project's writers can produce (registered pathological
+divergences are enumerated by tests/state-store-parity-regression.zsh).
+Locked down here:
 
-* load purity: no dir creation, no repair, unparsable reads as unset;
+* load purity: no dir creation, no repair; a bad slot (unparsable,
+  corrupt encoding) unsets ITSELF and never poisons the other seven;
 * transient reset_candidate semantics (None == definitely no candidate);
-* commit = optimistic-concurrency guard + only-changed-slot publish;
-* commit crash prefixes stay at-least-once directional
-  (next_due_at is published last, so any partial commit leaves the
-  provider looking due-again, never silently done).
+* commit is plan-then-execute: every validation/encoding failure leaves
+  the disk byte-for-byte untouched (no partial commit on bad input);
+* the old_state check is defensive misuse detection, NOT a CAS
+  (test_stale_check_is_defensive_not_cas demonstrates why production
+  writers must serialize externally via run.lock);
+* persistence validation survives python -O (no assert in store paths)
+  and refuses bool-masquerading-as-int epochs;
+* state_dir ownership: commit creates/normalizes mode 0700; load never
+  does; a no-op commit creates nothing;
+* crash prefixes of the SUCCESS transition stay at-least-once
+  directional (next_due_at published last). Other transitions are not
+  yet migrated and carry no blanket guarantee.
 """
 from __future__ import annotations
 
@@ -217,11 +227,16 @@ class CommitTests(unittest.TestCase):
     def test_crash_prefixes_stay_at_least_once(self) -> None:
         """Success-commit: debt cleared + deadline pushed forward.
 
+        SCOPE NOTE: this proves the crash-prefix at-least-once property
+        for the SUCCESS transition only (the one whose write order the
+        canonical SLOTS list mirrors). Other transitions — generation
+        init, far-reset promotion, debt creation, candidate lifecycle —
+        must be crash-tested individually before being moved behind
+        commit(); do not read this test as a global guarantee.
+
         For EVERY crash point between slot publishes, the on-disk residue
         must still demand work: either retry_pending is still 1, or
-        next_due_at is still the old matured (past) value. Silently-done
-        residue (pending 0 AND future deadline) may only exist after the
-        complete commit.
+        next_due_at is still the old matured (past) value.
         """
         matured = 1_000  # already in the past
         old = ProviderState(
@@ -260,11 +275,10 @@ class CommitTests(unittest.TestCase):
         )
         self.assertGreater(changed_count, 1)
 
-        # Crash points are strictly BETWEEN publishes: k runs over the first
-        # changed_count-1 prefixes. A crash after the last publish would be
-        # a completed commit, verified separately below.
+        # Crash points are strictly BETWEEN publishes. Countdown semantics:
+        # iteration k raises after exactly (k + 1) slots were published.
         for k in range(changed_count - 1):
-            with self.subTest(crash_after_slot=k):
+            with self.subTest(crash_after_n_published_slots=k + 1):
                 for path in self.state_dir.glob("codex-*"):
                     path.unlink()
                 for suffix, value in [
@@ -292,7 +306,7 @@ class CommitTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     work_still_demanded,
-                    f"crash after slot {k} silently lost the due task",
+                    f"crash after {k + 1} publishes silently lost the due task",
                 )
         # Full commit then lands cleanly:
         store = FileStateStore(self.state_dir)
@@ -331,6 +345,416 @@ class CliTests(unittest.TestCase):
             self._run("dump", "codex")
         self.assertIn("reset_candidate=900:100", buffer.getvalue())
         self.assertIn("next_due_at=unset", buffer.getvalue())
+
+
+# ======================================================================
+# Phase 1.1 hardening contracts
+# ======================================================================
+
+def disk_signature(state_dir: Path) -> list:
+    """(name, bytes, mode) for every file — the 'untouched' yardstick."""
+    entries = []
+    for path in sorted(state_dir.iterdir()):
+        entries.append((path.name, path.read_bytes(), os.stat(path).st_mode & 0o777))
+    return entries
+
+
+class PlanBeforePersistenceTests(unittest.TestCase):
+    """T1/T2/T3: no filesystem mutation may happen until the ENTIRE
+    mutation plan has been validated and encoded."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = FileStateStore(self.state_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_full_valid(self) -> ProviderState:
+        for suffix, value in [
+            ("last-attempt-at", "100"), ("last-task-at", "100"),
+            ("next-due-at", "500"), ("retry-pending", "0"),
+            ("last-known-reset-at", "400"), ("last-triggered-window", "400"),
+            ("reset-anchor", "400"),
+        ]:
+            write_slot(self.state_dir, "codex", suffix, value)
+        return self.store.load("codex")
+
+    def test_t1_invalid_late_slot_aborts_earlier_valid_writes(self) -> None:
+        old = self._seed_full_valid()
+        before = disk_signature(self.state_dir)
+        new = ProviderState(
+            last_attempt_at=999,          # valid, would publish FIRST
+            last_task_at=old.last_task_at,
+            next_due_at=old.next_due_at,
+            retry_pending=old.retry_pending,
+            last_known_reset=old.last_known_reset,
+            last_triggered_window=old.last_triggered_window,
+            reset_anchor=old.reset_anchor,
+            reset_candidate=None,
+        )
+        # An ILLEGAL deletion of a persistent slot late in the plan
+        # (next_due_at=None is ordered last): must abort pre-mutation.
+        new_illegal = ProviderState(
+            last_attempt_at=999, last_task_at=old.last_task_at,
+            next_due_at=None,               # illegal clear
+            retry_pending=old.retry_pending,
+            last_known_reset=old.last_known_reset,
+            last_triggered_window=old.last_triggered_window,
+            reset_anchor=old.reset_anchor, reset_candidate=None,
+        )
+        with self.assertRaises(StateStoreError):
+            self.store.commit("codex", old, new_illegal)
+        self.assertEqual(
+            disk_signature(self.state_dir), before,
+            "illegal late mutation leaked earlier valid writes to disk",
+        )
+
+    def test_t2_encoding_failure_zero_mutation(self) -> None:
+        old = self._seed_full_valid()
+        before = disk_signature(self.state_dir)
+        new = ProviderState(
+            last_attempt_at=999,           # valid change, canonical FIRST
+            last_task_at=old.last_task_at,
+            next_due_at=old.next_due_at,
+            retry_pending=old.retry_pending,
+            last_known_reset=old.last_known_reset,
+            last_triggered_window="un\\nrepresentable\nvalue",  # illegal raw
+            reset_anchor=old.reset_anchor,
+            reset_candidate=None,
+        )
+        with self.assertRaises(StateStoreError):
+            self.store.commit("codex", old, new)
+        self.assertEqual(disk_signature(self.state_dir), before)
+
+    def test_t3_bool_can_not_masquerade_as_epoch(self) -> None:
+        # type() checks in _encode must reject bool in every int slot,
+        # including inside ResetCandidate — even though bool is an int
+        # subclass and True >= 0.
+        old = self._seed_full_valid()
+        before = disk_signature(self.state_dir)
+        offenders = [
+            ProviderState(**{**old.__dict__, "last_attempt_at": True}),
+            ProviderState(**{**old.__dict__, "next_due_at": False}),
+            ProviderState(**{**old.__dict__, "reset_anchor": True}),
+            ProviderState(**{**old.__dict__, "last_known_reset": False}),
+            ProviderState(**{**old.__dict__,
+                             "reset_candidate": ResetCandidate(True, 5)}),
+            ProviderState(**{**old.__dict__,
+                             "reset_candidate": ResetCandidate(5, False)}),
+            ProviderState(**{**old.__dict__, "retry_pending": 1}),  # int-as-bool
+        ]
+        for bad in offenders:
+            with self.subTest(state=bad):
+                with self.assertRaises(StateStoreError):
+                    self.store.commit("codex", old, bad)
+        self.assertEqual(disk_signature(self.state_dir), before)
+
+    def test_t4_validation_survives_python_O(self) -> None:
+        # Run the same invalid commits under `python3 -O`, where any
+        # assert-based validation would have evaporated. Must still raise.
+        script = (
+            "import sys, tempfile, os\n"
+            "sys.path.insert(0, %r)\n"
+            "from quota_sentinel.state import (FileStateStore, ProviderState, "
+            "ResetCandidate, StateStoreError)\n"
+            "d = tempfile.mkdtemp()\n"
+            "s = FileStateStore(__import__('pathlib').Path(d))\n"
+            "open(os.path.join(d, 'codex-next-due-at'), 'w').write('500\\n')\n"
+            "open(os.path.join(d, 'codex-retry-pending'), 'w').write('0\\n')\n"
+            "old = s.load('codex')\n"
+            "bad = [old.__class__(**{**old.__dict__, 'next_due_at': True}),\n"
+            "       old.__class__(**{**old.__dict__, 'last_attempt_at': -1}),\n"
+            "       old.__class__(**{**old.__dict__, 'last_task_at': 3.5}),\n"
+            "       old.__class__(**{**old.__dict__, 'reset_candidate': ResetCandidate(True, 1)}),\n"
+            "       old.__class__(**{**old.__dict__, 'retry_pending': 1})]\n"
+            "for candidate in bad:\n"
+            "    try:\n"
+            "        s.commit('codex', old, candidate)\n"
+            "    except StateStoreError:\n"
+            "        continue\n"
+            "    sys.exit('ACCEPTED under -O: ' + repr(candidate))\n"
+            "print('OK')\n"
+            % str(Path(__file__).resolve().parent.parent)
+        )
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-O", "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
+
+class CorruptSlotIsolationTests(unittest.TestCase):
+    """T5 + §P2-1: one corrupt slot unsets itself, never poisons the load."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = FileStateStore(self.state_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_invalid_utf8_slot_degrades_independently(self) -> None:
+        write_slot(self.state_dir, "codex", "next-due-at", "1756000000")
+        write_slot(self.state_dir, "codex", "last-task-at", "123")
+        (self.state_dir / "codex-last-known-reset-at").write_bytes(b"\xff\xfe\x00garbage")
+        (self.state_dir / "codex-reset-candidate").write_bytes(b"\xc3(\xc3(\xc3(")
+        state = self.store.load("codex")
+        self.assertIsNone(state.last_known_reset)      # corrupt → unset
+        self.assertIsNone(state.reset_candidate)       # corrupt → unset
+        self.assertEqual(state.next_due_at, 1756000000)  # siblings intact
+        self.assertEqual(state.last_task_at, 123)
+
+    def test_load_is_pure_even_against_corrupt_slots(self) -> None:
+        (self.state_dir / "codex-last-attempt-at").write_bytes(b"\xed\xa0\x80")
+        self.store.load("codex")
+        self.assertEqual(
+            (self.state_dir / "codex-last-attempt-at").read_bytes(), b"\xed\xa0\x80"
+        )
+
+
+class StateDirOwnershipTests(unittest.TestCase):
+    """T6: the store's write path owns the persistence-dir invariant."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_commit_creates_missing_dir_0700_and_files_0600(self) -> None:
+        target = self.root / "nested" / "state"
+        store = FileStateStore(target)
+        old = store.load("codex")
+        store.commit("codex", old, ProviderState(next_due_at=555))
+        self.assertTrue(target.is_dir())
+        self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
+        self.assertEqual(
+            oct(os.stat(target / "codex-next-due-at").st_mode & 0o777), "0o600"
+        )
+
+    def test_commit_normalizes_loose_existing_dir(self) -> None:
+        target = self.root / "loose"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        store = FileStateStore(target)
+        store.commit("codex", store.load("codex"), ProviderState(next_due_at=555))
+        self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
+
+    def test_noop_commit_creates_nothing(self) -> None:
+        target = self.root / "absent"
+        store = FileStateStore(target)
+        empty = store.load("codex")          # pure read of missing dir
+        store.commit("codex", empty, empty)  # empty plan
+        self.assertFalse(target.exists())
+
+    def test_unwritable_parent_surfaces_as_state_store_error(self) -> None:
+        # A 0500 target dir would self-heal (owner may chmod own dir —
+        # that is the ensure step working, not a failure). The genuine
+        # unrecoverable case is an unwritable PARENT: mkdir raises
+        # PermissionError, which must surface as StateStoreError with
+        # context, never as a bare OSError.
+        parent = self.root / "locked-parent"
+        parent.mkdir()
+        os.chmod(parent, 0o500)
+        try:
+            store = FileStateStore(parent / "child-state")
+            store.load("codex")                      # pure read still works
+            with self.assertRaises(StateStoreError):
+                store.commit("codex", store.load("codex"),
+                             ProviderState(next_due_at=555))
+        finally:
+            os.chmod(parent, 0o700)
+
+
+class StaleCheckScopeTests(unittest.TestCase):
+    """T7: the old_state comparison is defensive detection, NOT a CAS."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = FileStateStore(self.state_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_matured_debt(self) -> ProviderState:
+        for suffix, value in [
+            ("last-attempt-at", "900"), ("last-task-at", "900"),
+            ("next-due-at", "1000"), ("retry-pending", "1"),
+            ("last-known-reset-at", "800"), ("reset-anchor", "800"),
+        ]:
+            write_slot(self.state_dir, "codex", suffix, value)
+        return self.store.load("codex")
+
+    def test_stale_commit_is_refused_before_mutation(self) -> None:
+        old = self._seed_matured_debt()
+        write_slot(self.state_dir, "codex", "next-due-at", "999")  # moved already
+        with self.assertRaises(StaleStateError):
+            self.store.commit("codex", old, ProviderState(next_due_at=600))
+        self.assertEqual(
+            (self.state_dir / "codex-next-due-at").read_text().strip(), "999"
+        )
+
+    def test_stale_check_is_defensive_not_cas(self) -> None:
+        # An external write AFTER the stale check but BEFORE the final
+        # publish is silently overwritten. This is exactly why production
+        # writers must serialize on run.lock — the store does not and
+        # cannot fix this, and the test pins that as the contract.
+        old = self._seed_matured_debt()
+        tripped = {"done": False}
+
+        def external_write(_attribute: str) -> None:
+            if not tripped["done"]:
+                tripped["done"] = True
+                write_slot(self.state_dir, "codex", "next-due-at", "2222")
+
+        self.store.on_slot_committed = external_write
+        new = ProviderState(
+            last_attempt_at=5000, last_task_at=5000, next_due_at=20000,
+            retry_pending=False, last_known_reset=800,
+            last_triggered_window=None, reset_anchor=None, reset_candidate=None,
+        )
+        self.store.commit("codex", old, new)   # NOT an error…
+        self.assertEqual(self.store.load("codex").next_due_at, 20000)
+        # …and the concurrent writer's 2222 was clobbered. Proof: no CAS.
+
+
+class MalformedValueParityTests(unittest.TestCase):
+    """§11: every shell-vs-store behavior on malformed content is a
+    REGISTERED decision. Cases marked DIVERGENCE are deliberate strictness
+    against content no project writer produces; the shell column records
+    what the shell getter does (cross-checked by the zsh parity suite).
+
+    (raw-file-content, python_result, shell_result)
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = FileStateStore(self.state_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _epoch(self, content: str) -> Optional[int]:
+        for path in self.state_dir.glob("codex-*"):
+            path.unlink()
+        write_slot(self.state_dir, "codex", "next-due-at", content)
+        return self.store.load("codex").next_due_at
+
+    def test_epoch_table(self) -> None:
+        cases = [
+            ("", None, "unset"),
+            ("garbage", None, "unset"),
+            ("42", 42, "42"),
+            ("42\n43", None, "unset"),        # embedded newline (2-line file)
+            (" 42", None, "unset"),           # leading space
+            ("42 ", None, "unset"),           # trailing space
+            ("42\r", None, "unset"),          # CRLF residue
+            ("+5", None, "unset"),
+            ("-5", None, "unset"),
+            ("5_0", None, "unset"),
+            ("\u0664\u0662", None, "unset"),  # non-ASCII digits (٤٢)
+            ("007", 7, "007"),                # DIVERGENCE: python canonicalizes,
+                                              # shell echoes raw; numerically equal,
+                                              # both pass the shell's own regex reads
+            ("42", 42, "42"),
+        ]
+        for content, expected, shell_note in cases:
+            with self.subTest(content=content, shell=shell_note):
+                self.assertEqual(self._epoch(content), expected)
+
+    def test_compound_table(self) -> None:
+        def compound(content: str) -> Optional[ResetCandidate]:
+            for path in self.state_dir.glob("codex-*"):
+                path.unlink()
+            write_slot(self.state_dir, "codex", "reset-candidate", content)
+            return self.store.load("codex").reset_candidate
+
+        self.assertEqual(compound("5:6"), ResetCandidate(5, 6))
+        self.assertIsNone(compound("5:6:7"))   # DIVERGENCE: shell slices 5:7; strict here
+        self.assertIsNone(compound("5"))
+        self.assertIsNone(compound(" 5:6 "))
+        self.assertIsNone(compound("5:"))
+        self.assertIsNone(compound(":6"))
+        self.assertIsNone(compound("a:b"))
+        self.assertIsNone(compound(""))
+
+    def test_pending_table(self) -> None:
+        def pending(content: str) -> bool:
+            for path in self.state_dir.glob("codex-*"):
+                path.unlink()
+            write_slot(self.state_dir, "codex", "retry-pending", content)
+            return self.store.load("codex").retry_pending
+
+        self.assertTrue(pending("1"))
+        for bad in ("0", " 1", "1 ", "11", "true", ""):
+            with self.subTest(content=bad):
+                self.assertFalse(pending(bad))
+
+    def test_raw_window_preserves_content_except_line_breaks(self) -> None:
+        for path in self.state_dir.glob("codex-*"):
+            path.unlink()
+        write_slot(self.state_dir, "codex", "last-triggered-window", "w-2026-08-29")
+        self.assertEqual(
+            self.store.load("codex").last_triggered_window, "w-2026-08-29"
+        )
+
+
+class ScheduleStateContractSpecTests(unittest.TestCase):
+    """§12: FileStateStore is intentionally NOT wired into
+    task_orchestrator.ScheduleState yet. This class records the contract
+    the future unification must preserve, and today's deliberate parser
+    differences — so they are known, not discovered later.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.store = FileStateStore(self.state_dir)
+        import task_orchestrator
+        self.ScheduleState = task_orchestrator.ScheduleState
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_aggregate_contract_must_survive_unification(self) -> None:
+        # min over non-pending providers, exclude pending debts, snapshot
+        # shape, and the provider roster all belong to the orchestrator
+        # layer — NOT to the store (store stays per-provider pure read).
+        write_slot(self.state_dir, "codex", "next-due-at", "300")
+        write_slot(self.state_dir, "antigravity", "next-due-at", "100")
+        write_slot(self.state_dir, "opencode", "next-due-at", "500")
+        schedule = self.ScheduleState(self.state_dir)
+        self.assertEqual(schedule.next_due(), 100)
+        self.assertEqual(schedule.snapshot(),
+                         {"codex": 300, "antigravity": 100, "opencode": 500})
+        # pending debt excluded from wake math (watchdog repays it instead)
+        write_slot(self.state_dir, "antigravity", "retry-pending", "1")
+        self.assertEqual(self.ScheduleState(self.state_dir).next_due(), 300)
+        # all pending → None
+        for p in ("codex", "opencode"):
+            write_slot(self.state_dir, p, "retry-pending", "1")
+        self.assertIsNone(self.ScheduleState(self.state_dir).next_due())
+
+    def test_parser_divergence_is_registered(self) -> None:
+        # ScheduleState parses int(raw) after .strip(): it accepts
+        # " 5 " and "+5" and "5_0"; the shell regex and FileStateStore do
+        # NOT. Recorded so unification decides explicitly which side wins
+        # instead of silently changing wake behavior.
+        write_slot(self.state_dir, "codex", "next-due-at", "5_0")
+        for p in ("antigravity", "opencode"):
+            (self.state_dir / f"{p}-next-due-at").write_text("999999999\n")
+        self.assertEqual(
+            self.ScheduleState(self.state_dir).snapshot()["codex"], 50
+        )
+        self.assertIsNone(self.store.load("codex").next_due_at)
 
 
 if __name__ == "__main__":

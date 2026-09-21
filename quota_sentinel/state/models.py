@@ -2,15 +2,25 @@
 
 The models are the Python-side view of the shell scheduler's authoritative
 state files (see ARCHITECTURE.md). Field semantics deliberately mirror the
-shell getters slot for slot:
+shell getters for every value the project's writers can produce:
 
 * a missing or unparsable slot reads as ``None`` — a load never repairs;
 * ``retry_pending`` is ``False`` both when the file is absent and when it
   holds ``"0"`` (the shell only treats the literal ``1`` as pending);
-* ``reset_candidate`` is transient: ``None`` means "definitely no candidate",
-  the same meaning the file's absence carries in the shell. A future JSON
-  backend must encode that as an explicit ``null``; a *missing key* is a
-  schema error, never business state.
+* ``reset_candidate`` is transient: ``None`` means "definitely no
+  candidate", the same meaning the file's absence carries in the shell. A
+  future JSON backend must encode that as an explicit ``null``; a
+  *missing key* is a schema error, never business state.
+
+The compound parser accepts only the canonical ``reset:observed`` form.
+The shell reader is looser on pathological content (it slices first:last
+of any colon-bearing string); that content cannot be produced by project
+writers, and the stricter behavior here is a registered, deliberate
+divergence (see tests/state-store-parity-regression.zsh), not an
+accidental drift.
+
+Models are plain carriers: they do not re-validate what commit() checks
+at the persistence boundary.
 
 Models know nothing about file names or layout — that is store.py's job.
 """

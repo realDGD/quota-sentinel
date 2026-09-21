@@ -2,9 +2,11 @@
 
 Only reads are exposed: the shell remains the sole writer of scheduler
 state until the scheduler-policy phase. The shell's `status` verb routes
-its next-due display through `next-due` to prove the store's read
-semantics match the shell getters exactly (fallback is built into the
-caller so this can never change what status reports).
+its next-due display through `next-due`; store and shell getters agree on
+every value project writers produce (divergences on pathological content
+are registered by tests/state-store-parity-regression.zsh) and the
+fallback is built into the caller, so this can never change what status
+reports.
 """
 from __future__ import annotations
 

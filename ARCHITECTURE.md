@@ -117,19 +117,55 @@ state:
 
 * `ProviderState` models the eight slots structurally (transient
   `reset_candidate` as an explicit `None`-able value); models know no file
-  names.
+  names and do not re-validate what the persistence boundary checks.
 * `FileStateStore` reads and writes exactly the shell's per-provider file
-  layout, with semantics mirrored slot-for-slot from the shell getters
-  (unset on missing/unparsable, never "repair"). `load()` is pure;
-  `commit(old → new)` re-checks disk state first (a stale caller fails
-  loudly rather than clobbering), publishes only changed slots, deletes
-  only the transient slots, and keeps `next_due_at` last so every crash
-  prefix of a commit remains at-least-once directional.
+  layout. `load()` is pure — a missing, unparsable, or corrupt-encoding
+  slot reads as `None`, unsets only itself, and is never repaired.
+* `commit(old → new)` is plan-then-execute: the stale check, the provider
+  name validation, the legality of every requested change (only
+  `reset_candidate`/`reset_anchor` may be cleared) and the full encoding
+  of every value complete BEFORE the first filesystem mutation. An
+  invalid transition leaves the disk byte-for-byte untouched. Values are
+  validated explicitly (no `assert` on persistence paths — `python -O`
+  must not weaken them) and `bool` is rejected wherever an epoch int is
+  required.
+* The store owns the persistence-directory invariant on its WRITE path
+  only: `commit` creates/normalizes `state_dir` to mode 0700 before its
+  first publish and writes files 0600; `load` never creates anything and
+  a no-op commit publishes/creates nothing.
+* **The `old_state` stale check is defensive misuse detection only.** It
+  is NOT a compare-and-swap and NOT cross-process serialization: a
+  writer that mutates disk after the check but before the publishes will
+  be silently overwritten (`test_stale_check_is_defensive_not_cas` pins
+  this). **Every future production StateStore writer must execute inside
+  the existing `run.lock` serialization boundary.** No such writer is
+  wired today, which is why none is listed in the write-path registry.
+* The canonical publish order mirrors `commit_provider_success` with
+  `next_due_at` last, so crash prefixes of the SUCCESS transition stay
+  at-least-once directional — and that is currently all the order is
+  proven for. Other scheduler transitions (generation init, far-reset
+  promotion, retry-debt creation/repayment, candidate lifecycle) must be
+  individually reviewed and crash-tested before being moved behind
+  `commit()`; the global slot order must not be assumed to cover them.
 * Only ONE shell path is wired through it today: the `status` next-due
-  display (`status_next_due`), with the shell getter as automatic fallback.
-  Scheduler policy, quota logic and **every state write** still run in the
-  shell unchanged. Parity is enforced by
-  `tests/state-store-parity-regression.zsh`.
+  display (`status_next_due`), a read with the shell getter as automatic
+  fallback. Scheduler policy, quota logic and **every state write** still
+  run in the shell unchanged.
+* Shell↔store agreement holds for every value project writers produce.
+  Two pathological-content divergences (multi-colon `reset_candidate`
+  where the shell slices first:last, and zero-padded epochs where the
+  shell echoes raw bytes) are deliberate strictness/canonicalization
+  decisions, enumerated case by case in
+  `tests/state-store-parity-regression.zsh` (SP4) and the store's Python
+  suite; the parity wording is intentionally not "100% slot-for-slot on
+  arbitrary bytes".
+* `task_orchestrator.ScheduleState` is deliberately NOT unified onto the
+  store yet: it owns cross-provider aggregation (min due, exclude
+  pending, snapshot, roster) and its epoch parser is looser than the
+  shell's (`int()` accepts `+5`, `5_0`, padded digits). The contract the
+  future unification must preserve is pinned by
+  `ScheduleStateContractSpecTests`; wiring changes wait for their own
+  phase.
 
 Future phases (JSON backend, scheduler decisions, quota adapters) grow out
 of this seam one boundary at a time — see the migration order in the
