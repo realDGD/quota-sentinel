@@ -123,12 +123,13 @@ state:
   slot reads as `None`, unsets only itself, and is never repaired.
 * `commit(old → new)` is plan-then-execute: the stale check, the provider
   name validation, the legality of every requested change (only
-  `reset_candidate`/`reset_anchor` may be cleared) and the full encoding
-  of every value complete BEFORE the first filesystem mutation. An
-  invalid transition leaves the disk byte-for-byte untouched. Values are
-  validated explicitly (no `assert` on persistence paths — `python -O`
-  must not weaken them) and `bool` is rejected wherever an epoch int is
-  required.
+  `reset_candidate`/`reset_anchor` may be cleared) and the SERIALIZATION
+  of every value to its final UTF-8 bytes complete BEFORE the first
+  filesystem mutation. An invalid transition leaves the disk
+  byte-for-byte untouched — the publish stage can fail only on
+  filesystem errors, never on business values. Values are validated
+  explicitly (no `assert` on persistence paths — `python -O` must not
+  weaken them) and `bool` is rejected wherever an epoch int is required.
 * The store owns the persistence-directory invariant on its WRITE path
   only: `commit` creates/normalizes `state_dir` to mode 0700 before its
   first publish and writes files 0600; `load` never creates anything and

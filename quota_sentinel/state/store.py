@@ -13,9 +13,11 @@ Contract (see ARCHITECTURE.md):
 
 * ``commit`` is the only side effect. It is plan-then-execute: the stale
   check, the mutation-plan build (provider-name validation, legality of
-  every requested change, and full encoding of every value) all complete
-  BEFORE the first filesystem mutation. A validation or encoding error
-  therefore leaves the disk byte-for-byte untouched.
+  every requested change, and SERIALIZATION of every value to its final
+  UTF-8 bytes) all complete BEFORE the first filesystem mutation. A
+  validation, encoding or text-encoding error therefore leaves the disk
+  byte-for-byte untouched; the publish stage can only fail on filesystem
+  errors, never on business values.
 
 * The ``old_state`` comparison is defensive misuse detection only. It is
   NOT a compare-and-swap and NOT cross-process serialization: a writer
@@ -96,13 +98,13 @@ class StaleStateError(StateStoreError):
 
 
 class _Mutation(NamedTuple):
-    """One planned filesystem change, fully validated and encoded before
-    any mutation begins."""
+    """One planned filesystem change, fully validated AND serialized to
+    its final persistable bytes before any mutation begins."""
 
     attribute: str
     path: Path
     operation: str          # "write" | "delete"
-    encoded: Optional[str]  # payload for "write"; None for "delete"
+    payload: Optional[bytes]  # final on-disk bytes for "write"; None for "delete"
 
 
 def _decode_epoch(raw: Optional[str]) -> Optional[int]:
@@ -195,14 +197,39 @@ def _encode(codec: str, value: object) -> str:
     raise StateStoreError(f"unknown codec {codec!r}")
 
 
-def _publish_atomic(path: Path, text: str) -> None:
-    """Complete-then-rename: readers see old or new value, never a mix."""
+def _serialize_for_slot(
+    provider: str, attribute: str, codec: str, value: object
+) -> bytes:
+    """validate → text → FINAL UTF-8 bytes, in the plan stage.
+
+    Everything the persistence write can choke on (type/range legality,
+    representability, text-level and byte-level encoding) fails HERE, so
+    no value-level failure can surface once filesystem mutations have
+    begun. Errors carry provider and slot context.
+    """
+    try:
+        text = _encode(codec, value)
+    except StateStoreError as exc:
+        raise StateStoreError(f"{provider}: slot {attribute}: {exc}") from exc
+    try:
+        return (text + "\n").encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise StateStoreError(
+            f"{provider}: slot {attribute}: value is not UTF-8 representable "
+            f"and cannot be persisted: {exc}"
+        ) from exc
+
+
+def _publish_atomic(path: Path, payload: bytes) -> None:
+    """Publish ALREADY-ENCODED bytes: complete-then-rename, so readers see
+    old or new value, never a mix. No value-level serialization or
+    encoding may happen here — the bytes are final by contract."""
     directory = path.parent
     temp = directory / f"{path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write((text + "\n").encode("utf-8"))
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
@@ -305,9 +332,10 @@ class FileStateStore(ProviderStateStore):
                     )
                 plan.append(_Mutation(attribute, path, "delete", None))
             else:
-                plan.append(
-                    _Mutation(attribute, path, "write", _encode(codec, new_value))
-                )
+                # Full serialization to final bytes, HERE: once phase 3
+                # begins, no value-level failure is possible anymore.
+                payload = _serialize_for_slot(provider, attribute, codec, new_value)
+                plan.append(_Mutation(attribute, path, "write", payload))
 
         if not plan:
             # An empty transition publishes nothing and creates nothing
@@ -321,7 +349,7 @@ class FileStateStore(ProviderStateStore):
                 if mutation.operation == "delete":
                     mutation.path.unlink(missing_ok=True)
                 else:
-                    _publish_atomic(mutation.path, mutation.encoded or "")
+                    _publish_atomic(mutation.path, mutation.payload or b"")
             except OSError as exc:
                 raise StateStoreError(
                     f"{provider}: failed to {mutation.operation} slot "

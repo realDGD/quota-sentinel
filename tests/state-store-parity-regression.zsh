@@ -1,13 +1,16 @@
 #!/bin/zsh
 # Python FileStateStore ↔ shell getters parity regression (SP-* cases).
 #
-# The strangler contract: quota_sentinel.state must read the shell's
-# per-provider state files EXACTLY like the shell's own getters do —
-# same values, same unset rules, same transient reset_candidate compound —
-# and must be strictly read-only. status() already routes its next-due
-# display through the store (with the shell getter as fallback), so this
-# suite is the compatibility proof for that seam and the guard for every
-# future one.
+# The strangler contract: for every value the project's writers can
+# produce, quota_sentinel.state must read the shell's per-provider state
+# files with the same semantics as the shell's own getters — same values,
+# same unset rules, same transient reset_candidate compound — and must be
+# strictly read-only. Known malformed-input divergences (zero-padded
+# epochs, multi-colon candidates) are explicitly registered in SP4, so
+# they remain decisions rather than discoveries. status() already routes
+# its next-due display through the store (with the shell getter as
+# fallback), so this suite is the compatibility proof for that seam and
+# the guard for every future one.
 # Fully isolated: temp state, stubbed probes, no network.
 
 set -euo pipefail

@@ -9,8 +9,10 @@ Locked down here:
 * load purity: no dir creation, no repair; a bad slot (unparsable,
   corrupt encoding) unsets ITSELF and never poisons the other seven;
 * transient reset_candidate semantics (None == definitely no candidate);
-* commit is plan-then-execute: every validation/encoding failure leaves
-  the disk byte-for-byte untouched (no partial commit on bad input);
+* commit is plan-then-execute: every change is validated AND serialized
+  to its final UTF-8 bytes during plan build, so no failure — illegal
+  clear, bad type, unencodable text — can occur after the first
+  filesystem mutation (T1/T2/R1/R2);
 * the old_state check is defensive misuse detection, NOT a CAS
   (test_stale_check_is_defensive_not_cas demonstrates why production
   writers must serialize externally via run.lock);
@@ -428,6 +430,75 @@ class PlanBeforePersistenceTests(unittest.TestCase):
             self.store.commit("codex", old, new)
         self.assertEqual(disk_signature(self.state_dir), before)
 
+    def test_r1_late_utf8_failure_leaves_disk_untouched(self) -> None:
+        # Lone surrogate: a perfectly valid Python str that passes the raw
+        # codec's text-level checks but CANNOT be UTF-8 encoded. If the
+        # UTF-8 step ran inside the publish phase, last_attempt_at (valid,
+        # canonical-first) would already be on disk when it fails.
+        old = self._seed_full_valid()
+        before = disk_signature(self.state_dir)
+        new = ProviderState(
+            last_attempt_at=999,               # valid, planned FIRST
+            last_task_at=old.last_task_at,
+            next_due_at=old.next_due_at,
+            retry_pending=old.retry_pending,
+            last_known_reset=old.last_known_reset,
+            last_triggered_window="\ud800",    # encodable? no: late failure
+            reset_anchor=old.reset_anchor,
+            reset_candidate=None,
+        )
+        with self.assertRaises(StateStoreError) as ctx:
+            self.store.commit("codex", old, new)
+        # The refusal must be typed + contextual, not a raw UnicodeError:
+        message = str(ctx.exception)
+        self.assertIn("codex", message)
+        self.assertIn("last_triggered_window", message)
+        # Zero mutation: even the valid earlier slot never reached disk,
+        # and not even a temp file was ever created (signature covers
+        # the full dir listing incl. any debris):
+        self.assertEqual(disk_signature(self.state_dir), before)
+        self.assertEqual(
+            (self.state_dir / "codex-last-attempt-at").read_text().strip(), "100"
+        )
+
+    def test_r2_unencodable_value_fails_before_first_filesystem_touch(self) -> None:
+        # Plan-stage proof: wrap every primitive that could touch the fs;
+        # any call while building the plan for an unencodable value is a
+        # contract violation.
+        old = self._seed_full_valid()
+        new = ProviderState(
+            last_attempt_at=999,
+            last_task_at=old.last_task_at,
+            next_due_at=old.next_due_at,
+            retry_pending=old.retry_pending,
+            last_known_reset=old.last_known_reset,
+            last_triggered_window="\ud800",
+            reset_anchor=old.reset_anchor,
+            reset_candidate=None,
+        )
+        fs_touches = []
+        real_open = os.open
+        real_replace = os.replace
+        real_unlink = os.unlink
+        real_mkdir = os.mkdir
+
+        def spy_open(*args, **kwargs):
+            fs_touches.append(("open", args[0]))
+            return real_open(*args, **kwargs)
+
+        os.open = spy_open
+        os.replace = lambda *a: (fs_touches.append(("replace", a[0])), real_replace(*a))[1]
+        try:
+            with self.assertRaises(StateStoreError):
+                self.store.commit("codex", old, new)
+        finally:
+            os.open = real_open
+            os.replace = real_replace
+        # No state file (or temp under any name) was ever opened/replaced:
+        offenders = [t for t in fs_touches
+                     if isinstance(t[1], (str, Path)) and "codex-" in str(t[1])]
+        self.assertEqual(offenders, [])
+
     def test_t3_bool_can_not_masquerade_as_epoch(self) -> None:
         # type() checks in _encode must reject bool in every int slot,
         # including inside ResetCandidate — even though bool is an int
@@ -468,7 +539,11 @@ class PlanBeforePersistenceTests(unittest.TestCase):
             "       old.__class__(**{**old.__dict__, 'last_attempt_at': -1}),\n"
             "       old.__class__(**{**old.__dict__, 'last_task_at': 3.5}),\n"
             "       old.__class__(**{**old.__dict__, 'reset_candidate': ResetCandidate(True, 1)}),\n"
-            "       old.__class__(**{**old.__dict__, 'retry_pending': 1})]\n"
+            "       old.__class__(**{**old.__dict__, 'retry_pending': 1}),\n"
+            # R3: lone surrogate — valid str, unencodable to UTF-8. Built
+            # inside the subprocess so no shell quoting games; must still
+            # be refused under -O, pre-mutation, as StateStoreError.
+            "       old.__class__(**{**old.__dict__, 'last_triggered_window': \"\\ud800\"})]\n"
             "for candidate in bad:\n"
             "    try:\n"
             "        s.commit('codex', old, candidate)\n"
