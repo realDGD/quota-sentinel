@@ -320,5 +320,59 @@ class CliErrorSurfaceTests(unittest.TestCase):
             store.document_path("../evil")
 
 
+# ---- ARCHITECTURE.md contract phrases must survive doc edits -----------------
+class ArchitectureDocGuardTests(unittest.TestCase):
+    """The Phase 3A contract lives in ARCHITECTURE.md. These guards fail
+    if a doc edit drops one of the load-bearing sentences; each asserted
+    string is deliberately a CONTRACT, not prose style."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.arch = (
+            Path(__file__).resolve().parent.parent / "ARCHITECTURE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_source_of_truth_and_lock_precondition(self) -> None:
+        self.assertIn("Source of truth is absolute", self.arch)
+        self.assertIn("a lock file existing does not imply the caller owns it",
+                      self.arch)
+
+    def test_prepared_is_not_authoritative(self) -> None:
+        self.assertIn("Phase 3A PREPARED is NOT JSON AUTHORITATIVE",
+                      self.arch)
+        self.assertIn(
+            "Phase 3A only prepares a semantically current JSON document",
+            self.arch,
+        )
+
+    def test_validation_pipeline_named(self) -> None:
+        self.assertIn(
+            "validate_state -> state_to_document -> validate_document "
+            "-> deterministic UTF-8 bytes", self.arch,
+        )
+
+    def test_load_failure_policy_named(self) -> None:
+        for phrase in ("MissingStateDocumentError", "DocumentCorruptError",
+                       "SchemaError", "FAIL CLOSED on state mutation"):
+            self.assertIn(phrase, self.arch)
+
+    def test_durability_scope_words_carefully(self) -> None:
+        self.assertIn(
+            "Atomic-visibility guarantees cover process crash and "
+            "concurrent readers", self.arch,
+        )
+        self.assertIn("Power-loss durability", self.arch)
+        self.assertIn("NOT claimed and NOT implemented", self.arch)
+
+    def test_phase3b_questions_present(self) -> None:
+        self.assertIn("Phase 3B ownership-switch design questions",
+                      self.arch)
+        self.assertIn("double-truth risk", self.arch)
+
+    def test_migrate_vs_prepare_contradiction_table(self) -> None:
+        self.assertIn("the exact opposite of Phase 2 `migrate_provider`",
+                      self.arch)
+
+
 if __name__ == "__main__":
     unittest.main()

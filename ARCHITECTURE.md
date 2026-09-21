@@ -243,6 +243,94 @@ Later phases (scheduler decisions, quota adapters) grow out of these
 seams one boundary at a time — see the migration order in the project
 log, never a big-bang rewrite.
 
+## Cutover preparation (Phase 3A)
+
+`quota_sentinel.state.cutover.prepare_provider_cutover` refreshes a
+provider's shadow JSON from the CURRENT authoritative legacy state and
+verifies semantic equality. It is preparation for a future cutover, not
+the cutover itself.
+
+Source of truth is absolute: the legacy slot files as read at call time.
+A pre-existing shadow document — stale, all-null or corrupt — is
+replaced, never trusted, never timestamp-compared and never "resolved"
+against legacy (there is deliberately no conflict-resolution algorithm).
+This is the exact opposite of Phase 2 `migrate_provider`
+(seed-if-absent, existing JSON wins) and the two operations must not be
+conflated:
+
+| | migrate (Phase 2) | prepare (Phase 3A) |
+|---|---|---|
+| existing JSON | always wins, skip | replaced if semantically different |
+| corrupt JSON | blocks seeding | rebuilt from legacy |
+| purpose | freeze a shadow snapshot | make the shadow current |
+| requires run.lock context | no (skip-only) | YES (precondition, see below) |
+
+Contract:
+
+* PRECONDITION: the caller already holds `run.lock` (serialization
+  against authoritative writers). The primitive does not and must not
+  verify or fake it: a lock file existing does not imply the caller owns it.
+  Mechanical proof comes with Phase 3B wiring, where the caller is
+  the lock holder.
+* Validation pipeline (single rule source, no drift), one contiguous
+  contract phrase: validate_state -> state_to_document -> validate_document -> deterministic UTF-8 bytes — entirely before any filesystem operation.
+* POSTCONDITION on success: legacy slot files byte-identical; the
+  document decodes (through the ordinary loud loader) to EXACTLY the
+  legacy ProviderState; idempotent re-runs write nothing.
+* On ANY failure (domain, schema, publish, verification): legacy
+  untouched and authoritative, shadow old-complete-or-absent.
+  Rollback from a Phase 3A failure is literally "do nothing".
+
+Phase 3A PREPARED is NOT JSON AUTHORITATIVE. Ownership after a
+successful prepare is exactly ownership before it: legacy files
+authoritative, JSON a semantically-current shadow. No scheduler
+transition executes here; the at-least-once semantics of the shell are
+untouched. Phase 3A only prepares a semantically current JSON document;
+it does not alter scheduler execution semantics.
+
+Authoritative JSON load-failure policy (binding on Phase 3B, when
+production reads may start hitting JSON errors): the three typed
+failures — MissingStateDocumentError, DocumentCorruptError, SchemaError —
+must FAIL CLOSED on state mutation: never default an unreadable document
+to ProviderState(), never mark work completed, never advance a deadline,
+never drop a retry debt or pending candidate; surface loudly and keep
+the existing durable state intact. Silent defaults are the one failure
+mode that directly violates at-least-once. Recovery mechanics (who
+rebuilds from what, how operators intervene) are Phase 3B design work;
+the prohibition is absolute now.
+
+Durability scope, stated precisely: Atomic-visibility guarantees cover process crash and concurrent readers (temp + fsync + atomic rename — readers always see old-complete or new-complete). Power-loss durability (post-rename persistence after a hard reboot: parent-directory fsync, macOS F_FULLFSYNC) is NOT claimed and NOT implemented. Making JSON
+authoritative does not by itself change this envelope — today's slot
+files have exactly the same property — but if a future design requires
+power-loss durability, it needs evidence and its own design review
+first, not an opportunistic fsync pile-on.
+
+Phase 3B ownership-switch design questions (must be answered BEFORE any
+reader/writer flips; no production switch was implemented in 3A):
+
+1. Which durable fact expresses "JSON is authoritative"? Candidate
+   designs must be argued, not assumed — adding a new state file
+   (backend-owner / cutover-complete flag) is disallowed without
+   justifying against double-truth risk, atomicity, recovery, and
+   versioning. An alternative with no new state: keep legacy slot files
+   as the marker itself (their presence/absence or content IS the
+   signal) — to be evaluated.
+2. How are reader and writer prevented from disagreeing mid-switch
+   (reader=JSON/writer=legacy or the reverse)? Likely answer: both
+   flips happen inside one run.lock-held critical section, derived per
+   invocation from durable facts, never cached across processes.
+3. Switch order: refresh-and-verify (this phase's prepare) must be
+   proven current INSIDE the same locked section that flips the writer.
+4. Crash after any partial point of the switch: recovery must be
+   mechanically derivable from durable state alone (idempotent prepare +
+   legacy-readable-until-final-step).
+5. Rollback path: while legacy files remain present, byte-complete and
+   still-written, rollback = flip derivation back; this is why 3B must
+   NOT delete or freeze-consume legacy files.
+6. When do legacy files stop being authoritative (final writer flip)?
+7. When — if ever — may legacy files be deleted? (Answer is very likely
+   "not in Phase 3B"; removal needs its own reviewed step.)
+
 ## Shell freeze
 
 `quota-sentinel.sh` is in functional freeze: bug fixes, compatibility fixes,
