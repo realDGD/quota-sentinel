@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional
 
@@ -223,20 +224,26 @@ def _serialize_for_slot(
 def _publish_atomic(path: Path, payload: bytes) -> None:
     """Publish ALREADY-ENCODED bytes: complete-then-rename, so readers see
     old or new value, never a mix. No value-level serialization or
-    encoding may happen here — the bytes are final by contract."""
+    encoding may happen here — the bytes are final by contract.
+
+    Temp names come from tempfile.mkstemp (kernel-globally unique): a
+    pid+random scheme is only probabilistically safe, and mkstemp also
+    fixes creation mode at 0600.
+    """
     directory = path.parent
-    temp = directory / f"{path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(directory), prefix=f"{path.name}.tmp.", suffix=""
+    )
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        os.replace(temp_name, path)
     except BaseException:
         # Clean up our temp file, but let the original error propagate.
         try:
-            os.unlink(temp)
+            os.unlink(temp_name)
         except OSError:
             pass
         raise

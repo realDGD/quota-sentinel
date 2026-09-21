@@ -615,6 +615,44 @@ class MigrationTests(unittest.TestCase):
             [p.name for p in (self.state_dir).iterdir() if ".tmp." in p.name], []
         )
 
+    # M4c (Phase 3A §32): deterministic full interleaving of the seed
+    # TOCTOU window. The exists()-pre-check sees "absent"; a concurrent
+    # JSON writer publishes BEFORE this migration's link(2) runs; the
+    # seed must then take EEXIST, return json-exists, and preserve the
+    # WRITER's bytes.
+    def test_m4c_deterministic_seed_toctou_window(self) -> None:
+        self._write_legacy("codex", next_due_at=500)
+        import quota_sentinel.state.migration as mig
+        from quota_sentinel.state.store import _publish_atomic
+
+        real_fs = mig.FileStateStore
+        winner_state = ProviderState(next_due_at=31337)
+        raced = {"done": False}
+
+        class RacingFileStore(real_fs):
+            def load(self, provider):
+                state = super().load(provider)
+                if provider == "codex" and not raced["done"]:
+                    raced["done"] = True
+                    self.state_dir.mkdir(parents=True, exist_ok=True)
+                    _publish_atomic(
+                        self.state_dir / "codex-state.json",
+                        serialize_state(winner_state, "codex"),
+                    )
+                return state
+
+        mig.FileStateStore = RacingFileStore
+        try:
+            action = migrate_provider(self.state_dir, "codex")
+        finally:
+            mig.FileStateStore = real_fs
+        self.assertTrue(raced["done"])                 # window really ran
+        self.assertEqual(action, ACTION_EXISTS)        # link took EEXIST
+        self.assertEqual(self.json_store.load("codex"), winner_state)
+        self.assertEqual(
+            [p.name for p in self.state_dir.iterdir() if ".tmp." in p.name], []
+        )
+
     # M5: corrupt legacy values travel through FileStateStore semantics
     # (unset), are NOT repaired, and the raw legacy files stay intact.
     def test_m5_legacy_garbage_not_repaired(self) -> None:

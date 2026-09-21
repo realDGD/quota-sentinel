@@ -23,6 +23,7 @@ by this module. Consequences, by design:
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -44,22 +45,27 @@ def seed_document_if_absent(json_path: Path, payload: bytes) -> bool:
     Returns True when this call seeded the document, False when a
     document already existed (ours was dropped). link(2) makes the
     existence test and the creation one atomic act — no check-then-write
-    window against a concurrent writer.
+    window against a concurrent writer. Temp naming uses mkstemp
+    (kernel-unique), so concurrent seeds can never collide on the temp
+    name itself; 0600 is fixed at creation.
     """
     directory = json_path.parent
-    # pid alone is insufficient across threads in one process; add
-    # randomness so concurrent seeds never collide on the temp name.
-    temp = directory / (
-        f"{json_path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}.seed"
-    )
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=f"{json_path.name}.tmp.", suffix=".seed"
+        )
+    except OSError as exc:
+        raise StateStoreError(
+            f"failed to create seed temp near {json_path}: {exc}"
+        ) from exc
+    seeded: bool
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temp, json_path)
+            os.link(temp_name, json_path)
             seeded = True
         except FileExistsError:
             seeded = False
@@ -69,7 +75,7 @@ def seed_document_if_absent(json_path: Path, payload: bytes) -> bool:
             ) from exc
     finally:
         try:
-            os.unlink(temp)
+            os.unlink(temp_name)
         except OSError:
             pass
     return seeded

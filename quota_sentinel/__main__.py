@@ -114,6 +114,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     except StateStoreError as exc:
         print(f"quota_sentinel: {exc}", file=sys.stderr)
         return 4
+    except ValueError as exc:
+        # e.g. an invalid provider name: a concise typed CLI error, not a
+        # traceback. The LIBRARY keeps raising ValueError (it is a
+        # programmer error); only the CLI edge converts it.
+        print(f"quota_sentinel: invalid argument: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

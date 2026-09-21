@@ -272,5 +272,53 @@ class CutoverPreparationTests(unittest.TestCase):
         self.assertEqual(self.files.load("codex"), STALE)
 
 
+# ---- Phase 3A P3 (§31): CLI edge converts ValueErrors to typed errors -------
+class CliErrorSurfaceTests(unittest.TestCase):
+    """The CLI converts library ValueErrors (bad provider names) into
+    concise typed non-zero exits; the library itself keeps raising."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, *argv: str):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from quota_sentinel.__main__ import main
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = main(list(argv))
+        return rc, err.getvalue()
+
+    def test_invalid_provider_on_every_read_verb(self) -> None:
+        for cmd in ("json-dump", "dump", "next-due"):
+            with self.subTest(cmd=cmd):
+                rc, err = self._run("--state-dir", str(self.dir), cmd, "../evil")
+                self.assertEqual(rc, 3)
+                self.assertIn("invalid argument", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_migrate_invalid_provider(self) -> None:
+        rc, err = self._run("--state-dir", str(self.dir), "migrate", "../evil")
+        self.assertEqual(rc, 3)
+        self.assertIn("invalid argument", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_missing_document_still_rc4_typed(self) -> None:
+        rc, err = self._run("--state-dir", str(self.dir), "json-dump", "codex")
+        self.assertEqual(rc, 4)
+        self.assertIn("no state document", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_library_contract_not_softened_by_cli(self) -> None:
+        store = JsonStateStore(self.dir)
+        with self.assertRaises(ValueError):
+            store.document_path("../evil")
+
+
 if __name__ == "__main__":
     unittest.main()
