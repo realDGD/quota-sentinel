@@ -19,10 +19,25 @@ touched here:
        mutate the environment;
 * UV7  the isolated antigravity boundary is still OUTSIDE the project:
        --no-project behavior unaffected by the root pyproject existing.
+* UV8  committed metadata carries NO user-local registry: uv.lock sources
+       are public PyPI only (no mirrors/localhost/private IPs/user paths),
+       and pyproject declares no index config — a generator machine's
+       personal uv.toml can never ride into the repository again
+       (reproducibility invariant: committed dependency metadata must not
+       depend on untracked user-local uv configuration).
+ * UV8b that policy is declared in the project itself (no [tool.uv]);
+ * UV8c the UV8 leak rules are canary-tested, so a future refactor cannot
+       silently turn one of them into a dead regex.
+* UV9  the build backend is version-constrained (uv does not record
+       build-system requires in uv.lock, so the pin lives in pyproject).
+* UV10 deployment contract: uv run --frozen --no-sync never mutates the
+       environment (byte-signature of .venv/bin stable across a run) —
+       runtime does not self-heal; re-sync belongs to the installer.
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -160,6 +175,140 @@ class UvProjectTests(unittest.TestCase):
             capture_output=True, text=True, timeout=120, cwd="/private/tmp",
         )
         self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    # ---- UV8: committed dependency metadata vs user-local configuration ----
+    OFFICIAL_HOSTS = ("pypi.org", "files.pythonhosted.org", "pypi.python.org")
+    LEAK_PATTERNS = (
+        r"localhost",
+        r"127\.0\.0\.1",
+        r"0\.0\.0\.0",
+        # Private ranges are matched only in host position (after a scheme
+        # or as a host key): a bare \b10\.\d+ would false-positive on any
+        # future dependency whose version starts with 10.x / 172.20.x.
+        r"(?:https?://|host\s*=\s*\")(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+"
+        r"|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|127\.)",
+        r"mirrors\.",           # public-but-personal CN mirrors (cernet/sustech/…)
+        r"file:///",
+        r"/Users/",             # user home paths
+        r"/home/",
+        r"\\\\",                # windows shares (future-proof)
+        # uv.lock encodes the index inside an inline table
+        #   source = { registry = "https://pypi.org/simple" }
+        # so a line-anchored ^registry rule can never fire; match the value
+        # anywhere and allow only the official simple-index roots.
+        r'registry\s*=\s*"(?!https://(?:pypi\.org|files\.pythonhosted\.org'
+        r'|pypi\.python\.org)(?:/|"))',
+    )
+
+    # Canaries for UV8c: the guard above must demonstrably still fire on a
+    # real leak and stay quiet on legitimate metadata. Without this, a
+    # refactor can silently turn a rule into a dead regex.
+    LEAK_CANARIES = (
+        'source = { registry = "https://mirrors.sustech.edu.cn/pypi/simple" }',
+        'source = { registry = "http://10.0.0.5:8081/simple" }',
+        'host = "192.168.1.9"',
+        'url = "http://localhost:8080/simple"',
+        'url = "file:///Users/example/wheels"',
+        'url = "https://pypi.org.evil.example/simple"',
+    )
+    LEAK_CLEAN_SAMPLES = (
+        'source = { registry = "https://pypi.org/simple" }',
+        'url = "https://files.pythonhosted.org/packages/x/foo-10.2.3-py3-none-any.whl"',
+        'url = "https://files.pythonhosted.org/packages/x/bar-172.20.1-py3-none-any.whl"',
+    )
+
+    def _violations(self, text: str) -> list[str]:
+        """Guard decision procedure for committed dependency metadata.
+
+        Two independent rules, both must hold:
+          1. no blacklisted fingerprint (blacklist; fast, specific);
+          2. every http(s) URL host is an official PyPI host (allow-list;
+             this is what catches unknown mirrors and look-alike domains
+             such as pypi.org.evil.example that no blacklist would know).
+        """
+        bad = [f"fingerprint {pat!r}" for pat in self.LEAK_PATTERNS
+               if re.search(pat, text)]
+        for host in re.findall(r"https?://([^/\"\s]+)", text):
+            host = host.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+            if host not in self.OFFICIAL_HOSTS:
+                bad.append(f"non-official host {host!r}")
+        return bad
+
+    def _scan(self, text: str, where: str) -> None:
+        bad = self._violations(text)
+        self.assertEqual(bad, [], f"{where} leaked local-registry metadata: {bad}")
+
+    def test_uv8_committed_lock_is_registry_clean(self) -> None:
+        lock = (REPO / "uv.lock").read_text(encoding="utf-8")
+        self._scan(lock, "uv.lock")
+        # positive: every source registry is official PyPI
+        for reg in set(re.findall(r'registry = "([^"]+)"', lock)):
+            self.assertTrue(
+                any(h in reg for h in self.OFFICIAL_HOSTS),
+                f"non-official registry in lock: {reg}",
+            )
+        self.assertGreater(len(re.findall(r'registry = "', lock)), 0)
+
+    # ---- UV8c: the leak guard itself must not rot ---------------------------
+    def test_uv8c_leak_guard_canaries(self) -> None:
+        for canary in self.LEAK_CANARIES:
+            self.assertTrue(
+                self._violations(canary),
+                f"leak guard missed known-bad metadata: {canary}",
+            )
+        for sample in self.LEAK_CLEAN_SAMPLES:
+            self.assertEqual(
+                self._violations(sample), [],
+                f"leak guard false-positives on official metadata: {sample}",
+            )
+
+    def test_uv8b_pyproject_declares_no_index_config(self) -> None:
+        # Project policy: default public PyPI. Users may set UV_INDEX /
+        # their own uv.toml at INSTALL time (deployment concern, §29); the
+        # repository itself must never carry index/personal registry config.
+        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertNotIn("[[tool.uv.index]]", pyproject)
+        self.assertNotIn("[tool.uv]", pyproject)
+        self._scan(pyproject, "pyproject.toml")
+
+    # ---- UV9: build backend must be version-constrained --------------------
+    def test_uv9_build_backend_pinned(self) -> None:
+        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'requires\s*=\s*\[([^\]]*)\]', pyproject)
+        self.assertIsNotNone(m, "build-system requires not found")
+        req = m.group(1)
+        self.assertIn("hatchling", req)
+        self.assertRegex(
+            req, r'hatchling\s*==\s*[0-9][0-9.]*',
+            "hatchling must be exact-pinned (uv.lock does not record "
+            "build dependencies; see ARCHITECTURE.md)",
+        )
+
+    # ---- UV10: --frozen --no-sync never mutates the environment -------------
+    def test_uv10_no_sync_runtime_cannot_mutate_env(self) -> None:
+        # Signature = (relpath, size) of every file under .venv EXCLUDING
+        # __pycache__ (a read-only run legitimately writes fresh .pyc
+        # files; that is not an environment change). Any package add /
+        # remove / content-size change moves this signature; mtimes are
+        # deliberately not compared, since import caching would churn them.
+        def env_sig() -> list:
+            root = REPO / ".venv"
+            out = []
+            for p in root.rglob("*"):
+                rp = str(p.relative_to(root))
+                if "__pycache__" in rp or not p.is_file():
+                    continue
+                out.append((rp, p.stat().st_size))
+            return sorted(out)
+
+        before = env_sig()
+        r = uv_run("python", "-c", "import lark_oapi, quota_sentinel; print('ran')",
+                   cwd=str(REPO))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(env_sig(), before,
+                         "uv run --frozen --no-sync mutated the project "
+                         "environment — runtime must not self-heal; the "
+                         "installer's uv sync --locked owns env freshness")
 
 
 if __name__ == "__main__":
