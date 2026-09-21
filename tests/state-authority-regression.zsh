@@ -200,4 +200,49 @@ print -r -- "$legacy_out" | grep -q '^backend=legacy$' ||
   fail "the legacy backend did not serve the same decision path"
 print -r -- "  PASS: the decision policy is identical on both backends"
 
+# ---------------------------------------------------------------------------
+# AB8: the post-run sync path works under JSON authority.
+#
+# Regression for a real defect this suite's sibling audit found: the post-run
+# window record was still a legacy slot write, so `run` would have died (or,
+# without the guard, written the retired backend) immediately after the first
+# cutover. This drives the exact sequence that path performs.
+print -r -- "== AB8: post-run window + deadline sync under JSON authority =="
+now="$(now_epoch)"
+future=$(( now + 1800 ))
+print -r -- "{\"source\":\"test\",\"fresh\":true,\"fiveHour\":{\"resetAt\":$future},\"weekly\":{\"resetAt\":$(( future + 500000 ))}}" >"$quota_file"
+scheduler_bridge scheduler-commit-success --provider antigravity --now "$now" >/dev/null
+bridge_run_logged "state" \
+  scheduler-last-window --provider antigravity --reset "$future" >/dev/null
+[[ "$(scheduler_bridge state-dump antigravity | grep '^last_triggered_window=')" == "last_triggered_window=$future" ]] ||
+  fail "the post-run window record did not reach the JSON document"
+sync_rc=0
+scheduler_bridge scheduler-sync --provider antigravity --now "$now" \
+  --quota-file "$quota_file" --fresh 1 >/dev/null || sync_rc=$?
+(( sync_rc == 0 )) || fail "post-run sync failed under JSON authority (rc=$sync_rc)"
+[[ "$(scheduler_bridge next-due antigravity)" == "$(( future + RESET_BUFFER_SECONDS ))" ]] ||
+  fail "post-run sync did not calibrate the JSON deadline"
+# The whole sequence left every legacy byte alone. AB3 deliberately wrote a
+# legacy slot to prove retired writes are invisible, so the baseline here is
+# taken now rather than reused from AB1.
+# Only the LEGACY SLOT files are frozen; the JSON documents in the same
+# directory are the live backend and are expected to change.
+typeset -a LEGACY_SLOTS=(
+  codex-next-due-at codex-last-task-at codex-last-attempt-at
+  antigravity-next-due-at antigravity-last-task-at antigravity-last-attempt-at
+)
+typeset -A LEGACY_NOW=()
+for name in "${LEGACY_SLOTS[@]}"; do
+  [[ -e "$QUOTA_SENTINEL_STATE_DIR/$name" ]] || continue
+  LEGACY_NOW[$name]="$(cat "$QUOTA_SENTINEL_STATE_DIR/$name")"
+done
+(( ${#LEGACY_NOW} > 0 )) || fail "no legacy slot files to compare against"
+scheduler_bridge scheduler-sync --provider codex --now "$now" \
+  --quota-file "$quota_file" --fresh 1 >/dev/null 2>&1 || true
+for name in "${(@k)LEGACY_NOW}"; do
+  [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/$name")" == "${LEGACY_NOW[$name]}" ]] ||
+    fail "the post-run path wrote the retired legacy file $name"
+done
+print -r -- "  PASS: post-run window and sync are JSON-only"
+
 print -r -- "state authority regression: all cases passed"

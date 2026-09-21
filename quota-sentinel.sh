@@ -2960,9 +2960,12 @@ run_selected_providers() {
       if [[ "$(provider_final_result "$provider")" == "发送成功" ]]; then
         reset_val="$(valid_provider_reset_at "$provider" "$probe_now" || true)"
         if [[ "$reset_val" =~ ^[0-9]+$ ]]; then
-          write_provider_last_window "$provider" "$reset_val"
+          bridge_run_logged "state" \
+            scheduler-last-window --provider "$provider" --reset "$reset_val"
           sync_provider_deadline_from_quota "$provider" "$probe_now"
-          log_info "run: post-run sync $provider fresh_reset=$reset_val due=$(( reset_val + RESET_BUFFER_SECONDS ))"
+          # The resulting deadline is read back from the domain: the shell
+          # does no deadline arithmetic, not even to compose a log line.
+          log_info "run: post-run sync $provider fresh_reset=$reset_val due=$(scheduler_bridge next-due "$provider" 2>/dev/null || print -r -- unset)"
         else
           log_info "run: post-run sync $provider no valid fresh reset (fallback stands)"
         fi
