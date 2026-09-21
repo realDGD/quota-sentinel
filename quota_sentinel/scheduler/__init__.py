@@ -48,7 +48,6 @@ from .service import (
     apply_transition,
     commit_success as commit_success_state,
     decide_due,
-    ensure_authority,
     load_roster,
     load_state,
     next_due,
@@ -99,5 +98,4 @@ __all__ = [
     "retry_due_providers",
     "pending_providers",
     "next_due",
-    "ensure_authority",
 ]

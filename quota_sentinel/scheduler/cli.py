@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from ..state.authority import initialize_authority
+from ..state.cutover import cutover_to_json, rollback_to_legacy
 from ..state.models import ProviderState, ResetCandidate
 from ..state.migration import DEFAULT_PROVIDERS
 
@@ -160,12 +162,51 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_ensure_authority(args: argparse.Namespace) -> int:
-    authority = service.ensure_authority(args.state_dir)
-    print(f"backend={authority.backend}")
-    print(f"epoch={authority.epoch}")
-    print(f"log=info\tauthoritative backend is {authority.backend} "
-          f"(epoch {authority.epoch})")
+def cmd_cutover(args: argparse.Namespace) -> int:
+    """INTERNAL: the ownership switch, WITHOUT acquiring run.lock.
+
+    The caller (quota-sentinel.sh) already holds it. Taking it again from
+    this process would fail against its own caller, so this verb
+    deliberately does not — which is exactly why it is not an operator
+    command. Operators use a lock-acquiring entry point instead:
+
+        ./quota-sentinel.sh cutover      (shell, holds run.lock)
+        uv run quota-sentinel cutover    (public, acquires run.lock)
+    """
+    result = cutover_to_json(args.state_dir, args.providers or None)
+    print(f"backend={result.current.backend}")
+    print(f"epoch={result.current.epoch}")
+    print(f"changed={1 if result.changed else 0}")
+    print(f"log=info\tauthoritative backend is {result.current.backend} "
+          f"(epoch {result.current.epoch})")
+    return 0
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    """INTERNAL: return ownership to legacy, WITHOUT acquiring run.lock.
+
+    Same precondition and reasoning as ``scheduler-cutover``. The
+    lock-acquiring equivalents are ``./quota-sentinel.sh rollback`` and
+    ``uv run quota-sentinel rollback``.
+    """
+    result = rollback_to_legacy(args.state_dir, args.providers or None)
+    print(f"backend={result.current.backend}")
+    print(f"epoch={result.current.epoch}")
+    print(f"changed={1 if result.changed else 0}")
+    print(f"log=info\tauthoritative backend is {result.current.backend} "
+          f"(epoch {result.current.epoch})")
+    return 0
+
+
+def cmd_initialize_authority(args: argparse.Namespace) -> int:
+    """INTERNAL: materialize the bootstrap manifest, without run.lock."""
+    result = initialize_authority(args.state_dir)
+    print(f"backend={result.authority.backend}")
+    print(f"epoch={result.authority.epoch}")
+    print(f"created={1 if result.created else 0}")
+    print(f"log=info\tauthority manifest "
+          f"{'created as' if result.created else 'already present as'} "
+          f"{result.authority.backend} (epoch {result.authority.epoch})")
     return 0
 
 
@@ -365,38 +406,45 @@ def cmd_next_due(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def register(sub: argparse._SubParsersAction) -> None:
     """Attach the scheduler verbs to the top-level parser."""
-    config = sub.add_parser("scheduler-config", help="print scheduler policy constants")
+    config = sub.add_parser("scheduler-config", help="INTERNAL BRIDGE API: print scheduler policy constants")
     config.set_defaults(handler=cmd_config)
 
-    ensure = sub.add_parser(
-        "scheduler-ensure-authority",
-        help="cut over to the JSON backend if that has not happened yet",
-    )
-    ensure.set_defaults(handler=cmd_ensure_authority)
+    for name, handler, helptext in (
+        ("scheduler-cutover", cmd_cutover,
+         "INTERNAL BRIDGE API: switch ownership to JSON (caller already holds run.lock)"),
+        ("scheduler-rollback", cmd_rollback,
+         "INTERNAL BRIDGE API: switch ownership back to legacy (caller already holds run.lock)"),
+        ("scheduler-initialize-authority", cmd_initialize_authority,
+         "INTERNAL BRIDGE API: materialize the bootstrap manifest (caller already holds run.lock)"),
+    ):
+        parser = sub.add_parser(name, help=helptext)
+        parser.add_argument("providers", nargs="*", default=None,
+                            help="override the default provider roster")
+        parser.set_defaults(handler=handler)
 
-    valid = sub.add_parser("scheduler-valid-reset", help="plausible fresh reset, if any")
+    valid = sub.add_parser("scheduler-valid-reset", help="INTERNAL BRIDGE API: plausible fresh reset, if any")
     valid.add_argument("--provider", required=True)
     _add_now(valid)
     _add_quota(valid)
     valid.set_defaults(handler=cmd_valid_reset)
 
-    fallback = sub.add_parser("scheduler-fallback-due", help="no-quota fallback deadline")
+    fallback = sub.add_parser("scheduler-fallback-due", help="INTERNAL BRIDGE API: no-quota fallback deadline")
     fallback.add_argument("--provider", required=True)
     _add_now(fallback)
     fallback.set_defaults(handler=cmd_fallback_due)
 
-    block = sub.add_parser("scheduler-block-reason", help="why writes are blocked")
+    block = sub.add_parser("scheduler-block-reason", help="INTERNAL BRIDGE API: why writes are blocked")
     block.add_argument("--provider", required=True)
     _add_now(block)
     block.set_defaults(handler=cmd_block_reason)
 
-    sync = sub.add_parser("scheduler-sync", help="recalibrate a deadline from quota")
+    sync = sub.add_parser("scheduler-sync", help="INTERNAL BRIDGE API: recalibrate a deadline from quota")
     sync.add_argument("--provider", required=True)
     _add_now(sync)
     _add_quota(sync)
     sync.set_defaults(handler=cmd_sync)
 
-    decide = sub.add_parser("scheduler-decide", help="the due decision for one provider")
+    decide = sub.add_parser("scheduler-decide", help="INTERNAL BRIDGE API: the due decision for one provider")
     decide.add_argument("--provider", required=True)
     _add_now(decide)
     _add_quota(decide)
@@ -404,11 +452,11 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     for name, handler, helptext in (
         ("scheduler-begin-attempt", cmd_begin_attempt,
-         "raise the debt and stamp the attempt before the model runs"),
+         "INTERNAL BRIDGE API: raise the debt and stamp the attempt before the model runs"),
         ("scheduler-record-attempt", cmd_record_attempt,
-         "stamp a later attempt of the same burst"),
+         "INTERNAL BRIDGE API: stamp a later attempt of the same burst"),
         ("scheduler-commit-success", cmd_commit_success,
-         "commit a verified model success"),
+         "INTERNAL BRIDGE API: commit a verified model success"),
     ):
         parser = sub.add_parser(name, help=helptext)
         parser.add_argument(
@@ -417,25 +465,25 @@ def register(sub: argparse._SubParsersAction) -> None:
         _add_now(parser)
         parser.set_defaults(handler=handler)
 
-    window = sub.add_parser("scheduler-last-window", help="record the window a run belonged to")
+    window = sub.add_parser("scheduler-last-window", help="INTERNAL BRIDGE API: record the window a run belonged to")
     window.add_argument("--provider", required=True)
     window.add_argument("--reset", type=int, required=True)
     window.set_defaults(handler=cmd_last_window)
 
-    retry = sub.add_parser("scheduler-retry-due", help="providers whose debt may burst now")
+    retry = sub.add_parser("scheduler-retry-due", help="INTERNAL BRIDGE API: providers whose debt may burst now")
     retry.add_argument("--provider", default=None)
     retry.add_argument("providers", nargs="*", default=None)
     _add_now(retry)
     retry.add_argument("--gap", type=int, required=True)
     retry.set_defaults(handler=cmd_retry_due)
 
-    pending = sub.add_parser("scheduler-pending", help="providers carrying an unpaid debt")
+    pending = sub.add_parser("scheduler-pending", help="INTERNAL BRIDGE API: providers carrying an unpaid debt")
     pending.add_argument("--provider", default=None)
     pending.add_argument("providers", nargs="*", default=None)
     pending.set_defaults(handler=cmd_pending)
 
     decide_all = sub.add_parser(
-        "scheduler-decide-all", help="the due decision for a whole roster"
+        "scheduler-decide-all", help="INTERNAL BRIDGE API: the due decision for a whole roster"
     )
     _add_now(decide_all)
     decide_all.add_argument("--quota", action="append", default=None)
@@ -445,12 +493,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     decide_all.set_defaults(handler=cmd_decide_all)
 
     deadlines = sub.add_parser(
-        "scheduler-deadlines", help="per-provider deadlines for the run log"
+        "scheduler-deadlines", help="INTERNAL BRIDGE API: per-provider deadlines for the run log"
     )
     deadlines.add_argument("providers", nargs="*", default=None)
     deadlines.set_defaults(handler=cmd_deadlines)
 
-    nxt = sub.add_parser("scheduler-next-due", help="earliest schedulable deadline")
+    nxt = sub.add_parser("scheduler-next-due", help="INTERNAL BRIDGE API: earliest schedulable deadline")
     nxt.add_argument("providers", nargs="*", default=None)
     nxt.set_defaults(handler=cmd_next_due)
 

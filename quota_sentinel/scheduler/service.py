@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from ..state import AuthorityError, AuthoritativeStateStore, BackendAuthority
-from ..state.cutover import cutover_to_json
 from ..state.migration import DEFAULT_PROVIDERS
 from ..state.models import ProviderState
 from . import policy
@@ -177,22 +176,6 @@ def next_due(
     return policy.min_next_due(load_roster(state_dir, providers))
 
 
-def ensure_authority(state_dir: Path) -> BackendAuthority:
-    """Make JSON authoritative if it is not already (idempotent).
-
-    BELONGS UNDER run.lock. Called at the start of every state-touching
-    command: the first such command after an upgrade cuts the deployment
-    over, and every later one is a single tiny file read. A deployment
-    that never upgrades keeps its legacy files untouched and keeps
-    reading them.
-    """
-    state_dir = Path(state_dir)
-    current = router(state_dir).authority()
-    if current.is_json:
-        return current
-    return cutover_to_json(state_dir).current
-
-
 __all__ = [
     "AuthorityError",
     "DecisionResult",
@@ -208,5 +191,4 @@ __all__ = [
     "retry_due_providers",
     "pending_providers",
     "next_due",
-    "ensure_authority",
 ]

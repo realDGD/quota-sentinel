@@ -50,6 +50,9 @@ readonly PROVIDERS=(codex antigravity opencode)
 # copy of a single value — a shell literal would be a second source of truth
 # for the scheduler's behavior.
 readonly QUOTA_LOCK_WAIT_SECONDS=20
+# Operator lifecycle commands wait for an in-flight scheduler run rather
+# than failing; see acquire_run_lock_with_timeout.
+readonly RUN_LOCK_WAIT_SECONDS="${QUOTA_SENTINEL_RUN_LOCK_WAIT:-120}"
 readonly TIMER_RECHECK_SECONDS=60
 # Hard execution bounds: a hung model task or quota probe must never hold the
 # run/quota locks forever. Include kill grace when budgeting /usage: lock 20s
@@ -107,7 +110,8 @@ typeset -gi RUN_LOCK_HELD=0
 typeset -gi QUOTA_LOCK_HELD=0
 
 usage() {
-  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|cutover|status]"
+  print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|status]"
+  print -r -- "       $SCRIPT_NAME [init-authority|cutover|rollback]"
 }
 
 # ---------------------------------------------------------------------------
@@ -155,9 +159,13 @@ scheduler_bridge() {
     --state-dir "$STATE_DIR" "$@"
 }
 
-# The manifest is the single durable ownership fact, so its ABSENCE is the
-# exact and cheapest test for "this deployment was never cut over".
-authority_manifest_exists() { [[ -e "$AUTHORITY_MANIFEST" ]] }
+# The manifest is the single durable ownership fact and it is REQUIRED.
+# Its absence is not "this deployment was never cut over": that is only
+# knowable at a lifecycle boundary (the installer, or `init-authority`),
+# and treating a later disappearance as a bootstrap would silently
+# resurrect legacy state that the authoritative backend has moved past.
+# There is deliberately no "does the manifest exist?" helper here: absence
+# is a failure, not a branch a caller could take safely.
 
 # Authoritative backend name, or non-zero when the durable fact cannot be
 # read (a loud condition, never a silent fall back to legacy).
@@ -167,12 +175,21 @@ authoritative_backend() {
   print -r -- "${${out%%$'\n'*}#backend=}"
 }
 
-# 0 = legacy owns the state, 1 = JSON owns the state, 2 = unreadable.
+# 0 = legacy owns the state, 1 = JSON owns the state, 2 = unreadable or
+# never initialized. Both non-legacy answers are LOUD: the caller decides
+# whether to refuse (writers) or to report (status).
 legacy_backend_active() {
-  authority_manifest_exists || return 0
   local backend
   backend="$(authoritative_backend)" || return 2
   [[ "$backend" == "legacy" ]]
+}
+
+# Materialize the bootstrap authority for a deployment that predates the
+# protocol. LIFECYCLE ONLY — the installer calls it, an operator can call
+# it through `init-authority`, and NOTHING in the runtime command paths
+# calls it. That restriction is what keeps a deleted manifest detectable.
+authority_initialize() {
+  scheduler_bridge authority-initialize
 }
 
 # ---------------------------------------------------------------------------
@@ -206,7 +223,7 @@ require_legacy_backend() {
   legacy_backend_active || rc=$?
   case "$rc" in
     0) return 0 ;;
-    2) die "state backend authority is unreadable; refusing to touch legacy state" ;;
+    2) die "state backend authority manifest is missing or unreadable; refusing to touch legacy state. If this deployment predates the authority protocol, initialize it ONCE with the installer or './quota-sentinel.sh init-authority'; otherwise the manifest was lost — restore it rather than recreating it." ;;
     *) die "internal error: legacy state access reached while the JSON backend is authoritative" ;;
   esac
 }
@@ -420,8 +437,12 @@ seed_provider_state_file() {
 # non-destructive: every value is published through seed_provider_state_file,
 # which can create a missing slot but never replaces an existing one.
 migrate_legacy_state() {
-  # Bootstrap-only legacy upgrade. Skipped once JSON owns the state: at that
-  # point the legacy files are a rollback artifact and must not be re-seeded.
+  # Bootstrap-only legacy upgrade, for an INITIALIZED deployment that still
+  # runs the legacy backend. Skipped once JSON owns the state: at that point
+  # the legacy files are a rollback artifact and must not be re-seeded. An
+  # unreadable or absent manifest also skips it here, on purpose — the
+  # command's first authoritative read is what reports the failure, and it
+  # must not be pre-empted by a seed that could mask a lost manifest.
   legacy_backend_active || return 0
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -704,6 +725,29 @@ acquire_run_lock() {
   fi
   chmod 600 "$RUN_LOCK_FILE"
   RUN_LOCK_HELD=1
+}
+
+# Same lock, same protocol, but an operator command waits instead of
+# failing instantly. A scheduler tick holds run.lock for the duration of a
+# model run, and an operator running `cutover` should follow it rather than
+# be told to retry by hand.
+#
+# The retry is not a correctness mechanism: shlock itself breaks a lock
+# whose recorded process is dead (it only refuses while that file is less
+# than a second old, a conservative guard against clock granularity). The
+# wait exists purely so a BUSY-but-healthy scheduler does not look like a
+# broken one.
+acquire_run_lock_with_timeout() {
+  local deadline now
+  deadline=$(( $(now_epoch) + ${1:-$RUN_LOCK_WAIT_SECONDS} ))
+  while ! acquire_run_lock; do
+    now="$(now_epoch)"
+    if (( now >= deadline )); then
+      return 1
+    fi
+    log_info "run.lock busy; waiting for the in-flight scheduler run"
+    "$SLEEP_BIN" 1
+  done
 }
 
 acquire_quota_lock() {
@@ -2886,21 +2930,71 @@ run_and_reschedule_selected() {
   release_run_lock
 }
 
-# The explicit production ownership switch (Phase 3B). Operator-invoked, and
-# the installer calls it between booting the old agent out and booting the new
-# one in, so no legacy writer can still be alive while ownership moves. It is
-# deliberately NOT implicit in check/wait/run/usage: switching the source of
-# truth is an upgrade step, not a side effect of a scheduler tick.
-run_cutover() {
-  acquire_run_lock || die "Another model run is already in progress"
-  local rc=0
-  # Seed the pre-cutover legacy slots first (idempotent, non-destructive);
-  # they are the source of truth this cutover reads.
-  migrate_legacy_state
-  bridge_run_logged "cutover" scheduler-ensure-authority || rc=$?
+# ---------------------------------------------------------------------------
+# Authority lifecycle commands.
+#
+# These are the operator surface for the ownership fact, and they are the
+# ONLY place the switch happens. Each acquires the real run.lock, so an
+# operator cannot interleave a switch with an in-flight check or model run.
+# They are deliberately NOT implicit in check/wait/run/usage: switching the
+# source of truth is an upgrade step, not a side effect of a scheduler tick.
+#
+# The installer does NOT call cutover. Upgrading and switching stay separate
+# actions so an operator can upgrade the code, watch the legacy backend
+# behave, and only then move ownership.
+# ---------------------------------------------------------------------------
+
+# run.lock is released on every exit path, including a failing bridge call.
+run_authority_lifecycle() {
+  local verb="$1" label="$2" rc=0
+  acquire_run_lock_with_timeout "$RUN_LOCK_WAIT_SECONDS" ||
+    die "Another model run is already in progress"
+  # Both calls capture their status; release_run_lock always runs.
+  "$verb" || rc=$?
   release_run_lock
-  (( rc == 0 )) || die "state backend cutover failed (rc=$rc)"
+  (( rc == 0 )) || die "$label failed (rc=$rc)"
+}
+
+run_init_authority() {
+  run_authority_lifecycle _init_authority_bridge "state backend authority initialization"
+}
+
+# Reports WHICH outcome happened. "initialized" and "already initialized"
+# are different operator-facing facts: the first changes durable state, the
+# second must not, and an operator re-running the installer needs to be able
+# to tell them apart from the output alone.
+_init_authority_bridge() {
+  local out rc=0
+  out="$(scheduler_bridge scheduler-initialize-authority)" || rc=$?
+  bridge_apply_log "authority" "$out"
+  (( rc == 0 )) || return $rc
+  if [[ "$out" == *"created=1"* ]]; then
+    print -r -- "state backend authority initialized (legacy epoch 0)"
+  else
+    print -r -- "state backend authority already initialized; nothing written"
+  fi
+}
+
+# Seed the pre-cutover legacy slots (idempotent, non-destructive), then
+# switch ownership. Requires an INITIALIZED deployment: a virgin one must be
+# initialized first, so that "no manifest" can never be read as "legacy".
+run_cutover() {
+  run_authority_lifecycle _cutover_bridge "state backend cutover"
   print -r -- "state backend cutover complete"
+}
+
+_cutover_bridge() {
+  migrate_legacy_state
+  bridge_run_logged "cutover" scheduler-cutover
+}
+
+run_rollback() {
+  run_authority_lifecycle _rollback_bridge "state backend rollback"
+  print -r -- "state backend rollback complete"
+}
+
+_rollback_bridge() {
+  bridge_run_logged "rollback" scheduler-rollback
 }
 
 usage_busy_message() {
@@ -3069,9 +3163,12 @@ check_schedule() {
   # Phase A — repay pending debts first: a fresh probe must never push a
   # due-but-unsucceeded task into the future. No quota lock is held here, so
   # 30s retry sleeps and model timeouts never block /usage.
-  local retry_out
+  local retry_out retry_rc=0
   retry_out="$(scheduler_bridge scheduler-retry-due \
-    --now "$(now_epoch)" --gap "$WATCHDOG_RETRY_GAP_SECONDS" "${PROVIDERS[@]}")"
+    --now "$(now_epoch)" --gap "$WATCHDOG_RETRY_GAP_SECONDS" "${PROVIDERS[@]}")" || retry_rc=$?
+  # Explicit, not a bare errexit exit: the message has to say WHAT failed,
+  # and the run.lock release has to happen (see the ZERR trap below).
+  (( retry_rc == 0 )) || die "scheduler-retry-due failed (rc=$retry_rc)"
   retry_pending_list=("${(@f)retry_out}")
   retry_pending_list=("${retry_pending_list[@]:#}")
   if (( ${#retry_pending_list[@]} > 0 )); then
@@ -3142,8 +3239,9 @@ check_schedule() {
 
   if (( ${#due_providers[@]} == 0 )); then
     due_log=""
-    local deadlines_out
-    deadlines_out="$(scheduler_bridge scheduler-deadlines "${PROVIDERS[@]}")"
+    local deadlines_out deadlines_rc=0
+    deadlines_out="$(scheduler_bridge scheduler-deadlines "${PROVIDERS[@]}")" || deadlines_rc=$?
+    (( deadlines_rc == 0 )) || die "scheduler-deadlines failed (rc=$deadlines_rc)"
     while IFS=$'\t' read -r p p_due; do
       [[ -n "$p" ]] || continue
       if [[ "$p_due" =~ ^[0-9]+$ ]]; then
@@ -3229,8 +3327,14 @@ main() {
     usage)
       send_usage_notification
       ;;
+    init-authority)
+      run_init_authority
+      ;;
     cutover)
       run_cutover
+      ;;
+    rollback)
+      run_rollback
       ;;
     card-preview)
       card_preview "${2:-both}"
@@ -3261,5 +3365,16 @@ scheduler_policy_config
 
 if [[ "${PI_SOURCE_ONLY:-0}" != "1" ]]; then
   trap cleanup EXIT
+  # zsh runs the EXIT trap when errexit fires at the TOP LEVEL, but NOT when
+  # it fires inside a function — verified on this shell version. Every
+  # scheduler step runs inside a function, so without this second trap a
+  # failed step would exit while still holding run.lock and leave the file
+  # behind for the next acquirer.
+  #
+  # TRAPZERR fires exactly where errexit would exit: not for `cmd || true`,
+  # not inside an `if` condition, not in a loop body that handles its own
+  # status. So this adds the missing release without changing which
+  # failures are fatal.
+  trap 'cleanup; exit 1' ZERR
   main "$@"
 fi

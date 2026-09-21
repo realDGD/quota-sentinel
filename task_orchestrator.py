@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Local task orchestration for Quota-Sentinel.
 
-This module deliberately owns *when* the existing shell scheduler is invoked,
-not *how* provider deadlines are calculated.  The shell remains the sole
-scheduling-policy adapter, preserving its Fresh/Stale, reset-buffer, blocking,
-fallback, and retry semantics.  SQLite provides durable run history and crash
-visibility while the existing provider state files remain authoritative.
+This module deliberately owns *when* the scheduler is invoked, not *how*
+provider deadlines are calculated. Deadline policy lives in
+``quota_sentinel.scheduler``; the shell drives model execution and quota
+fetches. SQLite provides durable run history and crash visibility, and the
+scheduler's authoritative state is read through ``quota_sentinel.state``'s
+backend router — which is what keeps this module from computing wake times
+off a retired backend after a cutover.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
+
+from quota_sentinel.state import AuthoritativeStateStore, StateStoreError
 
 
 logger = logging.getLogger("task_orchestrator")
@@ -196,7 +200,25 @@ class SubprocessRunner:
 
 
 class ScheduleState:
-    """Read the shell scheduler's provider-specific deadline state."""
+    """Provider deadlines, read through the authoritative backend router.
+
+    Reading the legacy slot files directly was correct only while they were
+    always authoritative. After a cutover they are a FROZEN rollback
+    artifact, so a direct read would compute wake times from state the
+    scheduler has already superseded: the listener would sleep through a
+    deadline that moved, or wake for one that is long gone. Every read now
+    goes through ``AuthoritativeStateStore``, which selects the backend
+    from the durable authority manifest and re-checks that manifest around
+    the read.
+
+    Failure stays non-fatal in the same DIRECTION as before: an
+    uninitialized, missing or unreadable authority yields no deadlines and
+    the orchestrator falls back to its watchdog grid, which still runs
+    ``check`` and therefore cannot lose a due task. What must never happen
+    is the silent alternative — reading a retired backend and reporting
+    its stale deadlines as if they were current. So the failure is logged
+    at ERROR with the reason, and no deadline is returned.
+    """
 
     def __init__(
         self,
@@ -206,30 +228,36 @@ class ScheduleState:
         self.state_dir = Path(state_dir)
         self.providers = providers
 
-    def _read_epoch(self, provider: str) -> int | None:
+    def _load(self) -> dict[str, Any] | None:
+        """Load every provider through the router, or None when unavailable."""
         try:
-            raw = (self.state_dir / f"{provider}-next-due-at").read_text().strip()
-            value = int(raw)
-            return value if value >= 0 else None
-        except (OSError, ValueError):
+            return AuthoritativeStateStore(self.state_dir).load_all(self.providers)
+        except StateStoreError as exc:
+            logger.error(
+                "scheduler state is unavailable through the authoritative "
+                "backend (%s); falling back to the watchdog grid rather than "
+                "reading a possibly retired backend",
+                exc,
+            )
             return None
 
     def snapshot(self) -> dict[str, int | None]:
-        return {provider: self._read_epoch(provider) for provider in self.providers}
-
-    def _is_pending(self, provider: str) -> bool:
-        try:
-            return (
-                self.state_dir / f"{provider}-retry-pending"
-            ).read_text().strip() == "1"
-        except OSError:
-            return False
+        states = self._load()
+        if states is None:
+            return {provider: None for provider in self.providers}
+        return {
+            provider: states[provider].next_due_at
+            for provider in self.providers
+        }
 
     def next_due(self) -> int | None:
+        states = self._load()
+        if states is None:
+            return None
         values = [
-            value
-            for provider, value in self.snapshot().items()
-            if value is not None and not self._is_pending(provider)
+            state.next_due_at
+            for provider, state in states.items()
+            if state.next_due_at is not None and not state.retry_pending
         ]
         return min(values) if values else None
 

@@ -36,11 +36,19 @@ Properties, each one deliberate:
   process-local cache, not a mtime, not "does the JSON exist", not "we
   probably cut over already". See ``read_authority``.
 
-* RECOVERABLE. The document is self-contained, has no dependency on any
-  provider document, and its absence has exactly one meaning: this
-  deployment has never been cut over, so legacy is authoritative. That
-  is a BOOTSTRAP default with a mechanical rule ("absent manifest"),
-  not an inference from state content.
+* ALWAYS PRESENT once the deployment has been initialized. The manifest
+  is materialized by an explicit lifecycle step (the installer, or
+  ``authority-initialize``) and from then on its ABSENCE IS CORRUPTION.
+  The earlier protocol treated an absent manifest as "never cut over";
+  that made a deleted manifest silently resurrect stale legacy state
+  (retry debt, deadlines, candidates and anchors included), so absence
+  is now only meaningful to ``initialize_authority`` — see below.
+
+* RECOVERABLE. The document is self-contained and has no dependency on
+  any provider document: it can be restored from a backup or from the
+  operator's own knowledge without reading scheduler state. What it is
+  NOT is inferable — not from the JSON documents (Phase 2 shadows may
+  predate the protocol), not from mtimes, not from the legacy files.
 
 * NOT PROVIDER STATE. Different file name, different schema, different
   key set. No provider name can produce it: provider documents are
@@ -50,11 +58,18 @@ Properties, each one deliberate:
 
 FAILURE POLICY
 --------------
-A present-but-unreadable/invalid manifest is NEVER defaulted. Ownership
+An unreadable, invalid or ABSENT manifest is NEVER defaulted. Ownership
 that cannot be determined mechanically must stop the process, not pick a
 side: defaulting to legacy while JSON is authoritative would let an old
-writer produce a second, diverging source of truth. Mutations fail
-closed; readers fail loudly.
+writer produce a second, diverging source of truth, and defaulting after
+a JSON cutover would resurrect state the authoritative document has long
+since moved past. Mutations fail closed; readers fail loudly.
+
+The one function allowed to act on absence is ``initialize_authority``,
+and it is a LIFECYCLE step: the installer or an explicit operator command
+calls it once for a deployment that predates the protocol. Runtime code
+never calls it, which is precisely what makes a later disappearance
+detectable.
 """
 from __future__ import annotations
 
@@ -83,6 +98,18 @@ class AuthorityError(StateStoreError):
     """Base class for authority-protocol failures."""
 
 
+class AuthorityMissingError(AuthorityError):
+    """No manifest exists in an initialized-or-unknown state directory.
+
+    Raised by every ownership read. It is deliberately NOT a synonym for
+    "legacy": a deployment that predates the protocol is initialized
+    explicitly (see ``initialize_authority``), and after that a missing
+    manifest means the single ownership fact was lost. Guessing legacy
+    there would silently roll the scheduler back to state the
+    authoritative document has already superseded.
+    """
+
+
 class AuthorityCorruptError(AuthorityError):
     """The manifest bytes are unreadable, not UTF-8, or not JSON."""
 
@@ -100,6 +127,15 @@ class ConcurrentAuthorityChangeError(AuthorityError):
     the wrong backend. Loud by design: the alternative is a silent
     mixed-backend read.
     """
+
+
+@dataclass(frozen=True)
+class InitializationResult:
+    """Outcome of ``initialize_authority``: the authority, and whether this
+    call created it (False means the deployment was already initialized)."""
+
+    authority: "BackendAuthority"
+    created: bool
 
 
 @dataclass(frozen=True)
@@ -138,7 +174,11 @@ class BackendAuthority:
 
 
 def bootstrap_authority() -> BackendAuthority:
-    """Authority of a state dir whose manifest has never been written."""
+    """The authority ``initialize_authority`` materializes.
+
+    Named for what it is: the authority a deployment has BEFORE the
+    protocol exists on disk, not a default that reads may fall back to.
+    """
     return BackendAuthority(BACKEND_LEGACY, BOOTSTRAP_EPOCH)
 
 
@@ -212,8 +252,8 @@ def parse_authority(raw: bytes) -> BackendAuthority:
 def read_authority(state_dir: Path) -> BackendAuthority:
     """The one and only ownership decision.
 
-    * absent manifest  -> bootstrap authority (legacy)
     * valid manifest   -> that authority
+    * absent manifest  -> AuthorityMissingError (NEVER a default)
     * damaged manifest -> loud AuthorityError, never a default
 
     Pure: creates nothing, repairs nothing, chmods nothing. Callers that
@@ -224,8 +264,17 @@ def read_authority(state_dir: Path) -> BackendAuthority:
     path = authority_path(state_dir)
     try:
         raw = path.read_bytes()
-    except FileNotFoundError:
-        return bootstrap_authority()
+    except FileNotFoundError as exc:
+        raise AuthorityMissingError(
+            f"backend authority manifest is missing at {path}: refusing to "
+            "guess between the legacy and JSON backends. Every initialized "
+            "deployment has one; if this deployment was never initialized, "
+            "run the installer or `quota-sentinel.sh init-authority` ONCE. "
+            "If it was initialized, the manifest was lost — restore it from "
+            "backup rather than recreating it, because recreating it as "
+            "legacy would resurrect state the authoritative backend has "
+            "already superseded."
+        ) from exc
     except IsADirectoryError as exc:
         raise AuthorityCorruptError(
             f"authority manifest path is a directory: {exc}"
@@ -264,9 +313,46 @@ def write_authority(state_dir: Path, authority: BackendAuthority) -> None:
 def read_authority_if_present(state_dir: Path) -> Optional[BackendAuthority]:
     """None when the manifest is absent, the authority when it is valid.
 
-    For diagnostics/CLI reporting only. Ownership decisions must use
-    ``read_authority`` so the bootstrap default is applied in one place.
+    For DIAGNOSTICS ONLY — reporting "this state dir has no manifest yet".
+    Ownership decisions must use ``read_authority``, whose missing-manifest
+    answer is a loud error rather than this None.
     """
     if not authority_path(state_dir).exists():
         return None
     return read_authority(state_dir)
+
+
+def initialize_authority(state_dir: Path) -> "InitializationResult":
+    """Materialize the bootstrap authority for a pre-protocol deployment.
+
+    THE ONE PLACE absence is allowed to mean something. It is a LIFECYCLE
+    operation, called by the installer or by an explicit operator command,
+    never by runtime code path — which is what makes a later missing
+    manifest detectable instead of self-healing.
+
+    Contract:
+
+    * absent manifest  -> publish ``legacy`` epoch 0 through the same
+      atomic temp-write/fsync/rename primitive as every other authority
+      write, then return it with ``created=True``;
+    * valid manifest   -> return it unchanged, ``created=False`` (so a
+      re-run of the installer is a no-op, never a re-write);
+    * damaged manifest -> loud error; NEVER overwritten. Re-initializing
+      over corruption would destroy the only ownership fact.
+
+    Scheduler state is not read, written or inferred here. In particular
+    the presence of Phase 2 JSON documents is deliberately ignored: they
+    may predate the protocol, so they cannot be evidence of a cutover.
+    """
+    existing = read_authority_if_present(state_dir)
+    if existing is not None:
+        return InitializationResult(existing, created=False)
+    authority = bootstrap_authority()
+    write_authority(state_dir, authority)
+    confirmed = read_authority(state_dir)
+    if confirmed != authority:
+        raise AuthorityError(
+            f"authority initialization published {authority} but re-reading "
+            f"it yielded {confirmed}; refusing to report success"
+        )
+    return InitializationResult(confirmed, created=True)

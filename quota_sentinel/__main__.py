@@ -1,4 +1,23 @@
-"""Thin CLI for the Python state store (strangler seam).
+"""Command line for quota_sentinel.
+
+TWO SURFACES, and the difference is a correctness property, not
+decoration.
+
+**Public operator verbs** are safe to run standalone. The lifecycle verbs
+(``cutover``, ``rollback``, ``authority-initialize``) acquire the
+scheduler's real ``run.lock`` through the same ``shlock`` protocol the
+shell uses (see ``quota_sentinel.state.runlock``), so an operator cannot
+interleave a backend switch with an in-flight ``check`` or model run. The
+read verbs acquire nothing because they mutate nothing.
+
+**Internal bridge verbs** (``scheduler-*``) are what ``quota-sentinel.sh``
+calls *while it already holds run.lock*. They deliberately do NOT acquire
+the lock themselves — the shell owns it, and a second acquisition from a
+different PID would deadlock against its own caller. They are named
+INTERNAL in their help for that reason: running one by hand bypasses the
+serialization the whole design rests on. There is no way for a CLI to
+verify that a caller holds a lock it did not take, so no such check is
+faked here; the safety comes from the public surface not needing one.
 
 Verbs, grouped by what they are allowed to do:
 
@@ -8,10 +27,10 @@ Verbs, grouped by what they are allowed to do:
   live. `dump` (legacy files) and `json-dump` (v1 documents) stay as
   explicit per-backend diagnostics; naming the backend is the whole
   point of those two.
-* AUTHORITY-AWARE writes — `cutover` and `rollback` perform the durable
-  ownership switch described in quota_sentinel.state.cutover. Both
-  require the caller to hold the shell's run.lock (a contract this CLI
-  cannot verify and does not pretend to).
+* LOCK-SAFE lifecycle writes — `cutover`, `rollback` and
+  `authority-initialize` perform the durable ownership changes described
+  in quota_sentinel.state.cutover, each under a real run.lock this
+  process acquires and releases itself.
 * `migrate` — the Phase 2 bootstrap that seeds shadow documents from the
   legacy slot files without overwriting anything.
 
@@ -34,10 +53,13 @@ from quota_sentinel.state import (
     ProviderState,
     ResetCandidate,
     StateStoreError,
+    acquire_run_lock,
     cutover_to_json,
+    initialize_authority,
     read_authority,
     rollback_to_legacy,
 )
+from quota_sentinel.state import runlock
 from quota_sentinel.state.json_store import JsonStateStore
 from quota_sentinel.state.migration import migrate_all
 from quota_sentinel.scheduler import cli as scheduler_cli
@@ -91,8 +113,46 @@ def run_authority(state_dir: Path) -> int:
     return 0
 
 
-def run_cutover(state_dir: Path, providers: Optional[List[str]]) -> int:
-    result = cutover_to_json(state_dir, providers or None)
+def _lock_timeout(args: argparse.Namespace) -> float:
+    return float(getattr(args, "lock_timeout", runlock.DEFAULT_LOCK_TIMEOUT_SECONDS))
+
+
+def _lifecycle_lock(state_dir: Path, args: argparse.Namespace, what: str):
+    """run.lock for a public lifecycle verb, with operator-facing waiting."""
+    def announce() -> None:
+        print(
+            f"quota_sentinel: run.lock is busy; waiting up to "
+            f"{_lock_timeout(args):.0f}s for the in-flight scheduler run "
+            f"before {what}",
+            file=sys.stderr,
+        )
+
+    return acquire_run_lock(
+        state_dir, timeout=_lock_timeout(args), on_wait=announce
+    )
+
+
+def run_authority_initialize(state_dir: Path, args: argparse.Namespace) -> int:
+    """Materialize the bootstrap authority for a pre-protocol deployment."""
+    with _lifecycle_lock(state_dir, args, "initializing authority"):
+        result = initialize_authority(state_dir)
+    if result.created:
+        print(
+            f"authority initialized to {result.authority.backend} "
+            f"(epoch {result.authority.epoch})"
+        )
+    else:
+        print(
+            f"authority already initialized as {result.authority.backend} "
+            f"(epoch {result.authority.epoch}); nothing written"
+        )
+    return 0
+
+
+def run_cutover(state_dir: Path, providers: Optional[List[str]],
+                args: argparse.Namespace) -> int:
+    with _lifecycle_lock(state_dir, args, "cutover"):
+        result = cutover_to_json(state_dir, providers or None)
     if not result.changed:
         print(f"authority already {result.current.backend} "
               f"(epoch {result.current.epoch}); nothing written")
@@ -135,8 +195,10 @@ def run_notification_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_rollback(state_dir: Path, providers: Optional[List[str]]) -> int:
-    result = rollback_to_legacy(state_dir, providers or None)
+def run_rollback(state_dir: Path, providers: Optional[List[str]],
+                 args: argparse.Namespace) -> int:
+    with _lifecycle_lock(state_dir, args, "rollback"):
+        result = rollback_to_legacy(state_dir, providers or None)
     if not result.changed:
         print(f"authority already {result.current.backend} "
               f"(epoch {result.current.epoch}); nothing written")
@@ -151,6 +213,22 @@ def run_json_dump(store: JsonStateStore, provider: str) -> int:
 
 
 def run_migrate(state_dir: Path, providers: Optional[List[str]]) -> int:
+    """Seed shadow documents — legacy backend only.
+
+    Refuses under JSON authority: a missing document there is corruption,
+    and "repairing" it from the retired legacy files would silently
+    resurrect state the authoritative document has moved past. That is the
+    same failure mode the missing-manifest rule closes, one layer down.
+    """
+    authority = read_authority(state_dir)
+    if authority.is_json:
+        print(
+            "quota_sentinel: refusing to seed shadow documents: the JSON "
+            "backend is authoritative, so a missing document is corruption "
+            "to investigate, not a bootstrap to re-run",
+            file=sys.stderr,
+        )
+        return 4
     for provider, action in migrate_all(state_dir, providers).items():
         print(f"{provider}: {action}")
     return 0
@@ -174,13 +252,43 @@ def build_parser() -> argparse.ArgumentParser:
         "authority",
         help="print the durable authoritative backend and its epoch",
     )
-    for name, help_text in (
-        ("cutover", "make the JSON backend authoritative (caller holds run.lock)"),
-        ("rollback", "return ownership to the legacy backend (pure undo only)"),
+    # Public lifecycle verbs. Each acquires the scheduler's real run.lock
+    # (same shlock protocol, same file) for the duration of the switch.
+    for name, help_text, handler in (
+        ("cutover",
+         "make the JSON backend authoritative (acquires run.lock)",
+         run_cutover),
+        ("rollback",
+         "return ownership to the legacy backend (acquires run.lock; "
+         "pure undo only)",
+         run_rollback),
     ):
         command = sub.add_parser(name, help=help_text)
         command.add_argument("providers", nargs="*", default=None,
                              help="override the default provider roster")
+        command.add_argument(
+            "--lock-timeout", type=float,
+            default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
+            help="seconds to wait for an in-flight scheduler run "
+                 "(default: %(default)s)",
+        )
+        command.set_defaults(handler=lambda a, h=handler: h(
+            a.state_dir, a.providers or None, a
+        ))
+    init = sub.add_parser(
+        "authority-initialize",
+        help="one-time: materialize the bootstrap authority manifest "
+             "(acquires run.lock)",
+    )
+    init.add_argument(
+        "--lock-timeout", type=float,
+        default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="seconds to wait for an in-flight scheduler run "
+             "(default: %(default)s)",
+    )
+    init.set_defaults(
+        handler=lambda a: run_authority_initialize(a.state_dir, a)
+    )
     state_dump = sub.add_parser(
         "state-dump",
         help="print scheduler slots from whichever backend is authoritative",
@@ -228,10 +336,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_json_dump(JsonStateStore(state_dir), args.provider)
         if args.command == "authority":
             return run_authority(state_dir)
-        if args.command == "cutover":
-            return run_cutover(state_dir, args.providers or None)
-        if args.command == "rollback":
-            return run_rollback(state_dir, args.providers or None)
         return run_migrate(state_dir, args.providers or None)
     except StateStoreError as exc:
         print(f"quota_sentinel: {exc}", file=sys.stderr)
