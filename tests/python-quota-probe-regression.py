@@ -351,5 +351,124 @@ time.sleep(30)
             os.kill(int(pid_file.read_text()), 0)
 
 
+class InstrumentationTests(unittest.TestCase):
+    """Per-tier outcome, elapsed time and the selected tier reach the log.
+
+    Without these lines a native tier that hangs until its timeout and one
+    that fails in 20ms look identical from outside: the run log shows only
+    the check's total duration, and the tier that actually served the
+    reading is invisible. The lines must stay sanitized — provider, tier,
+    outcome, seconds — so nothing from the vendor CLI's output can ride
+    along.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state"
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.missing = self.root / "missing"
+        self.lines = []
+
+    def collector(self, **overrides):
+        args = dict(
+            state_dir=self.state, workspace=self.work,
+            codex_bin=self.missing, agy_bin=self.missing, uv_bin=self.missing,
+            codexbar_bin=self.missing, opencode_usage_helper=self.missing,
+            antigravity_usage_helper=self.missing, curl_bin=self.missing,
+            opencode_api_key_getter=lambda: "",
+            logger=self.lines.append,
+        )
+        args.update(overrides)
+        return QuotaCollector(**args)
+
+    def binary(self, name: str, body: str) -> Path:
+        path = self.root / name
+        path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+        path.chmod(0o700)
+        return path
+
+    def test_every_attempted_tier_and_the_selected_tier_are_logged(self):
+        self.state.mkdir()
+        (self.state / "codexbar-codex-last-success.json").write_text(
+            json.dumps(dict(WINDOWS, source="CodexBar · cached", fresh=False,
+                            cached=True, capturedAt=1790000000)),
+            encoding="utf-8",
+        )
+        reading = self.collector().collect()["codex"]
+        text = "\n".join(self.lines)
+
+        # Every rung the ladder walked is named, with its outcome…
+        for tier in ("native", "codexbar-live", "codexbar-cache"):
+            self.assertIn("quota codex: %s" % tier, text)
+        # …and every ATTEMPT line carries a duration.
+        attempts = [
+            line for line in self.lines
+            if line.startswith("quota codex: ")
+            and " selected " not in line and " raised " not in line
+        ]
+        self.assertGreaterEqual(len(attempts), 3, attempts)
+        for line in attempts:
+            self.assertRegex(line, r"\d+\.\d+s$", line)
+        # The tier that actually served the reading is explicit.
+        self.assertIn("quota codex: selected codexbar-cache", text)
+        # And the choice itself is unchanged by the instrumentation.
+        self.assertEqual(reading.tier, Tier.CODEXBAR_CACHE)
+        self.assertFalse(reading.fresh)
+
+    def test_a_native_success_is_logged_as_selected_native(self):
+        codex = self.binary("codex", """
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'initialize':
+        answer = {'jsonrpc': '2.0', 'id': req['id'], 'result': {}}
+    else:
+        answer = {'jsonrpc': '2.0', 'id': req['id'], 'result': {'rateLimits': {
+            'primary': {'windowDurationMins': 300, 'usedPercent': 19, 'resetsAt': 1790000000},
+            'secondary': {'windowDurationMins': 10080, 'usedPercent': 8, 'resetsAt': 1790500000}}}}
+    print(json.dumps(answer), flush=True)
+""")
+        reading = self.collector(codex_bin=codex).collect()["codex"]
+        codex_lines = [l for l in self.lines if l.startswith("quota codex: ")]
+        text = "\n".join(codex_lines)
+        self.assertIn("quota codex: native ok", text)
+        self.assertIn("quota codex: selected native", text)
+        # A fresh tier stops THIS provider's ladder: nothing below it runs.
+        self.assertNotIn("codexbar-live", text)
+        self.assertEqual(reading.tier, Tier.NATIVE)
+        self.assertTrue(reading.fresh)
+
+    def test_instrumentation_lines_carry_no_secret_and_no_paths(self):
+        secret = "sk-must-never-be-logged-0123456789"
+        helper = self.binary("antigravity_usage.py", """
+import sys
+print("antigravity_usage: command_timeout", file=sys.stderr)
+print("token=%s" % sys.argv[0], file=sys.stderr)
+print("Authorization: Bearer very-private-value", file=sys.stderr)
+sys.exit(1)
+""")
+        fake_uv = self.binary("uv", """
+import os, sys
+args = sys.argv[1:]
+os.execv(sys.executable, [sys.executable] + args[args.index('python') + 1:])
+""")
+        environment = dict(os.environ, OPENCODE_API_KEY=secret)
+        collector = self.collector(
+            antigravity_usage_helper=helper, agy_bin=self.binary("agy", "print('agy')"),
+            uv_bin=fake_uv,
+        )
+        collector._base_environment = lambda: dict(environment)  # type: ignore[assignment]
+        collector.collect()
+        text = "\n".join(self.lines)
+        for forbidden in (secret, "very-private-value", str(self.state),
+                          str(self.work), str(Path.home())):
+            self.assertNotIn(forbidden, text, text)
+        # The reason code is still reported — that is the diagnostic value.
+        self.assertIn("command_timeout", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

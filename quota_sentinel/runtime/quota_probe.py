@@ -469,21 +469,40 @@ class QuotaCollector:
                     raise ValueError(
                         "unknown quota tier %r for provider %r" % (tier, provider)
                     )
+                started = time.monotonic()
                 try:
                     quota = self._tier(provider, tier, pi_raw)
                 except Exception as error:  # one rung, not the roster
                     self.logger("quota %s: %s raised %s" % (
-                        provider, tier, type(error).__name__,
+                        provider, tier.value, type(error).__name__,
                     ))
                     quota = None
+                # Instrumentation, deliberately not policy: this line only
+                # records what the ladder did. Without it a rung that hangs
+                # until its timeout and one that fails in milliseconds are
+                # indistinguishable from outside (the run log shows only the
+                # whole check's duration), and the tier that actually served
+                # the reading is never written down at all. It carries
+                # provider, tier, outcome and seconds — nothing from the
+                # vendor CLI's output.
+                self.logger("quota %s: %s %s in %.1fs" % (
+                    provider, tier.value,
+                    "ok" if quota is not None else "none",
+                    time.monotonic() - started,
+                ))
                 if quota is not None:
                     selected = tier
                     break
             if selected is None:
+                self.logger("quota %s: selected none (all tiers unavailable)"
+                            % provider)
                 readings[provider] = QuotaReading(None, None, False, "all tiers unavailable")
-            else:
-                readings[provider] = QuotaReading(quota, selected,
-                                                  selected in (Tier.NATIVE, Tier.CODEXBAR_LIVE))
+                continue
+            fresh = selected in (Tier.NATIVE, Tier.CODEXBAR_LIVE)
+            self.logger("quota %s: selected %s (fresh=%d)" % (
+                provider, selected.value, 1 if fresh else 0,
+            ))
+            readings[provider] = QuotaReading(quota, selected, fresh)
         return readings
 
     def _tier(

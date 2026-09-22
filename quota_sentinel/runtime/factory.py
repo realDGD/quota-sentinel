@@ -160,7 +160,17 @@ def create_application(
     options = quota_probe_options(env)
 
     def collector_factory(workspace: Path) -> QuotaCollector:
-        return QuotaCollector(state_dir, workspace, **options)
+        # The same seam the model runner already has. Without it every tier
+        # outcome inside the collector goes to a no-op: a native probe that
+        # hangs until its timeout and one that fails in milliseconds look
+        # identical in the run log, and the tier that actually served the
+        # reading is never written down. The lines carry provider, tier,
+        # outcome and seconds only.
+        return QuotaCollector(
+            state_dir, workspace,
+            logger=logging.getLogger("quota_sentinel.quota").info,
+            **options,
+        )
 
     return Application(
         state_dir, runner, collector_factory, notifier,
