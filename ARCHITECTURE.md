@@ -209,7 +209,8 @@ codebase. Production code never branches on the backend itself.
 Both are OPERATOR verbs, both acquire `run.lock` themselves, and both are
 **WHOLE-ROSTER**: the function signatures take no provider argument at all
 (`cutover_to_json(state_dir, *, checkpoint=None)`), the roster is the shared
-`DEFAULT_PROVIDERS` constant, and `cutover codex` is an argparse usage error
+`DEFAULT_PROVIDERS` constant, and naming a provider after either verb is an
+argparse usage error
 raised before any state is touched. Authority is one global fact, so a
 provider-scoped switch is not a smaller switch — it is a switch that hands the
 unprepared providers to the retired backend, silently discarding the deadlines

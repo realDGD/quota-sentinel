@@ -839,6 +839,58 @@ class WholeRosterAuthoritySwitch(unittest.TestCase):
                     parser.parse_args([verb, "codex"])
                 self.assertEqual(caught.exception.code, 2)
 
+    def test_ar14c_no_document_advertises_a_provider_scoped_switch(self):
+        """Whole-roster is also a DOCUMENTATION contract.
+
+        A doc that shows `cutover <provider>` teaches the exact command the
+        API now refuses, and an operator who follows it meets an argparse
+        error at best — or, on an older build, the partial switch that
+        motivated this round. Only command-shaped lines are flagged, so
+        prose that explains the rejection stays legal.
+        """
+        from quota_sentinel.state.migration import DEFAULT_PROVIDERS
+
+        prefixes = (
+            "uv run quota-sentinel",
+            "uv run python -m quota_sentinel",
+            "quota-sentinel ",
+            "./quota-sentinel.sh ",
+        )
+        offenders = []
+        for rel in tracked_files():
+            if not rel.endswith((".md", ".sh", ".zsh", ".py")):
+                continue
+            if rel.startswith("tests/"):
+                continue          # the suites assert the refusal on purpose
+            path = REPO / rel
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                stripped = line.strip().lstrip("$> ").strip()
+                if not stripped.startswith(prefixes):
+                    continue
+                tokens = stripped.replace("=", " ").split()
+                # A trailing comment may legitimately name a provider
+                # ("cutover, then watch codex") without advertising a
+                # provider-scoped switch.
+                for index, token in enumerate(tokens):
+                    if token.startswith("#"):
+                        tokens = tokens[:index]
+                        break
+                for verb in ("cutover", "rollback"):
+                    if verb not in tokens:
+                        continue
+                    tail = tokens[tokens.index(verb) + 1:]
+                    if any(t in DEFAULT_PROVIDERS for t in tail):
+                        offenders.append(f"{rel}:{lineno}: {stripped}")
+        self.assertEqual(
+            offenders, [],
+            "these documents show a provider-scoped authority switch; the "
+            "verbs accept no provider argument",
+        )
+
     def test_ar14b_bridge_verbs_reject_a_provider_subset_too(self):
         from quota_sentinel.__main__ import build_parser
 
@@ -888,14 +940,23 @@ class ExplicitBootstrapOnly(unittest.TestCase):
                 self.assertNotIn(token, self.INSTALLER)
 
     def test_ar16_shell_bootstrap_has_exactly_one_reachable_call_site(self):
-        # The helper and its bridge are each defined once and called once —
-        # from the operator verb only. A second call site anywhere in the
-        # script would mean a runtime path had grown a bootstrap.
-        self.assertEqual(self.SHELL.count("authority_bootstrap"), 2)
+        # Structural, not token-counting: the helper is defined once, the
+        # bridge is defined once and calls it once, and the helper makes
+        # exactly one bridge call. A second call site anywhere would mean a
+        # runtime path had grown a bootstrap.
         self.assertEqual(self.SHELL.count("_bootstrap_authority_bridge"), 2)
         self.assertEqual(
             self.SHELL.count("scheduler_bridge scheduler-bootstrap-authority"), 1
         )
+        self.assertEqual(
+            self.SHELL.count("authority_bootstrap --assume-legacy"), 1
+        )
+        # The helper refuses to run without the operator's flag in its OWN
+        # argv: it does not synthesize the assertion for its callers.
+        self.assertIn("refusing to bootstrap authority without --assume-legacy",
+                      self.SHELL)
+        self.assertIn("refusing to bootstrap authority: only --assume-legacy "
+                      "is accepted", self.SHELL)
         # ... and the runtime command paths never mention it at all.
         dispatch = self.SHELL[self.SHELL.index("main() {"):]
         for case in ("check)", "wait)", "run)", "usage)", "status)"):
@@ -942,6 +1003,42 @@ class ExplicitBootstrapOnly(unittest.TestCase):
         # thing that creates the ownership fact.
         installer_doc = readme[readme.index("install-launchagents.sh"):]
         self.assertIn("never", installer_doc[:4000].lower())
+
+
+    def test_ar19_dispatch_never_falls_through_to_a_mutating_verb(self):
+        """The CLI's last line must not be a mutating default.
+
+        `migrate` is the one verb that mutates without setting a handler, so
+        it is matched EXPLICITLY and a handler-less verb that is not in that
+        table fails loudly instead of becoming a secret state-seeding
+        migrate. This audit is what keeps a future verb registration from
+        silently inheriting the fall-through.
+        """
+        import re
+        from quota_sentinel.__main__ import build_parser
+
+        main_source = (REPO / "quota_sentinel" / "__main__.py").read_text(
+            encoding="utf-8"
+        )
+        main_body = main_source[main_source.index("def main("):]
+        explicit = set(re.findall(r'args\.command == "([a-z-]+)"', main_body))
+        self.assertIn("migrate", explicit)
+        # The mutate call sits inside the explicit arm, not at the end.
+        self.assertIn('if args.command == "migrate":', main_body)
+        self.assertIn("no handler registered", main_body)
+
+        parser = build_parser()
+        choices = parser._subparsers._group_actions[0].choices
+        for name, sub_parser in choices.items():
+            if sub_parser.get_default("handler") is not None:
+                continue
+            with self.subTest(verb=name):
+                self.assertIn(
+                    name, explicit,
+                    "this verb has no handler and no explicit dispatch arm: "
+                    "the fall-through would run migrate() or crash on "
+                    "args.providers",
+                )
 
 
 class DocumentationPointers(unittest.TestCase):

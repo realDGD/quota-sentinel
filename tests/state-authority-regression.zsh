@@ -72,6 +72,15 @@ manifest_backend() {
   sed -n 's/.*"backend": "\([a-z]*\)".*/\1/p' "$MANIFEST" 2>/dev/null
 }
 
+# Every durable byte of the deployment, so a refusal can be proven to have
+# changed NOTHING (not merely "the manifest still looks right").
+snapshot_state_bytes() {
+  local f
+  for f in "$QUOTA_SENTINEL_STATE_DIR"/*(N.); do
+    print -r -- "${f:t} $(shasum -a 256 <"$f" | cut -d' ' -f1)"
+  done
+}
+
 reset_deployment() {
   rm -rf "$QUOTA_SENTINEL_STATE_DIR"
   mkdir -p "$QUOTA_SENTINEL_STATE_DIR"
@@ -106,6 +115,16 @@ refuse_out="$(run_cli bootstrap-authority 2>&1)" || refuse_rc=$?
 print -r -- "$refuse_out" | grep -q "UNKNOWN" ||
   fail "the refusal did not explain itself: $refuse_out"
 [[ ! -e "$MANIFEST" ]] || fail "a refused bootstrap created a manifest"
+# ... and the lower-level helper does not SYNTHESIZE the assertion either:
+# a caller that cannot show the operator's flag cannot create the fact.
+bare_rc=0
+authority_bootstrap >/dev/null 2>&1 || bare_rc=$?
+(( bare_rc != 0 )) || fail "authority_bootstrap ran without an assertion"
+[[ ! -e "$MANIFEST" ]] || fail "a bare authority_bootstrap created a manifest"
+bare_rc=0
+authority_bootstrap --force >/dev/null 2>&1 || bare_rc=$?
+(( bare_rc != 0 )) || fail "authority_bootstrap accepted an unknown argument"
+[[ ! -e "$MANIFEST" ]] || fail "an unknown argument still created a manifest"
 init_out="$(run_cli bootstrap-authority --assume-legacy)"
 print -r -- "$init_out" | grep -q "bootstrapped as legacy" || fail "bootstrap did not report: $init_out"
 [[ "$(manifest_backend)" == "legacy" ]] || fail "bootstrap chose the wrong backend"
@@ -277,10 +296,18 @@ advanced_due="$(internal next-due codex)"
 # could lose lives in tests/python-authority-regression.py, where the
 # cutover/rollback code exposes a pause hook and the interleaving can be
 # driven precisely instead of raced.)
+#
+# WHOLE-ROSTER + run.lock, together: the refusal must leave EVERY byte of
+# the deployment alone — not just the manifest. A "verify the roster, then
+# flip" rollback that ran unsynchronized would show up here as a changed
+# document even when the manifest looked right.
+locked_snapshot="$(snapshot_state_bytes)"
 env QUOTA_SENTINEL_RUN_LOCK_WAIT=1 PI_SOURCE_ONLY=0 /bin/zsh "$SCRIPT_PATH" rollback >/dev/null 2>&1 &&
   fail "the public rollback ran while a writer held run.lock"
 [[ "$(manifest_backend)" == "json" ]] ||
   fail "the public rollback flipped ownership without the lock"
+[[ "$(snapshot_state_bytes)" == "$locked_snapshot" ]] ||
+  fail "a refused rollback still modified the deployment"
 [[ "$(internal next-due codex)" == "$advanced_due" ]] ||
   fail "the advanced JSON state was lost"
 wait "$writer_pid" || fail "the writer failed"
@@ -302,10 +329,13 @@ for _ in {1..80}; do
   "$SLEEP_BIN" 0.1
 done
 [[ -e "$TEST_TEMP_DIR/cutover-ready" ]] || fail "the second writer never took run.lock"
+locked_snapshot="$(snapshot_state_bytes)"
 env QUOTA_SENTINEL_RUN_LOCK_WAIT=1 PI_SOURCE_ONLY=0 /bin/zsh "$SCRIPT_PATH" cutover >/dev/null 2>&1 &&
   fail "cutover ran while another process held run.lock"
+[[ "$(snapshot_state_bytes)" == "$locked_snapshot" ]] ||
+  fail "a refused cutover modified the deployment"
 wait "$cut_pid" || fail "the lock holder failed"
-print -r -- "  PASS: cutover serializes on the same run.lock"
+print -r -- "  PASS: cutover serializes on the same run.lock, whole roster untouched"
 
 # ---------------------------------------------------------------------------
 print -r -- "== AB10: a failing command releases run.lock =="

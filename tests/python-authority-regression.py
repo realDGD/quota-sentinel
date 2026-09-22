@@ -1170,6 +1170,44 @@ class WholeRosterSwitchTests(AuthorityBase):
                 )
                 self.assertEqual(router.load(provider), expected)
 
+    def test_w5_an_empty_roster_refuses_to_move_ownership(self):
+        """All-or-nothing assumes there is something to be all-of.
+
+        With an empty roster the prepare/verify loops are no-ops, so a
+        switch would flip the global fact having read, prepared and
+        verified NOTHING — every provider handed to the other backend. The
+        roster is a module constant, so this is a guard against a future
+        edit or a test seam; it must refuse in BOTH directions and before
+        the first read.
+        """
+        self.seed_roster()
+        original = cutover_module.DEFAULT_PROVIDERS
+        cutover_module.DEFAULT_PROVIDERS = ()
+        try:
+            with self.assertRaises(StateStoreError):
+                cutover_to_json(self.state_dir)
+            # Refused before touching anything: still a legacy deployment.
+            self.assertEqual(
+                read_authority(self.state_dir), bootstrap_authority()
+            )
+        finally:
+            cutover_module.DEFAULT_PROVIDERS = original
+
+        # ... and the same in the other direction, from real JSON authority.
+        cutover_to_json(self.state_dir)
+        before = self.snapshot()
+        cutover_module.DEFAULT_PROVIDERS = ()
+        try:
+            with self.assertRaises(StateStoreError):
+                rollback_to_legacy(self.state_dir)
+        finally:
+            cutover_module.DEFAULT_PROVIDERS = original
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(
+            read_authority(self.state_dir),
+            BackendAuthority(BACKEND_JSON, 1),
+        )
+
     def test_w1_switch_primitives_cannot_express_a_provider_subset(self):
         import inspect
 

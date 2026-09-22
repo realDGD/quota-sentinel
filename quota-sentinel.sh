@@ -30,7 +30,9 @@ readonly FEISHU_APP_SECRET_SERVICE="quota-sentinel.feishu-app-secret"
 readonly FEISHU_USER_ID_SERVICE="quota-sentinel.feishu-user-id"
 readonly OPENCODE_API_KEY_SERVICE="quota-sentinel.opencode-go-api-key"
 readonly STATE_DIR="${QUOTA_SENTINEL_STATE_DIR:-$HOME/Library/Application Support/Quota-Sentinel}"
-readonly AUTHORITY_MANIFEST="$STATE_DIR/backend-authority.json"
+# No `backend-authority.json` path is declared here on purpose: the manifest
+# is never stat()ed or branched on. Absence is a loud failure reported by
+# the bridge, never a branch a shell helper could take safely.
 readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"
 readonly QUOTA_LOCK_FILE="$STATE_DIR/quota.lock"
 readonly CODEXBAR_CODEX_CACHE_FILE="$STATE_DIR/codexbar-codex-last-success.json"
@@ -194,12 +196,27 @@ legacy_backend_active() {
 # any status path. The only caller is the explicit operator verb
 # `bootstrap-authority --assume-legacy`, which is what keeps a deleted
 # manifest detectable instead of silently re-legitimized.
+#
+# The assertion is REQUIRED IN THIS CALL'S OWN ARGV. This helper does not
+# synthesize it: a caller that cannot show the operator's flag gets a
+# refusal, so a future second call site cannot inherit an assertion nobody
+# made.
 authority_bootstrap() {
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "--assume-legacy" ]] || {
+      print -ru2 -- "refusing to bootstrap authority: only --assume-legacy is accepted"
+      return 3
+    }
+  done
+  (( $# > 0 )) || {
+    print -ru2 -- "refusing to bootstrap authority without --assume-legacy"
+    return 3
+  }
   # The INTERNAL verb on purpose: the caller (the operator verb below, and
   # the test fixtures) holds run.lock already, and the public verb would
-  # try to take it a second time and deadlock against its own caller.
-  # The assertion travels with the call: the internal verb refuses without
-  # it, so no path can create the ownership fact merely by reaching here.
+  # try to take it a second time and deadlock against its own caller. The
+  # internal verb requires the flag too.
   scheduler_bridge scheduler-bootstrap-authority --assume-legacy
 }
 
@@ -2979,8 +2996,18 @@ run_authority_lifecycle() {
 # be silently re-legitimized as a legacy epoch-0 owner — resurrecting
 # deadlines and retry debt the authoritative documents have moved past.
 run_bootstrap_authority() {
-  local assume_legacy="$1"
-  if [[ "$assume_legacy" != "--assume-legacy" ]]; then
+  shift                       # drop the verb name; only the flag may follow
+  local assume_legacy=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --assume-legacy) assume_legacy=1 ;;
+      *)
+        print -ru2 -- "usage: $SCRIPT_NAME bootstrap-authority --assume-legacy"
+        exit 2
+        ;;
+    esac
+  done
+  if (( ! assume_legacy )); then
     print -ru2 -- "quota-sentinel: refusing to bootstrap the authority manifest."
     print -ru2 -- ""
     print -ru2 -- "A missing manifest means the owner is UNKNOWN, not that it is legacy."
@@ -3002,7 +3029,7 @@ run_bootstrap_authority() {
 # second must not, and the output has to distinguish them.
 _bootstrap_authority_bridge() {
   local out rc=0
-  out="$(authority_bootstrap)" || rc=$?
+  out="$(authority_bootstrap --assume-legacy)" || rc=$?
   bridge_apply_log "authority" "$out"
   (( rc == 0 )) || return $rc
   if [[ "$out" == *"created=1"* ]]; then
@@ -3022,8 +3049,8 @@ run_cutover() {
 }
 
 # Authority is one global fact, so there is no provider argument here and
-# there is none in the bridge verb either: `cutover codex` is a usage error
-# before any state is touched.
+# there is none in the bridge verb either: naming a provider after either
+# verb is a usage error before any state is touched.
 _cutover_bridge() {
   migrate_legacy_state
   bridge_run_logged "cutover" scheduler-cutover
@@ -3369,7 +3396,7 @@ main() {
       send_usage_notification
       ;;
     bootstrap-authority)
-      run_bootstrap_authority "${2:-}"
+      run_bootstrap_authority "$@"
       ;;
     cutover)
       run_cutover

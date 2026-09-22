@@ -60,7 +60,7 @@ LAST_TEMP_DIR="$TEST_TEMP_DIR"
 # A throwaway deployment this suite builds is an INITIALIZED deployment:
 # the authority manifest is required at runtime, so every state dir gets one
 # (legacy backend), exactly as the installer leaves it on an upgraded host.
-initialize_test_authority() { authority_bootstrap >/dev/null; }
+initialize_test_authority() { authority_bootstrap --assume-legacy >/dev/null; }
 
 trap cleanup EXIT
 ensure_temp_dir

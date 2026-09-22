@@ -194,6 +194,14 @@ before="$(cat "$MANIFEST")"
 run_installer --load >/dev/null || fail "install over an initialized deployment failed"
 [[ "$(cat "$MANIFEST")" == "$before" ]] ||
   fail "the installer rewrote an existing authority manifest"
+# A valid JSON-authority deployment is a normal update: the agents still
+# restart, and the retired schedulers still go first.
+grep -q "bootout gui/$(id -u)/quota-sentinel$" "$LAUNCHCTL_LOG" ||
+  fail "the retired watchdog was not booted out under JSON authority"
+grep -q "bootout gui/$(id -u)/quota-sentinel.timer$" "$LAUNCHCTL_LOG" ||
+  fail "the retired timer was not booted out under JSON authority"
+grep -q "bootstrap .*quota-sentinel.feishu-listener.plist" "$LAUNCHCTL_LOG" ||
+  fail "the listener was not restarted under JSON authority"
 print -r -- "  PASS: upgrade reads ownership and never downgrades JSON to legacy"
 
 # ---------------------------------------------------------------------------

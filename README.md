@@ -254,8 +254,8 @@ knowing which backend that is. `authority` prints the manifest itself.
 > **`cutover` and `rollback` are whole-roster.** They take no provider
 > argument: the manifest names the backend for the entire state directory,
 > so a provider-scoped switch would hand the other providers to the retired
-> backend. `cutover codex` is an argparse usage error, refused before any
-> state is touched.
+> backend. Naming a provider after either verb is an argparse usage error,
+> refused before any state is touched.
 
 > **The `scheduler-*` verbs are an INTERNAL BRIDGE API.** They are what
 > `quota-sentinel.sh` calls *while it already holds `run.lock`*, and they do

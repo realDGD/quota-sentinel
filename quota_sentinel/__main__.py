@@ -373,7 +373,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_json_dump(JsonStateStore(state_dir), args.provider)
         if args.command == "authority":
             return run_authority(state_dir)
-        return run_migrate(state_dir, args.providers or None)
+        if args.command == "migrate":
+            # `migrate` is the ONE verb that mutates without setting a
+            # handler (it takes a roster positional). It is matched
+            # EXPLICITLY: a bare fall-through here would turn any future
+            # handler-less verb into a secret state-seeding migrate, or
+            # crash on `args.providers` — neither of which is a decision
+            # this dispatch may make by accident.
+            return run_migrate(state_dir, args.providers or None)
+        print(
+            f"quota_sentinel: no handler registered for {args.command!r}; "
+            "refusing to guess what it should do",
+            file=sys.stderr,
+        )
+        return 3
     except StateStoreError as exc:
         print(f"quota_sentinel: {exc}", file=sys.stderr)
         return 4

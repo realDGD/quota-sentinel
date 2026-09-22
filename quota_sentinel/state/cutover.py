@@ -204,7 +204,17 @@ def prepare_provider_cutover(state_dir: Path, provider: str) -> CutoverPreparati
 def prepare_all_cutover(
     state_dir: Path, providers: Optional[Sequence[str]] = None
 ) -> Dict[str, CutoverPreparation]:
-    roster: Sequence[str] = providers if providers else DEFAULT_PROVIDERS
+    """Prepare SHADOW documents only — this never moves ownership.
+
+    ``providers`` is a preparation scope, not an authority scope: the
+    result is inert until a whole-roster cutover runs, so a narrower (or
+    even empty) scope here cannot produce a partial switch. ``None`` means
+    the deployment's roster; an explicit empty sequence means prepare
+    nothing, and is deliberately not silently promoted to "everything".
+    """
+    roster: Sequence[str] = (
+        DEFAULT_PROVIDERS if providers is None else tuple(providers)
+    )
     return {
         provider: prepare_provider_cutover(Path(state_dir), provider)
         for provider in roster
@@ -267,6 +277,24 @@ def _ensure_state_dir(state_dir: Path, provider: str) -> None:
         ) from exc
 
 
+def _require_non_empty_roster(roster: Sequence[str]) -> None:
+    """All-or-nothing assumes there is something to be all-of.
+
+    With an EMPTY roster the prepare/verify loops are no-ops and the global
+    fact would still flip — the worst possible switch: every provider handed
+    to the other backend while zero providers were read, prepared or
+    verified. The roster is a module constant, so this is a guard against a
+    future edit (or a monkeypatched test seam) rather than a runtime
+    possibility, and it is deliberately checked BEFORE the first read.
+    """
+    if not roster:
+        raise StateStoreError(
+            "the provider roster is empty; refusing to move the ownership "
+            "fact, because a switch that prepares and verifies nothing would "
+            "hand every provider to the other backend"
+        )
+
+
 def cutover_to_json(
     state_dir: Path,
     *,
@@ -293,6 +321,7 @@ def cutover_to_json(
     """
     state_dir = Path(state_dir)
     roster: Sequence[str] = DEFAULT_PROVIDERS
+    _require_non_empty_roster(roster)
 
     # 1. Current durable fact.
     previous = read_authority(state_dir)
@@ -374,6 +403,7 @@ def rollback_to_legacy(
     """
     state_dir = Path(state_dir)
     roster: Sequence[str] = DEFAULT_PROVIDERS
+    _require_non_empty_roster(roster)
 
     previous = read_authority(state_dir)
     if not previous.is_json:
