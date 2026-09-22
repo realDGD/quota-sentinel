@@ -13,10 +13,12 @@
 #   ./install-launchagents.sh          render + install into ~/Library/LaunchAgents
 #   ./install-launchagents.sh --load   ... and bootstrap the active listener
 #
-# This script does NOT switch the state backend. Upgrading the code and
-# moving ownership are separate actions on purpose, so an operator can
-# install, watch the existing (legacy) backend behave, and only then run
-# `./quota-sentinel.sh cutover`.
+# This script does NOT switch the state backend, and it does NOT create the
+# authority manifest. Upgrading the code, asserting ownership and moving
+# ownership are three separate actions on purpose: an operator can install,
+# watch the existing backend behave, and only then run
+# `./quota-sentinel.sh cutover`. The installer REQUIRES an existing,
+# parseable authority manifest and refuses to guess one.
 #
 set -euo pipefail
 
@@ -71,33 +73,44 @@ readonly UV_BIN="${QUOTA_SENTINEL_UV_BIN:-/opt/homebrew/bin/uv}"
 print -r -- "synced     $REPO_DIR/.venv (uv.lock verified)"
 
 # ---------------------------------------------------------------------------
-# Authority manifest.
+# Authority manifest: VALIDATED, never created.
 #
-# Every initialized deployment has one, and the runtime REQUIRES it: "no
-# manifest" is only allowed to mean something at a lifecycle boundary, and
-# this is that boundary. `authority-initialize` is idempotent (an existing
-# manifest wins and is never rewritten) and refuses to touch a corrupt one,
-# so re-running the installer can never destroy the ownership fact.
+# The manifest is the single durable ownership fact and this installer is not
+# allowed to guess it. "No manifest" and "pre-protocol legacy deployment" are
+# indistinguishable from the state directory alone, so an installer that
+# wrote `legacy` here would silently re-legitimize a deployment that had
+# already cut over and lost its manifest — resurrecting the deadlines and
+# retry debt the authoritative JSON documents have moved past.
 #
-# It takes the scheduler's real run.lock itself, so it cannot interleave
-# with an in-flight check or model run.
+# This step is therefore strictly READ-ONLY: it requires an existing,
+# parseable manifest and fails — before any launchctl call and before any
+# label is rendered — when there is none. Creating one is an explicit
+# operator decision, never an installer side effect:
 #
-# ORDERING: this runs BEFORE the agents are (re)started. That is safe
-# because initialization only records the authority that is already in
-# effect (legacy for a deployment that predates the protocol); it reads no
-# scheduler state and starts no process. The retired schedulers are then
-# stopped before the new listener starts, so no old writer is ever alive
-# alongside the new one.
+#     ./quota-sentinel.sh bootstrap-authority --assume-legacy
+#
+# ORDERING: this runs BEFORE the agents are (re)started, so a deployment
+# whose owner is unknown never gets a scheduler started over it. The retired
+# schedulers are then stopped before the new listener starts, so no old
+# writer is ever alive alongside the new one.
 # ---------------------------------------------------------------------------
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 authority_out="$(
   PYTHONPATH="$REPO_DIR" "$PYTHON3_BIN" -S -m quota_sentinel \
-    --state-dir "$STATE_DIR" authority-initialize 2>&1
+    --state-dir "$STATE_DIR" authority 2>&1
 )" || {
-  print -ru2 -- "authority initialization failed:"
+  print -ru2 -- "authority manifest missing or unreadable:"
   print -ru2 -- "$authority_out"
-  print -ru2 -- "refusing to install agents over an uninitialized or unreadable authority manifest"
+  print -ru2 -- ""
+  print -ru2 -- "Refusing to install agents over a state directory whose owner is unknown."
+  print -ru2 -- "This installer never creates the authority manifest: a missing manifest"
+  print -ru2 -- "means the owner is UNKNOWN, not that it is legacy, and a deployment that"
+  print -ru2 -- "cut over and then lost it looks exactly the same from here."
+  print -ru2 -- ""
+  print -ru2 -- "  * manifest lost -> restore backend-authority.json from backup; do NOT recreate it."
+  print -ru2 -- "  * confirmed pre-protocol deployment -> assert it once, explicitly:"
+  print -ru2 -- "      ./quota-sentinel.sh bootstrap-authority --assume-legacy"
   exit 1
 }
 print -r -- "authority  $(print -r -- "$authority_out" | head -1)"

@@ -111,7 +111,8 @@ typeset -gi QUOTA_LOCK_HELD=0
 
 usage() {
   print -r -- "Usage: $SCRIPT_NAME [check|wait|run [codex|antigravity|opencode|all]|usage|status]"
-  print -r -- "       $SCRIPT_NAME [init-authority|cutover|rollback]"
+  print -r -- "       $SCRIPT_NAME [cutover|rollback]"
+  print -r -- "       $SCRIPT_NAME bootstrap-authority --assume-legacy"
 }
 
 # ---------------------------------------------------------------------------
@@ -160,10 +161,13 @@ scheduler_bridge() {
 }
 
 # The manifest is the single durable ownership fact and it is REQUIRED.
-# Its absence is not "this deployment was never cut over": that is only
-# knowable at a lifecycle boundary (the installer, or `init-authority`),
-# and treating a later disappearance as a bootstrap would silently
-# resurrect legacy state that the authoritative backend has moved past.
+# Its absence is not "this deployment was never cut over": a deployment
+# that cut over and then lost the manifest looks exactly the same, and
+# treating that as a bootstrap would silently resurrect legacy state the
+# authoritative backend has moved past. Absence means the owner is
+# UNKNOWN, and the ONLY way to turn it back into a known owner is an
+# operator asserting, out loud, that this deployment predates the
+# protocol (`bootstrap-authority --assume-legacy`).
 # There is deliberately no "does the manifest exist?" helper here: absence
 # is a failure, not a branch a caller could take safely.
 
@@ -184,12 +188,19 @@ legacy_backend_active() {
   [[ "$backend" == "legacy" ]]
 }
 
-# Materialize the bootstrap authority for a deployment that predates the
-# protocol. LIFECYCLE ONLY — the installer calls it, an operator can call
-# it through `init-authority`, and NOTHING in the runtime command paths
-# calls it. That restriction is what keeps a deleted manifest detectable.
-authority_initialize() {
-  scheduler_bridge authority-initialize
+# Create the bootstrap authority — a legacy epoch-0 ownership fact — for a
+# deployment the OPERATOR has confirmed predates the protocol. NOTHING
+# automatic calls this: not the installer, not check/wait/run/usage, not
+# any status path. The only caller is the explicit operator verb
+# `bootstrap-authority --assume-legacy`, which is what keeps a deleted
+# manifest detectable instead of silently re-legitimized.
+authority_bootstrap() {
+  # The INTERNAL verb on purpose: the caller (the operator verb below, and
+  # the test fixtures) holds run.lock already, and the public verb would
+  # try to take it a second time and deadlock against its own caller.
+  # The assertion travels with the call: the internal verb refuses without
+  # it, so no path can create the ownership fact merely by reaching here.
+  scheduler_bridge scheduler-bootstrap-authority --assume-legacy
 }
 
 # ---------------------------------------------------------------------------
@@ -223,7 +234,7 @@ require_legacy_backend() {
   legacy_backend_active || rc=$?
   case "$rc" in
     0) return 0 ;;
-    2) die "state backend authority manifest is missing or unreadable; refusing to touch legacy state. If this deployment predates the authority protocol, initialize it ONCE with the installer or './quota-sentinel.sh init-authority'; otherwise the manifest was lost — restore it rather than recreating it." ;;
+    2) die "state backend authority manifest is missing or unreadable; refusing to touch legacy state. The owner of this state is UNKNOWN: a deployment that cut over and then lost the manifest is indistinguishable from one that never had it, so nothing here will guess. Restore backend-authority.json from backup. ONLY if you have confirmed this deployment predates the authority protocol and never cut over, assert it once with './quota-sentinel.sh bootstrap-authority --assume-legacy'." ;;
     *) die "internal error: legacy state access reached while the JSON backend is authoritative" ;;
   esac
 }
@@ -2939,9 +2950,12 @@ run_and_reschedule_selected() {
 # They are deliberately NOT implicit in check/wait/run/usage: switching the
 # source of truth is an upgrade step, not a side effect of a scheduler tick.
 #
-# The installer does NOT call cutover. Upgrading and switching stay separate
-# actions so an operator can upgrade the code, watch the legacy backend
-# behave, and only then move ownership.
+# The installer does NOT call cutover, and it does NOT bootstrap the
+# authority manifest either. Upgrading, initializing and switching stay
+# separate actions: the installer refuses to guess an owner, so an operator
+# can upgrade the code, watch the legacy backend behave, and only then move
+# ownership — and a deployment whose manifest went missing fails loudly
+# instead of being re-legitimized as legacy epoch 0.
 # ---------------------------------------------------------------------------
 
 # run.lock is released on every exit path, including a failing bridge call.
@@ -2955,34 +2969,61 @@ run_authority_lifecycle() {
   (( rc == 0 )) || die "$label failed (rc=$rc)"
 }
 
-run_init_authority() {
-  run_authority_lifecycle _init_authority_bridge "state backend authority initialization"
+# Create the legacy ownership fact from an EXPLICIT operator assertion.
+#
+# This is the only verb in the script that can turn a missing manifest into
+# a present one, and it refuses unless the operator passes
+# `--assume-legacy`. The flag is not ceremony: "missing manifest" and
+# "pre-protocol legacy deployment" are indistinguishable from the state
+# directory alone, and a deployment whose manifest was lost would otherwise
+# be silently re-legitimized as a legacy epoch-0 owner — resurrecting
+# deadlines and retry debt the authoritative documents have moved past.
+run_bootstrap_authority() {
+  local assume_legacy="$1"
+  if [[ "$assume_legacy" != "--assume-legacy" ]]; then
+    print -ru2 -- "quota-sentinel: refusing to bootstrap the authority manifest."
+    print -ru2 -- ""
+    print -ru2 -- "A missing manifest means the owner is UNKNOWN, not that it is legacy."
+    print -ru2 -- "If — and only if — you have confirmed this deployment predates the"
+    print -ru2 -- "authority protocol and never cut over, re-run:"
+    print -ru2 -- ""
+    print -ru2 -- "    $SCRIPT_NAME bootstrap-authority --assume-legacy"
+    print -ru2 -- ""
+    print -ru2 -- "Otherwise the manifest was lost: restore backend-authority.json from"
+    print -ru2 -- "backup rather than recreating it."
+    exit 3
+  fi
+  run_authority_lifecycle _bootstrap_authority_bridge \
+    "state backend authority bootstrap"
 }
 
-# Reports WHICH outcome happened. "initialized" and "already initialized"
-# are different operator-facing facts: the first changes durable state, the
-# second must not, and an operator re-running the installer needs to be able
-# to tell them apart from the output alone.
-_init_authority_bridge() {
+# Reports WHICH outcome happened. "created" and "already present" are
+# different operator-facing facts: the first changes durable state, the
+# second must not, and the output has to distinguish them.
+_bootstrap_authority_bridge() {
   local out rc=0
-  out="$(scheduler_bridge scheduler-initialize-authority)" || rc=$?
+  out="$(authority_bootstrap)" || rc=$?
   bridge_apply_log "authority" "$out"
   (( rc == 0 )) || return $rc
   if [[ "$out" == *"created=1"* ]]; then
-    print -r -- "state backend authority initialized (legacy epoch 0)"
+    print -r -- "state backend authority bootstrapped as legacy epoch 0 (operator asserted a pre-protocol deployment)"
   else
-    print -r -- "state backend authority already initialized; nothing written"
+    print -r -- "state backend authority already present; nothing written"
   fi
 }
 
 # Seed the pre-cutover legacy slots (idempotent, non-destructive), then
-# switch ownership. Requires an INITIALIZED deployment: a virgin one must be
-# initialized first, so that "no manifest" can never be read as "legacy".
+# switch ownership for the WHOLE roster. Requires an EXISTING manifest: a
+# deployment with no authority has an unknown owner and must be resolved by
+# an operator assertion (or a restore) first, never by this verb.
 run_cutover() {
   run_authority_lifecycle _cutover_bridge "state backend cutover"
   print -r -- "state backend cutover complete"
 }
 
+# Authority is one global fact, so there is no provider argument here and
+# there is none in the bridge verb either: `cutover codex` is a usage error
+# before any state is touched.
 _cutover_bridge() {
   migrate_legacy_state
   bridge_run_logged "cutover" scheduler-cutover
@@ -3327,8 +3368,8 @@ main() {
     usage)
       send_usage_notification
       ;;
-    init-authority)
-      run_init_authority
+    bootstrap-authority)
+      run_bootstrap_authority "${2:-}"
       ;;
     cutover)
       run_cutover

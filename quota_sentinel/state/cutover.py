@@ -269,22 +269,30 @@ def _ensure_state_dir(state_dir: Path, provider: str) -> None:
 
 def cutover_to_json(
     state_dir: Path,
-    providers: Optional[Sequence[str]] = None,
     *,
     checkpoint: Checkpoint = None,
 ) -> BackendSwitch:
     """Make the JSON backend authoritative for the WHOLE roster.
 
+    THERE IS NO PROVIDER SUBSET. The authority manifest is ONE global
+    fact, so a switch that prepared a subset of providers and then flipped
+    it would make the unprepared providers' authoritative state
+    unreachable while the manifest claimed all of them were JSON. The
+    roster is therefore not a parameter: it is the deployment's roster,
+    every time. Fixtures that only populate one provider simply leave the
+    others all-unset; they do not get a narrower switch.
+
     PRECONDITION (contract, not verified here — see the module docstring):
     the caller holds the shell's run.lock. Every authoritative writer in
     the system is serialised by that lock, so the legacy state read in
-    step 2 cannot change underneath the documents built from it.
+    step 2 cannot change underneath the documents built from it. The
+    public CLI verbs acquire it themselves; the shell already holds it.
 
     Idempotent: calling it when JSON is already authoritative returns the
     current authority with ``changed=False`` and writes nothing.
     """
     state_dir = Path(state_dir)
-    roster: Sequence[str] = tuple(providers) if providers else DEFAULT_PROVIDERS
+    roster: Sequence[str] = DEFAULT_PROVIDERS
 
     # 1. Current durable fact.
     previous = read_authority(state_dir)
@@ -348,20 +356,24 @@ def cutover_to_json(
 
 def rollback_to_legacy(
     state_dir: Path,
-    providers: Optional[Sequence[str]] = None,
     *,
     checkpoint: Checkpoint = None,
 ) -> BackendSwitch:
     """Return ownership to the legacy backend — only as a PURE UNDO.
 
-    Refuses (``RollbackRefusedError``) as soon as any JSON document
+    THERE IS NO PROVIDER SUBSET, and this is the more dangerous direction
+    of the two: verifying only the named providers and then flipping the
+    global fact would discard every unnamed provider's advanced JSON state
+    without ever looking at it.
+
+    Refuses (``RollbackRefusedError``) as soon as ANY JSON document
     differs from its legacy file, because that means authoritative state
     was written after the cutover and switching back would silently
     discard it. Legacy files are never deleted, so the pure-undo case is
     exactly the cutover's own output.
     """
     state_dir = Path(state_dir)
-    roster: Sequence[str] = tuple(providers) if providers else DEFAULT_PROVIDERS
+    roster: Sequence[str] = DEFAULT_PROVIDERS
 
     previous = read_authority(state_dir)
     if not previous.is_json:

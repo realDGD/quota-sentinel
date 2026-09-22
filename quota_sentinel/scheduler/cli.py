@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from ..state.authority import initialize_authority
+from ..state.authority import bootstrap_legacy_authority
 from ..state.cutover import cutover_to_json, rollback_to_legacy
 from ..state.models import ProviderState, ResetCandidate
 from ..state.migration import DEFAULT_PROVIDERS
@@ -172,8 +172,12 @@ def cmd_cutover(args: argparse.Namespace) -> int:
 
         ./quota-sentinel.sh cutover      (shell, holds run.lock)
         uv run quota-sentinel cutover    (public, acquires run.lock)
+
+    There is no provider argument. Authority is one global fact, so the
+    switch always prepares and verifies the entire roster; see
+    ``quota_sentinel.state.cutover``.
     """
-    result = cutover_to_json(args.state_dir, args.providers or None)
+    result = cutover_to_json(args.state_dir)
     print(f"backend={result.current.backend}")
     print(f"epoch={result.current.epoch}")
     print(f"changed={1 if result.changed else 0}")
@@ -187,9 +191,9 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 
     Same precondition and reasoning as ``scheduler-cutover``. The
     lock-acquiring equivalents are ``./quota-sentinel.sh rollback`` and
-    ``uv run quota-sentinel rollback``.
+    ``uv run quota-sentinel rollback``. Whole roster only, like cutover.
     """
-    result = rollback_to_legacy(args.state_dir, args.providers or None)
+    result = rollback_to_legacy(args.state_dir)
     print(f"backend={result.current.backend}")
     print(f"epoch={result.current.epoch}")
     print(f"changed={1 if result.changed else 0}")
@@ -198,9 +202,33 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_initialize_authority(args: argparse.Namespace) -> int:
-    """INTERNAL: materialize the bootstrap manifest, without run.lock."""
-    result = initialize_authority(args.state_dir)
+def cmd_bootstrap_authority(args: argparse.Namespace) -> int:
+    """INTERNAL: create the legacy epoch-0 manifest, WITHOUT run.lock.
+
+    Two preconditions travel with this verb, and the caller owns both:
+    it must already hold ``run.lock``, and it must have established for
+    itself that this deployment predates the authority protocol — which
+    an operator states explicitly as ``--assume-legacy``. Missing
+    authority is not evidence of legacy: it means the owner is unknown,
+    and a deployment whose manifest was lost would otherwise be silently
+    re-legitimized as a legacy epoch-0 owner by ordinary operations.
+
+    The flag is required HERE TOO, not only on the operator verb. A CLI
+    cannot verify that a caller holds a lock it did not take, so the one
+    thing this surface can enforce is that the assertion is present in the
+    argv: every path that can create the ownership fact then carries the
+    operator's decision with it.
+    """
+    if not getattr(args, "assume_legacy", False):
+        print(
+            "quota_sentinel: refusing to bootstrap the authority manifest: "
+            "this is the internal bridge verb, and it still requires "
+            "--assume-legacy. A missing manifest means the owner is UNKNOWN, "
+            "not legacy.",
+            file=sys.stderr,
+        )
+        return 3
+    result = bootstrap_legacy_authority(args.state_dir)
     print(f"backend={result.authority.backend}")
     print(f"epoch={result.authority.epoch}")
     print(f"created={1 if result.created else 0}")
@@ -411,16 +439,27 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     for name, handler, helptext in (
         ("scheduler-cutover", cmd_cutover,
-         "INTERNAL BRIDGE API: switch ownership to JSON (caller already holds run.lock)"),
+         "INTERNAL BRIDGE API: switch ownership to JSON for the WHOLE roster "
+         "(caller already holds run.lock)"),
         ("scheduler-rollback", cmd_rollback,
-         "INTERNAL BRIDGE API: switch ownership back to legacy (caller already holds run.lock)"),
-        ("scheduler-initialize-authority", cmd_initialize_authority,
-         "INTERNAL BRIDGE API: materialize the bootstrap manifest (caller already holds run.lock)"),
+         "INTERNAL BRIDGE API: switch ownership back to legacy for the WHOLE roster "
+         "(caller already holds run.lock)"),
     ):
         parser = sub.add_parser(name, help=helptext)
-        parser.add_argument("providers", nargs="*", default=None,
-                            help="override the default provider roster")
         parser.set_defaults(handler=handler)
+
+    bootstrap = sub.add_parser(
+        "scheduler-bootstrap-authority",
+        help="INTERNAL BRIDGE API: create the legacy epoch-0 manifest, ONLY for "
+             "a caller that holds run.lock and has established pre-protocol "
+             "legacy (still requires --assume-legacy)",
+    )
+    bootstrap.add_argument(
+        "--assume-legacy", action="store_true",
+        help="the operator's explicit assertion that this deployment predates "
+             "the authority protocol; required even here",
+    )
+    bootstrap.set_defaults(handler=cmd_bootstrap_authority)
 
     valid = sub.add_parser("scheduler-valid-reset", help="INTERNAL BRIDGE API: plausible fresh reset, if any")
     valid.add_argument("--provider", required=True)

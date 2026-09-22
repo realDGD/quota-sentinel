@@ -1,21 +1,25 @@
 #!/bin/zsh
 # State-backend authority lifecycle: end-to-end through the real shell.
 #
-# The authority manifest is a REQUIRED durable fact. Its absence is only
-# meaningful at a lifecycle boundary (the installer, or `init-authority`);
-# at runtime it means the ownership fact was LOST, and the correct answer is
-# a loud failure rather than a guess. This suite pins that contract, the
-# operator commands that own the lifecycle, and the lock-safety of those
-# commands.
+# The authority manifest is a REQUIRED durable fact, and its absence is
+# UNKNOWN OWNERSHIP — not "legacy", and no longer a lifecycle boundary at
+# which anything may invent an answer. A deployment that cut over and then
+# lost the manifest looks exactly like one that never had it, so the only
+# thing allowed to turn absence into a legacy epoch-0 fact is an operator
+# asserting it out loud (`bootstrap-authority --assume-legacy`). This suite
+# pins that contract, the operator commands that own the lifecycle, and the
+# lock-safety of those commands.
 #
-#   AB1  virgin deployment: reads fail loud, explicit init materializes
-#        legacy epoch 0, scheduler state is untouched (M1)
-#   AB2  initialized legacy deployment: deleting the manifest is CORRUPTION,
-#        never a silent re-bootstrap (M2)
+#   AB1  virgin deployment: reads fail loud, an assertion WITHOUT the flag
+#        creates nothing, and the explicit assertion materializes legacy
+#        epoch 0 without touching scheduler state (M1)
+#   AB2  initialized legacy deployment: deleting the manifest is CORRUPTION
+#        and every automatic path refuses; only an explicit operator
+#        assertion re-records it (M2)
 #   AB3  JSON authoritative with advanced state: deleting the manifest must
 #        not resurrect legacy, and must not modify the JSON (M3)
 #   AB4  mutations under a missing manifest fail closed (M4)
-#   AB5  cutover under run.lock: legacy bytes untouched, idempotent
+#   AB5  cutover switches a whole roster in one epoch
 #   AB6  after cutover legacy is retired: invisible to reads, refused to writers
 #   AB7  rollback is a pure undo and refuses once JSON has advanced
 #   AB8  the PUBLIC rollback cannot run while a writer holds run.lock (L1);
@@ -89,22 +93,31 @@ legacy_rc=0
 legacy_backend_active || legacy_rc=$?
 (( legacy_rc == 2 )) || fail "legacy_backend_active did not report unreadable (rc=$legacy_rc)"
 check_out="$(run_cli check 2>&1 || true)"
-print -r -- "$check_out" | grep -q "init-authority" ||
-  fail "the failure did not name the remedy: $check_out"
+print -r -- "$check_out" | grep -q "bootstrap-authority --assume-legacy" ||
+  fail "the failure did not name the explicit remedy: $check_out"
 printf '111\n' >"$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at"
 before="$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at")"
-init_out="$(run_cli init-authority)"
-print -r -- "$init_out" | grep -q "initialized" || fail "init did not report: $init_out"
-[[ "$(manifest_backend)" == "legacy" ]] || fail "init chose the wrong backend"
-grep -q '"epoch": 0' "$MANIFEST" || fail "init did not start at epoch 0"
+# The operator verb must refuse WITHOUT the assertion, and must create
+# nothing while refusing: that is what stops an accidental "repair" from
+# re-legitimizing a deployment whose manifest was lost.
+refuse_rc=0
+refuse_out="$(run_cli bootstrap-authority 2>&1)" || refuse_rc=$?
+(( refuse_rc == 3 )) || fail "bootstrap without --assume-legacy exited $refuse_rc"
+print -r -- "$refuse_out" | grep -q "UNKNOWN" ||
+  fail "the refusal did not explain itself: $refuse_out"
+[[ ! -e "$MANIFEST" ]] || fail "a refused bootstrap created a manifest"
+init_out="$(run_cli bootstrap-authority --assume-legacy)"
+print -r -- "$init_out" | grep -q "bootstrapped as legacy" || fail "bootstrap did not report: $init_out"
+[[ "$(manifest_backend)" == "legacy" ]] || fail "bootstrap chose the wrong backend"
+grep -q '"epoch": 0' "$MANIFEST" || fail "bootstrap did not start at epoch 0"
 [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at")" == "$before" ]] ||
-  fail "initialization modified scheduler state"
+  fail "bootstrapping modified scheduler state"
 [[ "$(stat -f '%Lp' "$MANIFEST")" == "600" ]] || fail "manifest is not 0600"
 epoch_before="$(cat "$MANIFEST")"
-run_cli init-authority | grep -q "already initialized" ||
-  fail "a second init did not report idempotence"
-[[ "$(cat "$MANIFEST")" == "$epoch_before" ]] || fail "a second init rewrote the manifest"
-print -r -- "  PASS: explicit init only; reads never guess"
+run_cli bootstrap-authority --assume-legacy | grep -q "already present" ||
+  fail "a second bootstrap did not report idempotence"
+[[ "$(cat "$MANIFEST")" == "$epoch_before" ]] || fail "a second bootstrap rewrote the manifest"
+print -r -- "  PASS: only an explicit assertion creates authority; reads never guess"
 
 # ---------------------------------------------------------------------------
 print -r -- "== AB2: deleting the manifest later is corruption, not bootstrap (M2) =="
@@ -119,14 +132,16 @@ run_cli check >/dev/null 2>&1 || true
 [[ ! -e "$MANIFEST" ]] || fail "the runtime re-created the manifest (self-healing)"
 [[ "$(cat "$QUOTA_SENTINEL_STATE_DIR/codex-next-due-at")" == "$before" ]] ||
   fail "a refused command still modified state"
-run_cli init-authority >/dev/null
-[[ "$(manifest_backend)" == "legacy" ]] || fail "recovery did not restore legacy"
-print -r -- "  PASS: absence is loud; only the operator re-initializes"
+# Automatic paths are exhausted; the only thing left is the operator
+# asserting the deployment predates the protocol.
+run_cli bootstrap-authority --assume-legacy >/dev/null
+[[ "$(manifest_backend)" == "legacy" ]] || fail "the assertion did not record legacy"
+print -r -- "  PASS: absence is loud; only the operator re-asserts ownership"
 
 # ---------------------------------------------------------------------------
 print -r -- "== AB3: JSON + advanced state + deleted manifest never resurrects legacy (M3) =="
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 # A legacy deadline that the cutover copies and the JSON backend then moves
 # far past — so "did this read fall back to legacy?" has an answer that is
 # visibly different from the authoritative one.
@@ -171,7 +186,7 @@ print -r -- "  PASS: no default state, no legacy write, no document change"
 # ---------------------------------------------------------------------------
 print -r -- "== AB5: cutover switches a whole roster in one epoch =="
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 write_provider_next_due codex 111222
 write_provider_last_task codex 111000
 typeset -A LEGACY_BEFORE=()
@@ -214,7 +229,7 @@ print -r -- "== AB7: rollback is a pure undo and then refuses =="
 # exactly what the next assertion expects to be REFUSED. So start from a
 # clean cutover to test the pure-undo path itself.
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 write_provider_next_due codex 333000
 write_provider_last_task codex 300000
 run_cli cutover >/dev/null || fail "cutover failed"
@@ -235,7 +250,7 @@ print -r -- "  PASS: pure undo only; divergence refuses"
 # ---------------------------------------------------------------------------
 print -r -- "== AB8: the public rollback cannot bypass run.lock (L1) =="
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 write_provider_last_task codex 1000
 write_provider_next_due codex 2000
 run_cli cutover >/dev/null || fail "cutover failed"
@@ -295,7 +310,7 @@ print -r -- "  PASS: cutover serializes on the same run.lock"
 # ---------------------------------------------------------------------------
 print -r -- "== AB10: a failing command releases run.lock =="
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 # Force a failure INSIDE a shell function while the lock is held: the
 # scheduler bridge cannot read a corrupt manifest, and the error path must
 # still release the lock (zsh skips the EXIT trap for errexit exits that
@@ -313,15 +328,15 @@ print -r -- '{"schema_version": 1, "backend": "sqlite", "epoch": 3}' >"$MANIFEST
 corrupt_before="$(cat "$MANIFEST")"
 if internal authority >/dev/null 2>&1; then fail "an unknown backend was accepted"; fi
 init_rc=0
-run_cli init-authority >/dev/null 2>&1 || init_rc=$?
-(( init_rc != 0 )) || fail "init-authority overwrote a corrupt manifest"
+run_cli bootstrap-authority --assume-legacy >/dev/null 2>&1 || init_rc=$?
+(( init_rc != 0 )) || fail "an explicit bootstrap overwrote a corrupt manifest"
 [[ "$(cat "$MANIFEST")" == "$corrupt_before" ]] || fail "the corrupt manifest was replaced"
 print -r -- "  PASS: corruption blocks the lifecycle and is preserved for diagnosis"
 
 # ---------------------------------------------------------------------------
 print -r -- "== AB12: the post-run window + sync path works under JSON =="
 reset_deployment
-run_cli init-authority >/dev/null
+run_cli bootstrap-authority --assume-legacy >/dev/null
 run_cli cutover >/dev/null || fail "cutover failed"
 now="$(now_epoch)"
 future=$(( now + 1800 ))

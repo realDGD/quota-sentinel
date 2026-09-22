@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quota_sentinel.state import (
-    initialize_authority,
+    bootstrap_legacy_authority,
     ACTION_EXISTS,
     ACTION_SEEDED,
     DEFAULT_PROVIDERS,
@@ -366,7 +366,7 @@ class CliErrorSurfaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
-        initialize_authority(self.dir)
+        bootstrap_legacy_authority(self.dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()

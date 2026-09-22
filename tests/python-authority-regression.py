@@ -5,8 +5,10 @@ What this suite exists to prove — the questions a crash or a concurrent
 reader can actually ask:
 
   A. The durable authority fact is atomic, versioned, unique and loud.
-     An absent manifest means "never cut over" (legacy); a damaged one is
-     NEVER defaulted to either side.
+     An absent manifest means the OWNER IS UNKNOWN — it is neither
+     "legacy" nor "never cut over" — and a damaged one is NEVER defaulted
+     to either side. Only an explicit operator assertion may record the
+     legacy epoch-0 fact.
 
   B. Routing has exactly one authority → backend mapping, never caches a
      selection across operations, and its generation-guarded read never
@@ -18,6 +20,10 @@ reader can actually ask:
      crash prefix.
 
   D. Rollback is available only as a pure undo.
+
+  E. The switch primitives are WHOLE-ROSTER by construction (a provider
+     subset cannot even be expressed), and the explicit bootstrap is the
+     only thing that may turn absence into authority.
 
 Run: PYTHONPATH=. uv run --frozen --no-sync python tests/python-authority-regression.py
 """
@@ -39,8 +45,8 @@ sys.path.insert(0, str(REPO))
 from quota_sentinel.state import (
     AUTHORITY_FILENAME,
     AuthorityMissingError,
-    InitializationResult,
-    initialize_authority,
+    BootstrapResult,
+    bootstrap_legacy_authority,
     AUTHORITY_SCHEMA_VERSION,
     BACKEND_JSON,
     BACKEND_LEGACY,
@@ -108,7 +114,7 @@ class AuthorityBase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name) / "state"
         self.state_dir.mkdir(parents=True)
-        initialize_authority(self.state_dir)
+        bootstrap_legacy_authority(self.state_dir)
         self.files = FileStateStore(self.state_dir)
         self.jsons = JsonStateStore(self.state_dir)
 
@@ -171,9 +177,9 @@ class AuthorityDocumentTests(AuthorityBase):
         self.assertEqual(bootstrap_authority().backend, BACKEND_LEGACY)
         self.assertEqual(bootstrap_authority().epoch, 0)
 
-    def test_a1b_initialize_materializes_legacy_epoch_zero(self):
+    def test_a1b_explicit_bootstrap_materializes_legacy_epoch_zero(self):
         self.deinitialize()
-        result = initialize_authority(self.state_dir)
+        result = bootstrap_legacy_authority(self.state_dir)
         self.assertTrue(result.created)
         self.assertEqual(result.authority, bootstrap_authority())
         self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
@@ -181,21 +187,21 @@ class AuthorityDocumentTests(AuthorityBase):
             stat.S_IMODE(os.stat(authority_path(self.state_dir)).st_mode), 0o600
         )
 
-    def test_a1c_initialize_is_idempotent_and_never_rewrites(self):
+    def test_a1c_bootstrap_is_idempotent_and_never_rewrites(self):
         before = authority_path(self.state_dir).read_bytes()
-        result = initialize_authority(self.state_dir)
+        result = bootstrap_legacy_authority(self.state_dir)
         self.assertFalse(result.created)
         self.assertEqual(result.authority, bootstrap_authority())
         self.assertEqual(authority_path(self.state_dir).read_bytes(), before)
         # An initialized-JSON deployment must not be downgraded to legacy.
         write_authority(self.state_dir, BackendAuthority(BACKEND_JSON, 4))
         json_before = authority_path(self.state_dir).read_bytes()
-        again = initialize_authority(self.state_dir)
+        again = bootstrap_legacy_authority(self.state_dir)
         self.assertFalse(again.created)
         self.assertEqual(again.authority, BackendAuthority(BACKEND_JSON, 4))
         self.assertEqual(authority_path(self.state_dir).read_bytes(), json_before)
 
-    def test_a1d_initialize_ignores_json_documents(self):
+    def test_a1d_bootstrap_ignores_json_documents(self):
         """Phase 2 shadow documents are NOT evidence of a cutover.
 
         They may have existed for months before the protocol, so inferring
@@ -204,14 +210,14 @@ class AuthorityDocumentTests(AuthorityBase):
         """
         self.deinitialize()
         self.put_json("codex", legacy_state(0))
-        result = initialize_authority(self.state_dir)
+        result = bootstrap_legacy_authority(self.state_dir)
         self.assertEqual(result.authority.backend, BACKEND_LEGACY)
 
-    def test_a1e_initialize_refuses_to_overwrite_corruption(self):
+    def test_a1e_bootstrap_refuses_to_overwrite_corruption(self):
         authority_path(self.state_dir).write_bytes(b"{ not json")
         corrupt = authority_path(self.state_dir).read_bytes()
         with self.assertRaises(AuthorityError):
-            initialize_authority(self.state_dir)
+            bootstrap_legacy_authority(self.state_dir)
         self.assertEqual(authority_path(self.state_dir).read_bytes(), corrupt)
 
     def test_a2_read_is_pure_and_never_creates_the_manifest(self):
@@ -545,7 +551,7 @@ class CutoverTests(AuthorityBase):
         )
         self.write_legacy("codex", current)
 
-        cutover_to_json(self.state_dir, providers=["codex"])
+        cutover_to_json(self.state_dir)
         self.assertEqual(
             AuthoritativeStateStore(self.state_dir).load("codex"), current
         )
@@ -659,7 +665,7 @@ class CrashMatrixTests(AuthorityBase):
                 states = self.seed_roster()
                 # clear_state_dir removed the manifest; a real deployment
                 # is always initialized, so restore that FIRST.
-                initialize_authority(self.state_dir)
+                bootstrap_legacy_authority(self.state_dir)
                 legacy_bytes = self.snapshot()
 
                 def crash(name, target=checkpoint):
@@ -731,7 +737,7 @@ class CrashMatrixTests(AuthorityBase):
             with self.subTest(label=label):
                 self.clear_state_dir()
                 self.seed_roster()
-                initialize_authority(self.state_dir)
+                bootstrap_legacy_authority(self.state_dir)
                 authority_module._publish_atomic = hook  # type: ignore[assignment]
                 try:
                     with self.assertRaises(_InjectedCrash):
@@ -829,7 +835,7 @@ class MissingManifestTests(AuthorityBase):
     def _authoritative_json_deployment(self):
         """Cut over, then advance the JSON state past the legacy snapshot."""
         self.write_legacy("codex", legacy_state(0))
-        cutover_to_json(self.state_dir, providers=["codex"])
+        cutover_to_json(self.state_dir)
         store = AuthoritativeStateStore(self.state_dir)
         store.commit(
             "codex",
@@ -864,7 +870,7 @@ class MissingManifestTests(AuthorityBase):
 
     def test_m4_mutations_fail_closed_with_no_manifest(self):
         self.write_legacy("codex", legacy_state(0))
-        cutover_to_json(self.state_dir, providers=["codex"])
+        cutover_to_json(self.state_dir)
         document_before = self.jsons.document_path("codex").read_bytes()
         legacy_before = (self.state_dir / "codex-next-due-at").read_bytes()
         self.deinitialize()
@@ -923,7 +929,7 @@ class InitializationCrashTests(AuthorityBase):
                 authority_module._publish_atomic = hook  # type: ignore[assignment]
                 try:
                     with self.assertRaises(_InjectedCrash):
-                        initialize_authority(self.state_dir)
+                        bootstrap_legacy_authority(self.state_dir)
                 finally:
                     authority_module._publish_atomic = original  # type: ignore
 
@@ -943,7 +949,7 @@ class InitializationCrashTests(AuthorityBase):
                 self.assertEqual(
                     [n for n in self.snapshot() if ".tmp." in n], []
                 )
-                result = initialize_authority(self.state_dir)
+                result = bootstrap_legacy_authority(self.state_dir)
                 # Created only when the crashed attempt left nothing; a
                 # crash AFTER the publish means the fact is already there.
                 self.assertEqual(result.created, not expect_created)
@@ -962,7 +968,7 @@ class LifecycleLockTests(AuthorityBase):
 
     def test_l1_internal_rollback_window_loses_an_unsynchronized_update(self):
         self.write_legacy("codex", legacy_state(0))
-        cutover_to_json(self.state_dir, providers=["codex"])
+        cutover_to_json(self.state_dir)
         store = AuthoritativeStateStore(self.state_dir)
         self.assertEqual(store.load("codex"), legacy_state(0))
 
@@ -981,7 +987,7 @@ class LifecycleLockTests(AuthorityBase):
                 observed["committed"] = True
 
         rollback_to_legacy(
-            self.state_dir, providers=["codex"], checkpoint=writer_commits_in_the_window
+            self.state_dir, checkpoint=writer_commits_in_the_window
         )
         self.assertTrue(observed.get("committed"))
         # The update is now INVISIBLE: ownership went back to legacy while
@@ -1058,7 +1064,7 @@ class LifecyclePrerequisiteTests(AuthorityBase):
         self.write_legacy("codex", legacy_state(0))
         self.deinitialize()
         with self.assertRaises(AuthorityMissingError):
-            cutover_to_json(self.state_dir, providers=["codex"])
+            cutover_to_json(self.state_dir)
         # Nothing was created, and ownership was not invented.
         self.assertFalse(authority_path(self.state_dir).exists())
         self.assertFalse(self.jsons.exists("codex"))
@@ -1066,14 +1072,14 @@ class LifecyclePrerequisiteTests(AuthorityBase):
     def test_l2_rollback_refuses_without_an_initialized_authority(self):
         self.deinitialize()
         with self.assertRaises(AuthorityMissingError):
-            rollback_to_legacy(self.state_dir, providers=["codex"])
+            rollback_to_legacy(self.state_dir)
         self.assertFalse(authority_path(self.state_dir).exists())
 
     def test_migrate_refuses_under_json_authority(self):
         """Seeding a missing document from legacy would resurrect retired
         state — the same failure mode as guessing legacy from absence."""
         self.write_legacy("codex", legacy_state(0))
-        cutover_to_json(self.state_dir, providers=["codex"])
+        cutover_to_json(self.state_dir)
         document_before = self.jsons.document_path("codex").read_bytes()
         self.jsons.document_path("codex").unlink()
 
@@ -1092,6 +1098,340 @@ class LifecyclePrerequisiteTests(AuthorityBase):
             "migrate re-created a document from the retired backend",
         )
         self.assertEqual(document_before, document_before)  # unchanged input
+
+
+class WholeRosterSwitchTests(AuthorityBase):
+    """E1 (P1-1): a backend switch is whole-roster or it does not happen.
+
+    The manifest is ONE global fact, so a provider-scoped switch is not a
+    smaller switch: flipping the global fact after preparing one provider
+    would hand the others to the retired backend, silently discarding the
+    deadlines and retry debt their documents own. These tests pin the
+    mechanical properties that make that unreachable, not the wording of
+    the API.
+    """
+
+    def _record_prepared(self) -> list:
+        """Wrap the prepare step so the test can see EXACTLY who was
+        prepared — a skipped provider is the bug this class is about."""
+        prepared = []
+        original = cutover_module.prepare_provider_cutover
+
+        def recording(state_dir, provider):
+            prepared.append(provider)
+            return original(state_dir, provider)
+
+        cutover_module.prepare_provider_cutover = recording  # type: ignore
+        self.addCleanup(
+            lambda: setattr(
+                cutover_module, "prepare_provider_cutover", original
+            )
+        )
+        return prepared
+
+    def test_w2_cutover_prepares_and_verifies_every_provider(self):
+        states = self.seed_roster()
+        prepared = self._record_prepared()
+        result = cutover_to_json(self.state_dir)
+
+        self.assertEqual(sorted(prepared), sorted(PROVIDERS))
+        self.assertEqual(sorted(result.states), sorted(PROVIDERS))
+        self.assertEqual(sorted(result.prepared), sorted(PROVIDERS))
+        # Every provider is verifiable through the authoritative route, and
+        # the JSON document for each one carries the legacy state.
+        router = AuthoritativeStateStore(self.state_dir)
+        for provider, state in states.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(self.jsons.exists(provider))
+                self.assertEqual(router.load(provider), state)
+
+    def test_w2b_a_one_provider_deployment_still_switches_the_whole_roster(self):
+        """The exact shape of the reviewed bug's fixture.
+
+        Only Codex has legacy state; the other providers are all-unset. A
+        provider-scoped switch would have flipped the global fact after
+        preparing Codex alone, leaving the others' authoritative (absent or
+        advanced) state behind a manifest that claims JSON owns everything.
+        Whole-roster means every provider gets a document, and every document
+        is verified, before the flip.
+        """
+        self.write_legacy("codex", legacy_state(0))
+        prepared = self._record_prepared()
+        cutover_to_json(self.state_dir)
+
+        self.assertEqual(sorted(prepared), sorted(PROVIDERS))
+        router = AuthoritativeStateStore(self.state_dir)
+        self.assertEqual(router.load("codex"), legacy_state(0))
+        for provider in PROVIDERS:
+            with self.subTest(provider=provider):
+                self.assertTrue(self.jsons.exists(provider))
+                expected = (
+                    legacy_state(0) if provider == "codex" else ProviderState()
+                )
+                self.assertEqual(router.load(provider), expected)
+
+    def test_w1_switch_primitives_cannot_express_a_provider_subset(self):
+        import inspect
+
+        for func in (cutover_to_json, rollback_to_legacy):
+            with self.subTest(func=func.__name__):
+                self.assertNotIn(
+                    "providers", inspect.signature(func).parameters
+                )
+
+    def test_w1b_public_verbs_reject_a_provider_subset_before_touching_state(self):
+        import io
+        from contextlib import redirect_stderr
+        from quota_sentinel.__main__ import build_parser
+
+        parser = build_parser()
+        self.seed_roster()
+        cutover_to_json(self.state_dir)
+        before = self.snapshot()
+        for verb in ("cutover", "rollback"):
+            with self.subTest(verb=verb):
+                # argparse's own usage error is expected output here.
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        parser.parse_args(
+                            ["--state-dir", str(self.state_dir), verb, "codex"]
+                        )
+                self.assertEqual(caught.exception.code, 2)
+        # argparse refused before the handler ran: nothing changed at all.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w3_one_provider_failure_blocks_the_global_flip(self):
+        """A partial prepare can never become a global ownership fact.
+
+        The failure is injected on the LAST provider so a "prepare them one
+        by one and flip at the end" implementation cannot pass by accident:
+        the earlier documents may already be refreshed, but ownership must
+        still be legacy, and the failure must be loud.
+        """
+        self.seed_roster()
+        victim = PROVIDERS[-1]
+        original = cutover_module.prepare_provider_cutover
+
+        def failing(state_dir, provider):
+            if provider == victim:
+                raise cutover_module.CutoverVerificationError(
+                    f"synthetic failure preparing {provider}"
+                )
+            return original(state_dir, provider)
+
+        cutover_module.prepare_provider_cutover = failing  # type: ignore
+        try:
+            with self.assertRaises(cutover_module.CutoverVerificationError):
+                cutover_to_json(self.state_dir)
+        finally:
+            cutover_module.prepare_provider_cutover = original  # type: ignore
+
+        self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
+        # Ownership never moved, so the legacy reader is still the truth and
+        # the refreshed documents are just shadows.
+        self.assertEqual(
+            AuthoritativeStateStore(self.state_dir).load(victim),
+            self.files.load(victim),
+        )
+
+    def test_w4_rollback_inspects_every_provider_and_keeps_divergence(self):
+        """A divergence in the LAST provider must refuse the rollback.
+
+        Rollback is a pure undo: it compares every document against the
+        legacy files it would restore. Only checking the first provider
+        would let the rest be silently discarded, so the divergence is
+        planted on the last one.
+        """
+        self.seed_roster()
+        cutover_to_json(self.state_dir)
+        victim = PROVIDERS[-1]
+        advanced = replace(
+            legacy_state(PROVIDERS.index(victim) * 10),
+            next_due_at=987654,
+            retry_pending=True,
+        )
+        AuthoritativeStateStore(self.state_dir).commit(
+            victim, self.files.load(victim), advanced
+        )
+        json_before = self.snapshot()
+
+        with self.assertRaises(RollbackRefusedError):
+            rollback_to_legacy(self.state_dir)
+
+        # Ownership unchanged, the advanced document untouched, and the
+        # legacy files still there for a later, informed decision.
+        self.assertEqual(
+            read_authority(self.state_dir),
+            BackendAuthority(BACKEND_JSON, 1),
+        )
+        self.assertEqual(self.snapshot(), json_before)
+        self.assertEqual(
+            AuthoritativeStateStore(self.state_dir).load(victim), advanced
+        )
+        for provider in PROVIDERS:
+            with self.subTest(provider=provider):
+                self.assertTrue(
+                    self.state_dir.joinpath(f"{provider}-next-due-at").exists()
+                )
+
+
+class ExplicitBootstrapTests(AuthorityBase):
+    """E2 (P1-2/P2): only an operator assertion may create authority."""
+
+    def run_cli(self, *argv):
+        """Run the real CLI in-process; returns (rc, stdout, stderr)."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from quota_sentinel.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(["--state-dir", str(self.state_dir), *argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_b1_explicit_assertion_creates_legacy_epoch_zero(self):
+        self.deinitialize()
+        self.write_legacy("codex", legacy_state(0))
+        before = self.snapshot()
+        rc, out, _ = self.run_cli("bootstrap-authority", "--assume-legacy")
+        self.assertEqual(rc, 0)
+        self.assertIn("bootstrapped as legacy", out)
+        self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
+        self.assertEqual(
+            stat.S_IMODE(os.stat(authority_path(self.state_dir)).st_mode), 0o600
+        )
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.state_dir).st_mode), 0o700
+        )
+        # The assertion records OWNERSHIP: the only thing that changed is
+        # the manifest. Scheduler state is byte-identical, no JSON document
+        # was seeded, and the retired backend was not "repaired".
+        after = self.snapshot()
+        self.assertEqual(
+            {name: payload for name, payload in after.items()
+             if name != AUTHORITY_FILENAME},
+            before,
+        )
+        self.assertFalse(self.jsons.exists("codex"))
+
+    def test_b2_missing_flag_refuses_and_creates_nothing(self):
+        self.deinitialize()
+        before = self.snapshot()
+        rc, _, err = self.run_cli("bootstrap-authority")
+        self.assertEqual(rc, 3)
+        self.assertIn("UNKNOWN", err)
+        self.assertIn("--assume-legacy", err)
+        self.assertFalse(authority_path(self.state_dir).exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_b3_an_existing_manifest_is_never_rewritten(self):
+        for authority in (
+            BackendAuthority(BACKEND_LEGACY, 5),
+            BackendAuthority(BACKEND_JSON, 9),
+        ):
+            with self.subTest(authority=authority):
+                write_authority(self.state_dir, authority)
+                before = authority_path(self.state_dir).read_bytes()
+                rc, out, _ = self.run_cli(
+                    "bootstrap-authority", "--assume-legacy"
+                )
+                self.assertEqual(rc, 0)
+                self.assertIn("already present", out)
+                self.assertEqual(
+                    authority_path(self.state_dir).read_bytes(), before
+                )
+                self.assertEqual(read_authority(self.state_dir), authority)
+
+    def test_b4_a_corrupt_manifest_is_never_overwritten(self):
+        corrupt = b"{ not json"
+        authority_path(self.state_dir).write_bytes(corrupt)
+        rc, _, err = self.run_cli("bootstrap-authority", "--assume-legacy")
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(err.strip())
+        self.assertEqual(authority_path(self.state_dir).read_bytes(), corrupt)
+
+    def test_b5_after_a_cutover_a_deleted_manifest_stays_unknown(self):
+        """The reviewed hazard, end to end at the CLI boundary.
+
+        JSON owns advanced state and the manifest is deleted. Every
+        automatic read refuses, and the operator's own assertion is the
+        only thing that can decide — it is never inferred from the
+        documents, and the documents are not rewritten by the decision.
+        """
+        self.seed_roster()
+        cutover_to_json(self.state_dir)
+        advanced = replace(legacy_state(0), next_due_at=424242)
+        AuthoritativeStateStore(self.state_dir).commit(
+            "codex", self.files.load("codex"), advanced
+        )
+        json_before = self.snapshot()
+        self.deinitialize()
+
+        rc, _, err = self.run_cli("authority")
+        self.assertEqual(rc, 4)
+        self.assertIn("UNKNOWN", err)
+        self.assertFalse(authority_path(self.state_dir).exists())
+
+        # Still refused with the advanced documents sitting right there.
+        rc, _, _ = self.run_cli("bootstrap-authority")
+        self.assertEqual(rc, 3)
+        self.assertFalse(authority_path(self.state_dir).exists())
+
+        # The explicit assertion records legacy — visibly, and without
+        # rewriting anything else the deployment owns.
+        rc, out, _ = self.run_cli("bootstrap-authority", "--assume-legacy")
+        self.assertEqual(rc, 0)
+        self.assertIn("bootstrapped as legacy", out)
+        self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
+        self.assertEqual(self.snapshot(), {**json_before, AUTHORITY_FILENAME:
+                                          authority_path(self.state_dir).read_bytes()})
+        # The advanced JSON document is still intact for the operator to
+        # inspect; nothing was "repaired".
+        self.assertEqual(
+            json.loads(
+                self.jsons.document_path("codex").read_text(encoding="utf-8")
+            )["next_due_at"],
+            424242,
+        )
+
+    def test_b6_retired_primitive_name_is_gone_not_aliased(self):
+        from quota_sentinel.state import authority as authority_module
+
+        with self.assertRaises(AttributeError) as caught:
+            authority_module.initialize_authority
+        self.assertIn("REMOVED", str(caught.exception))
+        self.assertNotIn("initialize_authority", dir(authority_module))
+
+    def test_b7_the_internal_bridge_verb_also_demands_the_assertion(self):
+        """Defense in depth at the surface a hand-run could reach.
+
+        The bridge verb cannot verify a lock it did not take, but it CAN
+        refuse to create the ownership fact without the operator's
+        assertion in its own argv — so every reachable path carries the
+        decision instead of checking it in exactly one place.
+        """
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from quota_sentinel.__main__ import main
+
+        self.deinitialize()
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main([
+                "--state-dir", str(self.state_dir),
+                "scheduler-bootstrap-authority",
+            ])
+        self.assertEqual(rc, 3)
+        self.assertIn("UNKNOWN", err.getvalue())
+        self.assertFalse(authority_path(self.state_dir).exists())
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = main([
+                "--state-dir", str(self.state_dir),
+                "scheduler-bootstrap-authority", "--assume-legacy",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
 
 
 if __name__ == "__main__":

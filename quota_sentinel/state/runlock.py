@@ -16,7 +16,7 @@ operator lifecycle CLI must not introduce.
 WHY THIS EXISTS
 ---------------
 The public lifecycle verbs (``cutover``, ``rollback``,
-``authority-initialize``) are safe to run standalone precisely because they
+``bootstrap-authority``) are safe to run standalone precisely because they
 acquire this lock before touching authority. The verbs the SHELL calls
 (``scheduler-*``) deliberately do NOT acquire it: the shell already holds
 it, and taking it twice from two different PIDs would deadlock against

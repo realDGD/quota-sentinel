@@ -40,7 +40,7 @@ from quota_sentinel.state import (
     ResetCandidate,
     StateStoreError,
     StaleStateError,
-    initialize_authority,
+    bootstrap_legacy_authority,
 )
 
 
@@ -324,7 +324,7 @@ class CliTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
         # The CLI requires an initialized authority manifest.
-        initialize_authority(self.state_dir)
+        bootstrap_legacy_authority(self.state_dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -813,7 +813,7 @@ class ScheduleStateContractSpecTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
-        initialize_authority(self.state_dir)
+        bootstrap_legacy_authority(self.state_dir)
         self.store = FileStateStore(self.state_dir)
         import task_orchestrator
         self.ScheduleState = task_orchestrator.ScheduleState

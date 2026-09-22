@@ -4,7 +4,7 @@ TWO SURFACES, and the difference is a correctness property, not
 decoration.
 
 **Public operator verbs** are safe to run standalone. The lifecycle verbs
-(``cutover``, ``rollback``, ``authority-initialize``) acquire the
+(``cutover``, ``rollback``, ``bootstrap-authority``) acquire the
 scheduler's real ``run.lock`` through the same ``shlock`` protocol the
 shell uses (see ``quota_sentinel.state.runlock``), so an operator cannot
 interleave a backend switch with an in-flight ``check`` or model run. The
@@ -28,9 +28,11 @@ Verbs, grouped by what they are allowed to do:
   explicit per-backend diagnostics; naming the backend is the whole
   point of those two.
 * LOCK-SAFE lifecycle writes — `cutover`, `rollback` and
-  `authority-initialize` perform the durable ownership changes described
+  `bootstrap-authority` perform the durable ownership changes described
   in quota_sentinel.state.cutover, each under a real run.lock this
-  process acquires and releases itself.
+  process acquires and releases itself. `cutover` and `rollback` always
+  act on the WHOLE provider roster: the authority manifest is one global
+  fact, so neither accepts a provider subset.
 * `migrate` — the Phase 2 bootstrap that seeds shadow documents from the
   legacy slot files without overwriting anything.
 
@@ -54,8 +56,8 @@ from quota_sentinel.state import (
     ResetCandidate,
     StateStoreError,
     acquire_run_lock,
+    bootstrap_legacy_authority,
     cutover_to_json,
-    initialize_authority,
     read_authority,
     rollback_to_legacy,
 )
@@ -132,27 +134,54 @@ def _lifecycle_lock(state_dir: Path, args: argparse.Namespace, what: str):
     )
 
 
-def run_authority_initialize(state_dir: Path, args: argparse.Namespace) -> int:
-    """Materialize the bootstrap authority for a pre-protocol deployment."""
-    with _lifecycle_lock(state_dir, args, "initializing authority"):
-        result = initialize_authority(state_dir)
+def run_bootstrap_authority(state_dir: Path, args: argparse.Namespace) -> int:
+    """Record a LEGACY ownership fact that the operator explicitly asserted.
+
+    The mandatory flag is the whole point. A missing manifest means the
+    system does not know who owns the state — it does not mean "legacy" —
+    and the two situations are indistinguishable from the state directory
+    alone. So the operator has to say it out loud, and the tool refuses
+    otherwise.
+    """
+    if not args.assume_legacy:
+        print(
+            "quota_sentinel: refusing to bootstrap the authority manifest.\n"
+            "\n"
+            "A missing manifest means the owner is UNKNOWN, not that it is\n"
+            "legacy: a deployment that already cut over and then lost the\n"
+            "manifest looks exactly the same from here. Bootstrapping it as\n"
+            "legacy would silently re-legitimize stale deadlines and retry\n"
+            "debt the authoritative documents have moved past.\n"
+            "\n"
+            "If — and only if — you have confirmed this is a pre-protocol\n"
+            "legacy deployment that never cut over, re-run with:\n"
+            "\n"
+            "    quota-sentinel bootstrap-authority --assume-legacy\n"
+            "\n"
+            "Otherwise the manifest was lost: restore it from backup rather\n"
+            "than recreating it.",
+            file=sys.stderr,
+        )
+        return 3
+    with _lifecycle_lock(state_dir, args, "bootstrapping authority"):
+        result = bootstrap_legacy_authority(state_dir)
     if result.created:
         print(
-            f"authority initialized to {result.authority.backend} "
-            f"(epoch {result.authority.epoch})"
+            f"authority bootstrapped as {result.authority.backend} "
+            f"(epoch {result.authority.epoch}); this asserted that the "
+            "deployment is a pre-protocol legacy one"
         )
     else:
         print(
-            f"authority already initialized as {result.authority.backend} "
+            f"authority already present as {result.authority.backend} "
             f"(epoch {result.authority.epoch}); nothing written"
         )
     return 0
 
 
-def run_cutover(state_dir: Path, providers: Optional[List[str]],
-                args: argparse.Namespace) -> int:
+def run_cutover(state_dir: Path, args: argparse.Namespace) -> int:
     with _lifecycle_lock(state_dir, args, "cutover"):
-        result = cutover_to_json(state_dir, providers or None)
+        result = cutover_to_json(state_dir)
     if not result.changed:
         print(f"authority already {result.current.backend} "
               f"(epoch {result.current.epoch}); nothing written")
@@ -195,10 +224,9 @@ def run_notification_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_rollback(state_dir: Path, providers: Optional[List[str]],
-                 args: argparse.Namespace) -> int:
+def run_rollback(state_dir: Path, args: argparse.Namespace) -> int:
     with _lifecycle_lock(state_dir, args, "rollback"):
-        result = rollback_to_legacy(state_dir, providers or None)
+        result = rollback_to_legacy(state_dir)
     if not result.changed:
         print(f"authority already {result.current.backend} "
               f"(epoch {result.current.epoch}); nothing written")
@@ -253,41 +281,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the durable authoritative backend and its epoch",
     )
     # Public lifecycle verbs. Each acquires the scheduler's real run.lock
-    # (same shlock protocol, same file) for the duration of the switch.
+    # (same shlock protocol, same file) for the duration of the switch, and
+    # each operates on the WHOLE provider roster — the authority manifest is
+    # one global fact, so no verb here accepts a provider subset. Passing one
+    # is an argparse usage error, before any state is touched.
     for name, help_text, handler in (
         ("cutover",
-         "make the JSON backend authoritative (acquires run.lock)",
+         "make the JSON backend authoritative for the whole roster "
+         "(acquires run.lock)",
          run_cutover),
         ("rollback",
-         "return ownership to the legacy backend (acquires run.lock; "
-         "pure undo only)",
+         "return ownership to the legacy backend for the whole roster; "
+         "pure undo only (acquires run.lock)",
          run_rollback),
     ):
         command = sub.add_parser(name, help=help_text)
-        command.add_argument("providers", nargs="*", default=None,
-                             help="override the default provider roster")
         command.add_argument(
             "--lock-timeout", type=float,
             default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
             help="seconds to wait for an in-flight scheduler run "
                  "(default: %(default)s)",
         )
-        command.set_defaults(handler=lambda a, h=handler: h(
-            a.state_dir, a.providers or None, a
-        ))
-    init = sub.add_parser(
-        "authority-initialize",
-        help="one-time: materialize the bootstrap authority manifest "
-             "(acquires run.lock)",
+        command.set_defaults(
+            handler=lambda a, h=handler: h(a.state_dir, a)
+        )
+    bootstrap = sub.add_parser(
+        "bootstrap-authority",
+        help="ONE-TIME, and only for a confirmed pre-protocol legacy "
+             "deployment: record the legacy ownership fact "
+             "(requires --assume-legacy; acquires run.lock)",
     )
-    init.add_argument(
+    bootstrap.add_argument(
+        "--assume-legacy", action="store_true",
+        help="assert that this deployment predates the authority protocol "
+             "and never cut over. Required: a missing manifest means the "
+             "owner is unknown, not legacy.",
+    )
+    bootstrap.add_argument(
         "--lock-timeout", type=float,
         default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
         help="seconds to wait for an in-flight scheduler run "
              "(default: %(default)s)",
     )
-    init.set_defaults(
-        handler=lambda a: run_authority_initialize(a.state_dir, a)
+    bootstrap.set_defaults(
+        handler=lambda a: run_bootstrap_authority(a.state_dir, a)
     )
     state_dump = sub.add_parser(
         "state-dump",

@@ -129,47 +129,64 @@ json backend     <state_dir>/<provider>-state.json   one v1 document per provide
 
 * Atomic (temp-write/fsync/rename), versioned, and strict: an unknown version
   or backend is a loud error.
-* **REQUIRED once the deployment is initialized, and absence is CORRUPTION.**
-  It is materialized by an explicit lifecycle step — the installer, or
-  `quota-sentinel.sh init-authority` / `authority-initialize` — and from then
-  on the runtime never accepts a missing manifest. The earlier protocol read
-  absence as "never cut over, so legacy"; that made a deleted manifest
-  silently resurrect stale legacy state (retry debt, deadlines, candidates,
-  anchors) out from under an advanced JSON backend, so absence is now only
-  meaningful to `initialize_authority` and to nothing else.
+* **REQUIRED once the deployment has an owner, and absence means UNKNOWN —
+  never `legacy`.** The only thing that materializes it is an operator
+  asserting, explicitly, that the deployment predates the protocol:
+  `quota-sentinel.sh bootstrap-authority --assume-legacy` (library primitive
+  `bootstrap_legacy_authority`). The earlier protocol let the installer
+  create it as `legacy epoch 0` when absent, and read absence as "never cut
+  over"; that made a deleted manifest silently resurrect stale legacy state
+  (retry debt, deadlines, candidates, anchors) out from under an advanced
+  JSON backend — the installer would even re-legitimize it on the next
+  upgrade. Nothing automatic touches absence any more: not the installer, not
+  an update path, not a runtime command.
 * A *damaged* manifest is never defaulted to either side: `read_authority`
   raises, mutations fail closed, readers fail loudly. Guessing here would let
   a legacy writer create a second, diverging source of truth.
 * `epoch` increments on every durable switch, so "the same authority" is
   distinguishable from "a different authority that looks similar".
 
-### Initialization, and why it is not a runtime side effect
+### Asserting ownership, and why it is not a runtime side effect
 
 ```text
-uninitialized state dir
-   │  installer, or `init-authority` / `authority-initialize`   (lifecycle)
+uninitialized / manifest-lost state dir
+   │  OPERATOR: bootstrap-authority --assume-legacy   (the only entry point)
    ▼
 backend-authority.json = {backend: legacy, epoch: 0}
    │  every later command
    ▼
 manifest present  ──►  normal operation
-manifest missing  ──►  loud AuthorityMissingError
+manifest missing  ──►  loud AuthorityMissingError, and NOTHING creates one
 ```
 
 The distinction that matters is not "has this file existed before" — that is
-not knowable from the state directory — but **which lifecycle action is
-running**. Initialization is therefore an explicit step that never runs
-inside a command path, which is exactly what makes a later disappearance
-detectable instead of self-healing.
+not knowable from the state directory — but **whether an operator has
+established that this deployment predates the protocol**. Two situations are
+indistinguishable on disk:
 
-Two consequences, both deliberate:
+```text
+A. the deployment predates the protocol (no fact was ever written)
+B. the deployment cut over and the manifest was lost
+```
 
-* `initialize_authority` is idempotent (an existing manifest is returned
-  untouched, never rewritten) and refuses to publish over a corrupt one:
-  re-initializing over corruption would destroy the only ownership fact.
-* Initialization reads NO scheduler state and does NOT look at whether JSON
-  documents exist. Phase 2 shadow documents may predate the protocol by
-  months, so their presence cannot be evidence of a cutover.
+so the decision cannot be inferred and must be ASSERTED. That is why the
+primitive is named `bootstrap_legacy_authority`, why the CLI verb requires
+`--assume-legacy`, and why the installer only READS the fact: an automatic
+caller in case B is a silent downgrade, and in case A the operator is the
+only one who can say so.
+
+Three consequences, all deliberate:
+
+* `bootstrap_legacy_authority` is idempotent (an existing manifest is
+  returned untouched, never rewritten — a JSON manifest is never downgraded)
+  and refuses to publish over a corrupt one: writing over corruption would
+  destroy the only ownership fact.
+* Its PRECONDITIONS are the caller's: hold `run.lock`, and have established
+  case A. Nothing in the library can verify either, so the name, the
+  docstring and the mandatory flag carry them instead of a fake check.
+* It reads NO scheduler state and ignores whether JSON documents exist.
+  Phase 2 shadow documents may predate the protocol by months, so their
+  presence cannot be evidence of a cutover.
 
 `AuthoritativeStateStore` is the only authority → backend mapping in the
 codebase. Production code never branches on the backend itself.
@@ -189,10 +206,23 @@ codebase. Production code never branches on the backend itself.
 
 ### Cutover and rollback
 
-Both are OPERATOR verbs, and both acquire `run.lock` themselves. The shell
-entry points (`./quota-sentinel.sh cutover|rollback|init-authority`) take the
+Both are OPERATOR verbs, both acquire `run.lock` themselves, and both are
+**WHOLE-ROSTER**: the function signatures take no provider argument at all
+(`cutover_to_json(state_dir, *, checkpoint=None)`), the roster is the shared
+`DEFAULT_PROVIDERS` constant, and `cutover codex` is an argparse usage error
+raised before any state is touched. Authority is one global fact, so a
+provider-scoped switch is not a smaller switch — it is a switch that hands the
+unprepared providers to the retired backend, silently discarding the deadlines
+and retry debt their documents own. The property is pinned structurally
+(`tests/python-architecture-audit-regression.py`, AR13/AR14: no `providers`
+parameter, no positional in either CLI surface) and behaviorally
+(`tests/python-authority-regression.py`, W1-W4: every provider is prepared and
+verified, and a divergence or failure in the LAST provider still blocks the
+global flip).
+
+The shell entry points (`./quota-sentinel.sh cutover|rollback`) take the
 lock and then call the internal bridge verbs; the Python entry points
-(`uv run quota-sentinel cutover|rollback|authority-initialize`) take it
+(`uv run quota-sentinel cutover|rollback`) take it
 through `quota_sentinel.state.runlock`, which executes **the same
 `/usr/bin/shlock` with the same arguments on the same file** as the shell.
 That is not a second lock: a Python holder and a shell holder exclude each
@@ -220,14 +250,14 @@ re-read the fact and confirm
 
 The whole roster switches in ONE epoch; there is no state in which Codex is
 JSON while antigravity is still legacy. Every crash prefix resolves
-mechanically, and — since the manifest is materialized before the cutover
-begins — it resolves from a manifest that is always present: before the flip
-it reads `legacy` at epoch N (refreshed documents are harmless shadows), and
-the flip itself is one atomic replacement, so readers see the complete old or
-the complete new manifest. `cutover` also refuses outright when the
-deployment was never initialized: a virgin deployment must be initialized
-first, so that "no manifest" can never be read as "legacy" by a command that
-was only trying to switch backends.
+mechanically, and — since the owner must already be recorded before the
+cutover begins — it resolves from a manifest that is always present: before
+the flip it reads `legacy` at epoch N (refreshed documents are harmless
+shadows), and the flip itself is one atomic replacement, so readers see the
+complete old or the complete new manifest. `cutover` also refuses outright
+when the deployment has no owner: absence must be resolved by an operator
+assertion, and can never be read as "legacy" by a command that was only trying
+to switch backends.
 `tests/python-authority-regression.py` injects a crash at every checkpoint,
 including inside the manifest publish, and asserts that ownership is always
 determinable, that no legacy byte ever changes, and that no torn document or
@@ -363,7 +393,7 @@ All entries funnel through `quota_sentinel.scheduler.service` →
 | 6 | `usage` → opportunistic sync after collection | as #3 | quota (collect) → **released** → run (non-blocking; busy → skip) |
 | 7 | `cutover` → `scheduler-cutover` | the authority manifest, after refreshing every document | run (the shell entry point acquires it; the public CLI acquires it through `runlock`) |
 | 7b | `rollback` → `scheduler-rollback` | the authority manifest, after proving a pure undo | run (same) |
-| 7c | `init-authority` → `scheduler-initialize-authority` | the authority manifest, ONLY when absent | run (same) |
+| 7c | `bootstrap-authority --assume-legacy` → `scheduler-bootstrap-authority` | the authority manifest, ONLY for an operator-asserted pre-protocol deployment | run (same); unknown ownership is never resolved automatically |
 | 8 | bootstrap `migrate_legacy_state` (state-touching commands only) | seeds absent per-provider legacy files | none — `seed_provider_state_file` publishes by `link(2)` EEXIST, so creation is atomic and non-destructive; skipped entirely once JSON is authoritative |
 
 Reads are pure: no lazy migration, no repair writes. `/usage` never runs a
@@ -572,8 +602,8 @@ bug to self-heal around.
 `quota-sentinel.sh` keeps exactly four responsibilities:
 
 1. **CLI compatibility layer** — `check|wait|run|usage|status` plus the
-   authority lifecycle verbs (`init-authority`, `cutover`, `rollback`), which
-   it runs while holding `run.lock`.
+   authority lifecycle verbs (`bootstrap-authority --assume-legacy`,
+   `cutover`, `rollback`), which it runs while holding `run.lock`.
 2. **Model runner adapter** — provider CLI invocation, `auth.json`/settings
    handling, provider environment, process groups, timeouts, and the retry
    burst's process management. Python decides *whether* to run and *what the
@@ -602,20 +632,27 @@ new scheduler policy branches are not.
 Upgrading an existing deployment:
 
 ```text
+0. ./quota-sentinel.sh bootstrap-authority --assume-legacy
+                                      ONE-TIME, and only for a deployment the
+                                      operator has confirmed predates the
+                                      protocol; nothing automatic does this
 1. ./install-launchagents.sh --load   uv sync, retire the legacy watchdog and
                                       timer agents, render the plists,
-                                      initialize the authority manifest,
+                                      VALIDATE the authority manifest (and
+                                      fail if it is missing/unreadable),
                                       restart the listener
-2. ./quota-sentinel.sh cutover        under run.lock, verified, atomic
+2. ./quota-sentinel.sh cutover        under run.lock, verified, atomic,
+                                      whole roster
 3. legacy slot files remain on disk, untouched, as the rollback artifact
 ```
 
 The installer retires the legacy schedulers BEFORE it starts the listener, so
 the post-condition is "only the listener/orchestrator is loaded" rather than
-"the operator remembered to stop the old ones". It initializes the manifest
-before any agent is restarted, which is safe because initialization only
-records the authority already in effect and starts no process; and it never
-cuts over, so upgrading and switching ownership stay separate actions.
+"the operator remembered to stop the old ones". It **reads** the manifest
+before any agent is restarted and never writes one: a deployment whose owner
+is unknown gets a failed install with zero launchctl calls, not an invented
+`legacy epoch 0`. Upgrading, asserting ownership and switching ownership are
+therefore three separate actions.
 
 Step 1 must include the restart (`--load`, or an explicit `launchctl
 bootout`) because the ONE unsafe state is a still-running process from the
@@ -629,11 +666,14 @@ before or after the new agent starts does not matter, and `cutover` takes
 ### Losing the manifest
 
 The recovery path is deliberately manual and loud rather than automatic:
-`read_authority` raises `AuthorityMissingError` with the two readings of the
-situation ("never initialized" vs "the fact was lost") and the remedy for
-each. There is no repair subsystem, because a heuristic that recreates the
+`read_authority` raises `AuthorityMissingError` naming the situation (the
+owner is UNKNOWN) and both remedies (restore from backup; or, only for a
+confirmed pre-protocol deployment, assert legacy). There is no repair
+subsystem and no automatic caller, because a heuristic that recreates the
 ownership fact is indistinguishable from the silent legacy fallback this
-design removed. See the README for the operator procedure.
+design removed — and a lost-but-recreated manifest re-legitimizes exactly the
+stale deadlines and retry debt the JSON documents moved past. See the README
+for the operator procedure.
 
 An automatic cleanup of legacy files is deliberately NOT provided: deleting a
 user's state is their decision, and the files are harmless once retired.

@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from quota_sentinel.state import initialize_authority
+from quota_sentinel.state import bootstrap_legacy_authority
 
 from task_orchestrator import (
     CHECK_COMMAND_TIMEOUT_SECONDS,
@@ -93,7 +93,7 @@ class TaskOrchestratorTest(unittest.TestCase):
         # one this suite builds is an initialized LEGACY deployment —
         # exactly what the installer leaves on an upgraded host — so the
         # router selects the legacy slot files this suite writes.
-        initialize_authority(self.state_dir)
+        bootstrap_legacy_authority(self.state_dir)
         self.clock = FakeClock(100.0)
         self.runner = FakeRunner()
         self.store = TaskStore(self.state_dir / "tasks.sqlite3")

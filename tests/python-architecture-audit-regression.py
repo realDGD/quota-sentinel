@@ -589,7 +589,7 @@ class LifecycleLockOwnership(unittest.TestCase):
         main_source = (REPO / "quota_sentinel" / "__main__.py").read_text(
             encoding="utf-8"
         )
-        for verb in ("cutover", "rollback", "authority-initialize"):
+        for verb in ("cutover", "rollback", "bootstrap-authority"):
             with self.subTest(verb=verb):
                 self.assertIn(f'"{verb}"', main_source)
         # The lock helper is a context manager around the switch itself.
@@ -638,7 +638,9 @@ class LifecycleLockOwnership(unittest.TestCase):
         for verb in ("cutover", "rollback"):
             with self.subTest(verb=verb):
                 self.assertIn(f"./quota-sentinel.sh {verb}", readme)
-        self.assertIn("./quota-sentinel.sh init-authority", readme)
+        self.assertIn(
+            "./quota-sentinel.sh bootstrap-authority --assume-legacy", readme
+        )
 
 
 class AuthorityNeverDefaultsToLegacy(unittest.TestCase):
@@ -663,18 +665,24 @@ class AuthorityNeverDefaultsToLegacy(unittest.TestCase):
             self.assertFalse(authority_path(state_dir).exists())
 
     def test_ar11b_bootstrap_authority_has_exactly_one_producer(self):
-        """The legacy default may be CONSTRUCTED only by the initializer.
+        """The legacy default may be CONSTRUCTED only by the bootstrap.
 
         If another module could conjure `bootstrap_authority()` on a
-        missing manifest, absence would silently become legacy again.
+        missing manifest, absence would silently become legacy again. The
+        match is anchored on the exact call, because the one legal caller is
+        named `bootstrap_legacy_authority` and a substring test would either
+        miss a real offender or flag the legitimate one.
         """
+        import re
+
         allowed = {"quota_sentinel/state/authority.py"}
         offenders = []
+        pattern = re.compile(r"(?<![A-Za-z0-9_])bootstrap_authority\s*\(")
         for path in python_sources():
             rel = str(path.relative_to(REPO))
             if rel in allowed or "/quota/" in rel:
                 continue
-            if "bootstrap_authority(" in path.read_text(encoding="utf-8"):
+            if pattern.search(path.read_text(encoding="utf-8")):
                 offenders.append(rel)
         self.assertEqual(offenders, [])
 
@@ -698,7 +706,7 @@ class AuthorityNeverDefaultsToLegacy(unittest.TestCase):
         self.assertNotIn("return bootstrap_authority()", read_body)
         # The initializer is the one function allowed to construct it.
         init_body = authority_source[
-            authority_source.index("def initialize_authority("):
+            authority_source.index("def bootstrap_legacy_authority("):
         ]
         self.assertIn("bootstrap_authority()", init_body)
 
@@ -724,15 +732,39 @@ class InstallerUpgradeSafety(unittest.TestCase):
             "starts, or two scheduling entry points coexist",
         )
 
-    def test_ar12c_installer_initializes_authority_but_never_cuts_over(self):
-        """Upgrading the code and moving ownership stay separate actions.
+    def test_ar12c_installer_validates_authority_and_never_creates_it(self):
+        """The installer may not decide who owns the state.
 
-        The installer may initialize the manifest (the runtime requires it),
-        but it must never switch a deployment to JSON: an operator needs the
-        chance to install, watch the existing backend, and only then cut
-        over.
+        A missing manifest means the owner is UNKNOWN — not legacy — so an
+        installer that wrote `legacy` would silently re-legitimize a
+        deployment that had already cut over and lost its manifest. The
+        installer therefore only READS the fact, and refuses to install when
+        it cannot be read. Upgrading, asserting ownership and switching
+        ownership stay three separate actions.
         """
-        self.assertIn("authority-initialize", self.INSTALLER)
+        # It reads the fact ...
+        self.assertIn(" authority 2>&1", self.INSTALLER)
+        # ... and never writes it. The retired spellings must be gone
+        # entirely, and the one surviving mention of the operator verb may
+        # only be the guidance text in the refusal: a line that PRINTS the
+        # command, never one that runs it.
+        for retired in (
+            "authority-initialize",
+            "bootstrap_legacy_authority",
+            "initialize_authority",
+        ):
+            with self.subTest(token=retired):
+                self.assertNotIn(retired, self.INSTALLER)
+        for line in self.INSTALLER.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or "bootstrap-authority" not in stripped:
+                continue
+            with self.subTest(line=stripped):
+                self.assertIn(
+                    "print -ru2", stripped,
+                    "the installer may PRINT the bootstrap command as "
+                    "guidance but must never CALL it",
+                )
         self.assertNotIn("scheduler-cutover", self.INSTALLER)
         self.assertNotIn("scheduler-rollback", self.INSTALLER)
         # No invocation of the cutover/rollback CLI either, in any form.
@@ -743,10 +775,173 @@ class InstallerUpgradeSafety(unittest.TestCase):
             with self.subTest(line=stripped):
                 self.assertNotIn(" cutover", stripped)
                 self.assertNotIn(" rollback", stripped)
+        # The refusal has to tell the operator what ONLY they can decide.
+        self.assertIn(
+            "quota-sentinel.sh bootstrap-authority --assume-legacy",
+            self.INSTALLER,
+        )
 
     def test_ar12d_launchctl_is_overridable_so_upgrades_are_testable(self):
         self.assertIn("QUOTA_SENTINEL_LAUNCHCTL_BIN", self.INSTALLER)
         self.assertIn("QUOTA_SENTINEL_STATE_DIR", self.INSTALLER)
+
+
+class WholeRosterAuthoritySwitch(unittest.TestCase):
+    """AR13/AR14: authority is ONE global fact, so a switch is all-or-nothing.
+
+    A provider-scoped cutover is not a smaller cutover: the manifest names
+    the backend for the whole state directory, so flipping it after
+    preparing one provider would hand the other two to the retired backend —
+    silently discarding deadlines and retry debt the JSON documents own.
+    These tests pin the API shape that makes that unexpressible.
+    """
+
+    def test_ar13_switch_primitives_take_no_provider_subset(self):
+        import inspect
+
+        from quota_sentinel.state import cutover_to_json, rollback_to_legacy
+
+        for func in (cutover_to_json, rollback_to_legacy):
+            with self.subTest(func=func.__name__):
+                signature = inspect.signature(func)
+                self.assertNotIn("providers", signature.parameters)
+                self.assertEqual(
+                    list(signature.parameters)[:2], ["state_dir", "checkpoint"]
+                )
+                source = inspect.getsource(func)
+                self.assertIn("DEFAULT_PROVIDERS", source)
+
+    def test_ar13b_switch_primitives_prepare_and_verify_every_provider(self):
+        from quota_sentinel.state import migration
+
+        cutover_source = (
+            REPO / "quota_sentinel" / "state" / "cutover.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("roster: Sequence[str] = DEFAULT_PROVIDERS", cutover_source)
+        self.assertIn("DEFAULT_PROVIDERS", (
+            REPO / "quota_sentinel" / "state" / "migration.py"
+        ).read_text(encoding="utf-8"))
+        # The roster is the shared constant, not a local list that could
+        # drift away from the migration/parity surface.
+        self.assertGreaterEqual(len(migration.DEFAULT_PROVIDERS), 2)
+
+    def test_ar14_public_and_bridge_verbs_reject_a_provider_subset(self):
+        from quota_sentinel.__main__ import build_parser
+
+        parser = build_parser()
+        for verb in ("cutover", "rollback"):
+            with self.subTest(verb=verb):
+                # No positional providers argument exists ...
+                args = parser.parse_args([verb])
+                self.assertFalse(hasattr(args, "providers"))
+                # ... so passing one is a usage error BEFORE any mutation.
+                with self.assertRaises(SystemExit) as caught:
+                    parser.parse_args([verb, "codex"])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_ar14b_bridge_verbs_reject_a_provider_subset_too(self):
+        from quota_sentinel.__main__ import build_parser
+
+        parser = build_parser()
+        for verb in ("scheduler-cutover", "scheduler-rollback"):
+            with self.subTest(verb=verb):
+                args = parser.parse_args([verb])
+                self.assertFalse(hasattr(args, "providers"))
+                with self.assertRaises(SystemExit) as caught:
+                    parser.parse_args([verb, "codex"])
+                self.assertEqual(caught.exception.code, 2)
+        # The one authority-CREATING verb demands the assertion on both
+        # surfaces: no reachable path may create the fact without it.
+        self.assertFalse(
+            parser.parse_args(["scheduler-bootstrap-authority"]).assume_legacy
+        )
+        self.assertTrue(
+            parser.parse_args(
+                ["scheduler-bootstrap-authority", "--assume-legacy"]
+            ).assume_legacy
+        )
+        self.assertFalse(
+            parser.parse_args(["bootstrap-authority"]).assume_legacy
+        )
+
+
+class ExplicitBootstrapOnly(unittest.TestCase):
+    """AR15-AR17: nothing automatic may turn absence into legacy.
+
+    The reviewed hazard: JSON authoritative + advanced state + a deleted
+    manifest, and the user re-runs the installer — which used to create
+    `legacy epoch 0` and thereby re-legitimize stale deadlines and retry
+    debt. Only an operator assertion (`--assume-legacy`) may do that, and
+    these tests pin every path that could otherwise do it by accident.
+    """
+
+    SHELL = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
+    INSTALLER = (REPO / "install-launchagents.sh").read_text(encoding="utf-8")
+
+    def test_ar15_installer_never_bootstraps_authority(self):
+        for token in (
+            "authority_bootstrap",
+            "scheduler-bootstrap-authority",
+            "authority-initialize",
+        ):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.INSTALLER)
+
+    def test_ar16_shell_bootstrap_has_exactly_one_reachable_call_site(self):
+        # The helper and its bridge are each defined once and called once —
+        # from the operator verb only. A second call site anywhere in the
+        # script would mean a runtime path had grown a bootstrap.
+        self.assertEqual(self.SHELL.count("authority_bootstrap"), 2)
+        self.assertEqual(self.SHELL.count("_bootstrap_authority_bridge"), 2)
+        self.assertEqual(
+            self.SHELL.count("scheduler_bridge scheduler-bootstrap-authority"), 1
+        )
+        # ... and the runtime command paths never mention it at all.
+        dispatch = self.SHELL[self.SHELL.index("main() {"):]
+        for case in ("check)", "wait)", "run)", "usage)", "status)"):
+            block = dispatch[dispatch.index(case):]
+            block = block[:block.index(";;")]
+            with self.subTest(case=case):
+                self.assertNotIn("bootstrap", block)
+
+    def test_ar16b_only_the_operator_cli_may_call_the_library_primitive(self):
+        import re
+
+        allowed = {
+            "quota_sentinel/state/authority.py",
+            "quota_sentinel/__main__.py",
+            "quota_sentinel/scheduler/cli.py",
+        }
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_])bootstrap_legacy_authority\s*\("
+        )
+        offenders = []
+        for path in python_sources():
+            rel = str(path.relative_to(REPO))
+            if rel in allowed or "/quota/" in rel:
+                continue
+            if pattern.search(path.read_text(encoding="utf-8")):
+                offenders.append(rel)
+        self.assertEqual(
+            offenders, [],
+            "an automatic runtime path grew an authority bootstrap: a "
+            "deleted manifest would be silently re-legitimized as legacy",
+        )
+
+    def test_ar17_docs_describe_the_assertion_not_an_auto_initialize(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        arch = (REPO / "ARCHITECTURE.md").read_text(encoding="utf-8")
+        for text, label in ((readme, "README.md"), (arch, "ARCHITECTURE.md")):
+            with self.subTest(document=label):
+                for retired in ("init-authority", "authority-initialize",
+                                "initialize_authority"):
+                    self.assertNotIn(retired, text)
+                self.assertIn("bootstrap-authority", text)
+                self.assertIn("--assume-legacy", text)
+        # The install/update flow must not present the installer as the
+        # thing that creates the ownership fact.
+        installer_doc = readme[readme.index("install-launchagents.sh"):]
+        self.assertIn("never", installer_doc[:4000].lower())
 
 
 class DocumentationPointers(unittest.TestCase):

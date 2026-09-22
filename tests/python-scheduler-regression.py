@@ -39,7 +39,7 @@ from quota_sentinel.scheduler.observation import (
 )
 from quota_sentinel.state import (
     AuthoritativeStateStore,
-    initialize_authority,
+    bootstrap_legacy_authority,
     BackendAuthority,
     BACKEND_JSON,
     FileStateStore,
@@ -611,7 +611,7 @@ class TransitionPersistenceTests(unittest.TestCase):
         self.state_dir.mkdir(parents=True)
         # Every deployment has an authority manifest; the runtime requires
         # it, so a throwaway legacy deployment gets one too.
-        initialize_authority(self.state_dir)
+        bootstrap_legacy_authority(self.state_dir)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -643,9 +643,9 @@ class TransitionPersistenceTests(unittest.TestCase):
         # Start over on the JSON backend with the same input state.
         other = Path(self._tmp.name) / "json-state"
         other.mkdir()
-        initialize_authority(other)
+        bootstrap_legacy_authority(other)
         self.state_dir = other
-        cutover_to_json(other, providers=[provider])
+        cutover_to_json(other)
         routed = self._exercise(provider)
 
         self.assertEqual(legacy, routed)
@@ -663,7 +663,7 @@ class TransitionPersistenceTests(unittest.TestCase):
         service.commit_success(self.state_dir, provider, 500)
         legacy_bytes = (self.state_dir / f"{provider}-next-due-at").read_bytes()
 
-        cutover_to_json(self.state_dir, providers=[provider])
+        cutover_to_json(self.state_dir)
         service.commit_success(self.state_dir, provider, 900)
         # The retired backend is frozen at the value it held at the cutover.
         self.assertEqual(
@@ -693,7 +693,7 @@ class TransitionPersistenceTests(unittest.TestCase):
 
     def test_json_authoritative_read_failure_fails_closed(self):
         provider = "codex"
-        cutover_to_json(self.state_dir, providers=[provider])
+        cutover_to_json(self.state_dir)
         (self.state_dir / f"{provider}-state.json").write_bytes(b"{ broken")
         from quota_sentinel.state import StateStoreError
         with self.assertRaises(StateStoreError):

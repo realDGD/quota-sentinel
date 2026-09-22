@@ -1,16 +1,20 @@
 #!/bin/zsh
-# Installer upgrade regression (I1-I5).
+# Installer upgrade regression (I1-I9).
 #
-# `install-launchagents.sh --load` is the upgrade entry point, and two of its
-# post-conditions are correctness properties rather than conveniences:
+# `install-launchagents.sh --load` is the upgrade entry point, and three of
+# its post-conditions are correctness properties rather than conveniences:
 #
 #   * the RETIRED scheduler agents (the legacy watchdog and precision timer)
 #     must not be left loaded next to the listener/orchestrator — a second
 #     scheduling entry point is exactly what the upgrade is supposed to end;
-#   * the authority manifest must exist afterwards, because the runtime
-#     refuses to guess a backend when it is missing, and an operator who
-#     upgraded but never initialized would otherwise meet that refusal on
-#     the very next command.
+#   * the installer NEVER creates the authority manifest. A missing manifest
+#     means the owner of the state is UNKNOWN, not that it is legacy, and a
+#     deployment that cut over and then lost it looks identical from the
+#     state directory alone. So the installer REQUIRES an existing,
+#     parseable manifest and fails — with zero launchctl calls and zero
+#     writes — when there is none;
+#   * an existing manifest is READ, never rewritten: re-running the upgrade
+#     cannot downgrade json to legacy or advance an epoch.
 #
 # Nothing here touches the real machine. The suite builds a throwaway REPO
 # (so rendered plists never land in the checkout), a throwaway HOME, a fake
@@ -30,6 +34,7 @@ readonly FAKE_BIN="$TEST_TEMP_DIR/bin"
 readonly LAUNCHCTL_LOG="$TEST_TEMP_DIR/launchctl.log"
 readonly UV_LOG="$TEST_TEMP_DIR/uv.log"
 readonly STATE_DIR="$TEST_TEMP_DIR/state"
+readonly MANIFEST_NAME="backend-authority.json"
 
 fail() { print -u2 -- "FAIL: $*"; exit 1; }
 
@@ -80,6 +85,8 @@ export QUOTA_SENTINEL_LAUNCHCTL_BIN="$FAKE_BIN/launchctl"
 export QUOTA_SENTINEL_STATE_DIR="$STATE_DIR"
 export QUOTA_SENTINEL_PYTHON3_BIN="/usr/bin/python3"
 
+readonly MANIFEST="$STATE_DIR/$MANIFEST_NAME"
+
 run_installer() {
   ( cd "$FAKE_REPO" && /bin/zsh ./install-launchagents.sh "$@" )
 }
@@ -91,23 +98,47 @@ reset_state() {
 }
 reset_agents() { rm -f "$FAKE_HOME/Library/LaunchAgents"/*.plist(N) 2>/dev/null || true; }
 
+# Seed the ownership fact the way an OPERATOR does — never the way the
+# installer used to. The installer is not allowed to do this at all.
+seed_legacy_authority() {
+  reset_state
+  (
+    cd "$FAKE_REPO" &&
+      PI_SOURCE_ONLY=0 /bin/zsh ./quota-sentinel.sh bootstrap-authority --assume-legacy
+  ) >/dev/null 2>&1 || fail "could not seed a legacy authority manifest"
+  [[ -e "$MANIFEST" ]] || fail "the seeding assertion created no manifest"
+}
+
+# ---------------------------------------------------------------------------
+print -r -- "== I8: no manifest means NO install (never an inferred legacy) =="
+reset_logs; reset_state; reset_agents
+if run_installer >/dev/null 2>&1; then
+  fail "the installer succeeded on a state dir with no authority manifest"
+fi
+[[ ! -e "$MANIFEST" ]] || fail "the installer created the authority manifest"
+[[ ! -s "$LAUNCHCTL_LOG" ]] || fail "launchctl ran with no authority manifest"
+[[ -z "$(print -l "$FAKE_HOME/Library/LaunchAgents"/*.plist(N) 2>/dev/null)" ]] ||
+  fail "the installer rendered plists with no authority manifest"
+failure_out="$(run_installer 2>&1 || true)"
+print -r -- "$failure_out" | grep -q "bootstrap-authority --assume-legacy" ||
+  fail "the refusal did not name the explicit operator remedy: $failure_out"
+print -r -- "  PASS: unknown ownership blocks the upgrade and creates nothing"
+
 # ---------------------------------------------------------------------------
 print -r -- "== I5: render-only mode never touches launchctl =="
-reset_logs; reset_state
+seed_legacy_authority; reset_logs; reset_agents
+manifest_before="$(cat "$MANIFEST")"
 run_installer >/dev/null || fail "render-only install failed"
 [[ ! -s "$LAUNCHCTL_LOG" ]] || fail "render-only mode called launchctl: $(cat "$LAUNCHCTL_LOG")"
 [[ -e "$FAKE_HOME/Library/LaunchAgents/quota-sentinel.feishu-listener.plist" ]] ||
   fail "render-only mode did not install the listener plist"
-# It DOES initialize authority: the runtime requires the manifest.
-[[ -e "$STATE_DIR/backend-authority.json" ]] ||
-  fail "installer did not initialize the authority manifest"
-grep -q '"backend": "legacy"' "$STATE_DIR/backend-authority.json" ||
-  fail "installer initialized an unexpected backend"
-print -r -- "  PASS: render + authority init, zero launchctl calls"
+[[ "$(cat "$MANIFEST")" == "$manifest_before" ]] ||
+  fail "render-only mode rewrote the authority manifest"
+print -r -- "  PASS: render only, authority read and left byte-identical"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I1: --load retires the legacy schedulers, then starts the listener =="
-reset_logs; reset_state; reset_agents
+seed_legacy_authority; reset_logs; reset_agents
 run_installer --load >/dev/null || fail "--load install failed"
 expected="bootout gui/$(id -u)/quota-sentinel
 bootout gui/$(id -u)/quota-sentinel.timer
@@ -123,7 +154,7 @@ print -r -- "  PASS: retired watchdog + timer, then listener restart (in order)"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I2: retired labels that were never loaded are not an error =="
-reset_logs; reset_state; reset_agents
+seed_legacy_authority; reset_logs; reset_agents
 FAKE_LAUNCHCTL_ABSENT="quota-sentinel quota-sentinel.timer" \
   run_installer --load >/dev/null || fail "install failed when retired labels were absent"
 grep -q "bootstrap .*quota-sentinel.feishu-listener.plist" "$LAUNCHCTL_LOG" ||
@@ -132,54 +163,69 @@ print -r -- "  PASS: bootout is idempotent for never-loaded labels"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I3: a failed uv sync installs nothing =="
-reset_logs; reset_state; reset_agents
+seed_legacy_authority; reset_logs; reset_agents
+manifest_before="$(cat "$MANIFEST")"
 if FAKE_UV_RC=1 run_installer --load >/dev/null 2>&1; then
   fail "installer succeeded despite a failing uv sync"
 fi
 [[ ! -s "$LAUNCHCTL_LOG" ]] || fail "launchctl ran after a failed uv sync"
-[[ ! -e "$STATE_DIR/backend-authority.json" ]] ||
-  fail "authority was initialized after a failed uv sync"
+[[ "$(cat "$MANIFEST")" == "$manifest_before" ]] ||
+  fail "the authority manifest changed after a failed uv sync"
 print -r -- "  PASS: zero bootstrap on environment failure"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I4: an unreadable authority manifest installs nothing =="
 reset_logs; reset_state; reset_agents
-print -r -- '{ not json' >"$STATE_DIR/backend-authority.json"
-manifest_before="$(cat "$STATE_DIR/backend-authority.json")"
+print -r -- '{ not json' >"$MANIFEST"
+manifest_before="$(cat "$MANIFEST")"
 if run_installer --load >/dev/null 2>&1; then
   fail "installer succeeded over a corrupt authority manifest"
 fi
 [[ ! -s "$LAUNCHCTL_LOG" ]] || fail "launchctl ran over a corrupt manifest"
-[[ "$(cat "$STATE_DIR/backend-authority.json")" == "$manifest_before" ]] ||
+[[ "$(cat "$MANIFEST")" == "$manifest_before" ]] ||
   fail "the corrupt manifest was overwritten"
 print -r -- "  PASS: corrupt authority is loud, untouched, and blocks the install"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I6: an EXISTING manifest is never rewritten =="
 reset_logs; reset_state; reset_agents
-run_installer >/dev/null || fail "first install failed"
-python3 - <<'PY' || fail "could not prepare an initialized-json deployment"
-import json, os, pathlib
-p = pathlib.Path(os.environ["QUOTA_SENTINEL_STATE_DIR"]) / "backend-authority.json"
-doc = json.loads(p.read_text())
-doc["backend"] = "json"
-doc["epoch"] = 7
-p.write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
-PY
-before="$(cat "$STATE_DIR/backend-authority.json")"
-run_installer --load >/dev/null || fail "re-install over an initialized deployment failed"
-[[ "$(cat "$STATE_DIR/backend-authority.json")" == "$before" ]] ||
+print -r -- '{"schema_version": 1, "backend": "json", "epoch": 7}' >"$MANIFEST"
+before="$(cat "$MANIFEST")"
+run_installer --load >/dev/null || fail "install over an initialized deployment failed"
+[[ "$(cat "$MANIFEST")" == "$before" ]] ||
   fail "the installer rewrote an existing authority manifest"
-print -r -- "  PASS: initialization is idempotent and never downgrades JSON to legacy"
+print -r -- "  PASS: upgrade reads ownership and never downgrades JSON to legacy"
 
 # ---------------------------------------------------------------------------
 print -r -- "== I7: the installer never cuts over on its own =="
-reset_logs; reset_state; reset_agents
+seed_legacy_authority; reset_logs; reset_agents
 run_installer --load >/dev/null || fail "--load install failed"
-grep -q '"backend": "legacy"' "$STATE_DIR/backend-authority.json" ||
+grep -q '"backend": "legacy"' "$MANIFEST" ||
   fail "installer changed the backend without being asked"
 [[ ! -e "$STATE_DIR/codex-state.json" ]] ||
   fail "installer performed a cutover (JSON documents were created)"
 print -r -- "  PASS: upgrade and ownership switch stay separate actions"
+
+# ---------------------------------------------------------------------------
+print -r -- "== I9: deleting a manifest after cutover is never self-healed =="
+reset_logs; reset_state; reset_agents
+# A cut-over deployment: JSON owns the state and has moved past legacy.
+print -r -- '{"schema_version": 1, "backend": "json", "epoch": 4}' >"$MANIFEST"
+print -r -- '{"schema_version": 1, "provider": "codex"}' >"$STATE_DIR/codex-state.json"
+json_before="$(cat "$STATE_DIR/codex-state.json")"
+rm -f "$MANIFEST"
+if run_installer --load >/dev/null 2>&1; then
+  fail "the installer succeeded after the manifest was deleted"
+fi
+[[ ! -e "$MANIFEST" ]] ||
+  fail "the installer recreated a deleted manifest as legacy epoch 0"
+[[ "$(cat "$STATE_DIR/codex-state.json")" == "$json_before" ]] ||
+  fail "a refused install modified the authoritative JSON document"
+[[ ! -s "$LAUNCHCTL_LOG" ]] || fail "launchctl ran with unknown ownership"
+# ...and the explicit operator assertion is the ONLY thing that may decide.
+( cd "$FAKE_REPO" && PI_SOURCE_ONLY=0 /bin/zsh ./quota-sentinel.sh bootstrap-authority ) \
+  >/dev/null 2>&1 && fail "the operator verb bootstrapped without --assume-legacy"
+[[ ! -e "$MANIFEST" ]] || fail "a refused operator bootstrap created a manifest"
+print -r -- "  PASS: lost ownership stays lost until an operator says otherwise"
 
 print -r -- "installer upgrade regression: all cases passed"

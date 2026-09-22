@@ -36,13 +36,17 @@ Properties, each one deliberate:
   process-local cache, not a mtime, not "does the JSON exist", not "we
   probably cut over already". See ``read_authority``.
 
-* ALWAYS PRESENT once the deployment has been initialized. The manifest
-  is materialized by an explicit lifecycle step (the installer, or
-  ``authority-initialize``) and from then on its ABSENCE IS CORRUPTION.
-  The earlier protocol treated an absent manifest as "never cut over";
-  that made a deleted manifest silently resurrect stale legacy state
-  (retry debt, deadlines, candidates and anchors included), so absence
-  is now only meaningful to ``initialize_authority`` — see below.
+* ALWAYS PRESENT once the deployment has an owner. The manifest is
+  materialized by exactly ONE thing: an operator asserting that this
+  deployment predates the authority protocol
+  (``bootstrap-authority --assume-legacy``, whose library primitive is
+  ``bootstrap_legacy_authority``). From then on absence is a LOUD FAILURE
+  that reports the owner as UNKNOWN — never a default, never a repair
+  opportunity. The earlier protocol treated an absent manifest as "never
+  cut over" and even let the installer write one; that made a deleted
+  manifest silently resurrect stale legacy state (retry debt, deadlines,
+  candidates and anchors included), so absence is now only ever resolved
+  by the explicit operator decision above.
 
 * RECOVERABLE. The document is self-contained and has no dependency on
   any provider document: it can be restored from a backup or from the
@@ -65,11 +69,12 @@ writer produce a second, diverging source of truth, and defaulting after
 a JSON cutover would resurrect state the authoritative document has long
 since moved past. Mutations fail closed; readers fail loudly.
 
-The one function allowed to act on absence is ``initialize_authority``,
-and it is a LIFECYCLE step: the installer or an explicit operator command
-calls it once for a deployment that predates the protocol. Runtime code
-never calls it, which is precisely what makes a later disappearance
-detectable.
+The one function allowed to act on absence is
+``bootstrap_legacy_authority``, and it does not infer: it records a LEGACY
+ownership fact that an operator explicitly asserted. It is a lifecycle
+step for a confirmed pre-protocol deployment; runtime code never calls it,
+and neither does the installer, which is precisely what makes a later
+disappearance detectable instead of self-healing.
 """
 from __future__ import annotations
 
@@ -102,11 +107,12 @@ class AuthorityMissingError(AuthorityError):
     """No manifest exists in an initialized-or-unknown state directory.
 
     Raised by every ownership read. It is deliberately NOT a synonym for
-    "legacy": a deployment that predates the protocol is initialized
-    explicitly (see ``initialize_authority``), and after that a missing
-    manifest means the single ownership fact was lost. Guessing legacy
-    there would silently roll the scheduler back to state the
-    authoritative document has already superseded.
+    "legacy": a deployment that predates the protocol has that fact
+    recorded explicitly by an operator (see
+    ``bootstrap_legacy_authority``), and after that a missing manifest
+    means the single ownership fact was lost. Guessing legacy there would
+    silently roll the scheduler back to state the authoritative document
+    has already superseded.
     """
 
 
@@ -130,12 +136,21 @@ class ConcurrentAuthorityChangeError(AuthorityError):
 
 
 @dataclass(frozen=True)
-class InitializationResult:
-    """Outcome of ``initialize_authority``: the authority, and whether this
-    call created it (False means the deployment was already initialized)."""
+class BootstrapResult:
+    """Outcome of ``bootstrap_legacy_authority``: the authority, and whether
+    this call created it (False means a manifest was already there, so the
+    call was a reported no-op)."""
 
     authority: "BackendAuthority"
     created: bool
+
+
+# The old name, kept ONLY so an out-of-tree caller fails with a clear
+# message instead of a bare AttributeError (see ``__getattr__`` below). It
+# is deliberately not exported and deliberately not a working alias:
+# quietly keeping two ways to perform the one destructive authority
+# operation is how it gets performed by accident.
+_OLD_INITIALIZE_NAME = "initialize_authority"
 
 
 @dataclass(frozen=True)
@@ -174,7 +189,7 @@ class BackendAuthority:
 
 
 def bootstrap_authority() -> BackendAuthority:
-    """The authority ``initialize_authority`` materializes.
+    """The authority ``bootstrap_legacy_authority`` materializes.
 
     Named for what it is: the authority a deployment has BEFORE the
     protocol exists on disk, not a default that reads may fall back to.
@@ -267,13 +282,14 @@ def read_authority(state_dir: Path) -> BackendAuthority:
     except FileNotFoundError as exc:
         raise AuthorityMissingError(
             f"backend authority manifest is missing at {path}: refusing to "
-            "guess between the legacy and JSON backends. Every initialized "
-            "deployment has one; if this deployment was never initialized, "
-            "run the installer or `quota-sentinel.sh init-authority` ONCE. "
-            "If it was initialized, the manifest was lost — restore it from "
-            "backup rather than recreating it, because recreating it as "
-            "legacy would resurrect state the authoritative backend has "
-            "already superseded."
+            "guess between the legacy and JSON backends. The owner of this "
+            "state is UNKNOWN — a deployment that cut over and then lost the "
+            "manifest is indistinguishable from one that never had it, so "
+            "nothing here will infer legacy. Restore the manifest from "
+            "backup. ONLY if this deployment is confirmed to predate the "
+            "authority protocol, assert it once with "
+            "`quota-sentinel bootstrap-authority --assume-legacy`, an "
+            "explicit operator decision the installer never makes for you."
         ) from exc
     except IsADirectoryError as exc:
         raise AuthorityCorruptError(
@@ -322,37 +338,81 @@ def read_authority_if_present(state_dir: Path) -> Optional[BackendAuthority]:
     return read_authority(state_dir)
 
 
-def initialize_authority(state_dir: Path) -> "InitializationResult":
-    """Materialize the bootstrap authority for a pre-protocol deployment.
+def bootstrap_legacy_authority(state_dir: Path) -> BootstrapResult:
+    """Assert, on an operator's explicit behalf, that this deployment's
+    authoritative backend is legacy — and record it as epoch 0.
 
-    THE ONE PLACE absence is allowed to mean something. It is a LIFECYCLE
-    operation, called by the installer or by an explicit operator command,
-    never by runtime code path — which is what makes a later missing
-    manifest detectable instead of self-healing.
+    THIS FUNCTION DOES NOT REPAIR ANYTHING, and the name says so on
+    purpose. A missing manifest means the system does not know who owns
+    the state; it does NOT mean "legacy". Those two situations are
+    indistinguishable from the state directory alone:
+
+      A. a deployment that predates the authority protocol, so no fact was
+         ever written;
+      B. a deployment that already cut over and whose manifest was lost.
+
+    In case B, writing ``legacy`` epoch 0 would silently re-legitimize
+    stale legacy deadlines and retry debt that the authoritative JSON
+    documents have long since moved past. No amount of inspecting the
+    directory can tell A from B — the JSON documents may predate the
+    protocol too — so this is the one decision that cannot be inferred and
+    must be ASSERTED.
+
+    PRECONDITIONS (both the caller's responsibility; neither is verifiable
+    here):
+
+    * the caller holds the scheduler's ``run.lock``;
+    * the caller has ESTABLISHED that this is case A — a confirmed
+      pre-protocol deployment. The operator CLI requires an explicit
+      ``--assume-legacy`` for exactly this reason, and the installer never
+      calls this function at all.
 
     Contract:
 
     * absent manifest  -> publish ``legacy`` epoch 0 through the same
       atomic temp-write/fsync/rename primitive as every other authority
       write, then return it with ``created=True``;
-    * valid manifest   -> return it unchanged, ``created=False`` (so a
-      re-run of the installer is a no-op, never a re-write);
-    * damaged manifest -> loud error; NEVER overwritten. Re-initializing
-      over corruption would destroy the only ownership fact.
+    * valid manifest   -> return it UNCHANGED with ``created=False``. A
+      JSON manifest is never rewritten as legacy, so an operator who runs
+      this by mistake on a cut-over deployment gets a report, not a
+      downgrade;
+    * damaged manifest -> loud error; NEVER overwritten. Writing over
+      corruption would destroy the only ownership fact.
 
-    Scheduler state is not read, written or inferred here. In particular
-    the presence of Phase 2 JSON documents is deliberately ignored: they
-    may predate the protocol, so they cannot be evidence of a cutover.
+    Scheduler state is not read, written or inferred here, and the
+    presence of Phase 2 JSON documents is deliberately ignored.
     """
     existing = read_authority_if_present(state_dir)
     if existing is not None:
-        return InitializationResult(existing, created=False)
+        return BootstrapResult(existing, created=False)
     authority = bootstrap_authority()
     write_authority(state_dir, authority)
     confirmed = read_authority(state_dir)
     if confirmed != authority:
         raise AuthorityError(
-            f"authority initialization published {authority} but re-reading "
+            f"authority bootstrap published {authority} but re-reading "
             f"it yielded {confirmed}; refusing to report success"
         )
-    return InitializationResult(confirmed, created=True)
+    return BootstrapResult(confirmed, created=True)
+
+
+def __getattr__(name: str):
+    """Fail the RETIRED name loudly, with the reason attached.
+
+    Removing ``initialize_authority`` is not a rename for tidiness: the old
+    name invited every caller to materialize an ownership fact, including
+    callers that had no business making that decision (an installer, an
+    update path, a repair helper). The replacement cannot be called by
+    accident because it is not named like a repair, and any survivor of the
+    old call site now stops here with an explanation rather than silently
+    acquiring a different behaviour.
+    """
+    if name == _OLD_INITIALIZE_NAME:
+        raise AttributeError(
+            "initialize_authority() has been REMOVED. Creating the authority "
+            "manifest is an explicit operator decision, not a routine "
+            "initialization: use bootstrap_legacy_authority() only from a "
+            "command whose caller asserted --assume-legacy and holds run.lock. "
+            "Runtime, installer and update paths must never call it."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

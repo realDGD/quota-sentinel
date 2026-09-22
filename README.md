@@ -201,7 +201,7 @@ an Authorization header supplied to curl over stdin.
 ./quota-sentinel.sh send-test-card [all|both|codex|antigravity|opencode|usage|progress]
 
 # state-backend lifecycle (each acquires the scheduler's run.lock)
-./quota-sentinel.sh init-authority
+./quota-sentinel.sh bootstrap-authority --assume-legacy   # ONE-TIME, see below
 ./quota-sentinel.sh cutover
 ./quota-sentinel.sh rollback
 ```
@@ -211,10 +211,16 @@ an Authorization header supplied to curl over stdin.
 - `run [codex|antigravity|opencode|all]`: Runs specified provider (or all three) and updates its schedule.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
-- `init-authority`: one-time upgrade step that materializes the authority
-  manifest for a deployment that predates it.
-- `cutover`: makes the JSON state backend authoritative.
-- `rollback`: returns ownership to the legacy backend (pure undo only).
+- `bootstrap-authority --assume-legacy`: the **only** way the ownership
+  manifest is ever created, and the flag is mandatory. It asserts, out loud,
+  that this deployment predates the authority protocol. Nothing automatic —
+  not the installer, not `check`/`wait`/`run`, not an update — ever creates
+  it for you.
+- `cutover`: makes the JSON state backend authoritative **for the whole
+  provider roster**. Authority is one global fact, so there is no
+  per-provider switch; naming a provider is a usage error.
+- `rollback`: returns ownership to the legacy backend (pure undo only, and
+  likewise whole-roster).
   See [Upgrading from the legacy state backend](#upgrading-from-the-legacy-state-backend).
 
 The Python side has its own verbs, equivalent under either entry point (parity
@@ -235,7 +241,7 @@ uv run quota-sentinel json-dump codex     # v1 JSON document
 
 # lifecycle — these acquire run.lock themselves, so they are safe to run
 # directly; ./quota-sentinel.sh <verb> is the equivalent shell entry point
-uv run quota-sentinel authority-initialize
+uv run quota-sentinel bootstrap-authority --assume-legacy   # one-time, explicit
 uv run quota-sentinel cutover
 uv run quota-sentinel rollback
 uv run quota-sentinel migrate             # legacy deployments only
@@ -244,6 +250,12 @@ uv run quota-sentinel migrate             # legacy deployments only
 `next-due` and `state-dump` read through whichever backend the durable
 authority manifest selects, so `status` reports the live state without
 knowing which backend that is. `authority` prints the manifest itself.
+
+> **`cutover` and `rollback` are whole-roster.** They take no provider
+> argument: the manifest names the backend for the entire state directory,
+> so a provider-scoped switch would hand the other providers to the retired
+> backend. `cutover codex` is an argparse usage error, refused before any
+> state is touched.
 
 > **The `scheduler-*` verbs are an INTERNAL BRIDGE API.** They are what
 > `quota-sentinel.sh` calls *while it already holds `run.lock`*, and they do
@@ -256,16 +268,25 @@ knowing which backend that is. `authority` prints the manifest itself.
 
 Every deployment has an **authority manifest**
 (`<state-dir>/backend-authority.json`), and the runtime requires it. The
-installer creates it, so the normal upgrade is:
+installer **never creates it** — a missing manifest means the owner of the
+state is unknown, not that it is legacy — so a pre-protocol deployment
+asserts it once, explicitly:
 
 ```bash
-./install-launchagents.sh --load  # sync, retire old agents, restart listener
-./quota-sentinel.sh cutover       # one-time ownership switch (run.lock held)
+./quota-sentinel.sh bootstrap-authority --assume-legacy  # ONE-TIME assertion
+./install-launchagents.sh --load   # sync, retire old agents, restart listener
+./quota-sentinel.sh cutover        # one-time ownership switch (run.lock held)
 ```
 
-Both steps are needed:
-- `--load` retires the legacy watchdog/timer agents, restarts the listener,
-  and initializes the manifest as `legacy epoch 0`;
+All three steps are separate on purpose:
+- `bootstrap-authority --assume-legacy` records `legacy epoch 0`. The flag is
+  mandatory because "no manifest" and "a pre-protocol deployment" are
+  indistinguishable from the state directory alone. A virgin deployment
+  qualifies (it has no state at all); nothing else may be assumed.
+- `--load` retires the legacy watchdog/timer agents and restarts the
+  listener. It **reads and validates** the manifest, and fails — before any
+  `launchctl` call — when it is missing or unparseable, so an upgrade can
+  never invent an owner.
 - `cutover` is the separate, explicit ownership switch. The installer never
   performs it, so you can upgrade the code, watch the existing backend
   behave, and move ownership when you choose.
@@ -275,19 +296,16 @@ know the manifest exists and would keep writing the legacy slots after the
 switch. New code is safe in either order, because every state access re-reads
 the durable fact.
 
-If you do not use the installer, initialize once by hand:
-
-```bash
-./quota-sentinel.sh init-authority   # one-time, idempotent, run.lock held
-```
-
 `cutover` reads the CURRENT slot files, writes and verifies one JSON document
-per provider, and only then publishes the ownership fact — a single atomic
-replace. Every crash point is recoverable: before the flip the slot files are
-still authoritative, and the flip itself is all-or-nothing. The slot files are
-left byte-for-byte untouched afterwards and act as the rollback artifact;
-`rollback` returns ownership to them and refuses once JSON state has advanced,
-because that would discard authoritative state.
+**per provider in the roster**, and only then publishes the ownership fact —
+a single atomic replace. Every crash point is recoverable: before the flip the
+slot files are still authoritative, and the flip itself is all-or-nothing. If
+any provider fails to prepare or verify, ownership does not move at all; the
+refreshed documents are just shadows under a still-legacy deployment. The slot
+files are left byte-for-byte untouched afterwards and act as the rollback
+artifact; `rollback` returns ownership to them and refuses once JSON state has
+advanced, because that would discard authoritative state. It compares every
+provider before refusing, so one diverged provider is enough to stop it.
 
 All three lifecycle commands take the scheduler's `run.lock` themselves
 (same `shlock` protocol, same file), so they cannot interleave with an
@@ -295,21 +313,24 @@ in-flight `check` or model run.
 
 #### If the authority manifest goes missing
 
-**Do not hand-create it, and do not re-run `init-authority` to "fix" it.**
-A missing manifest is not "never cut over" — it means the single ownership
-fact was lost. The runtime says so and refuses to touch state, because
-guessing `legacy` would silently roll the scheduler back to deadlines and
-retry debt the authoritative backend has already moved past.
+**Do not hand-create it, and do not bootstrap it to "fix" it.** A missing
+manifest is not "never cut over" — it means the single ownership fact was
+lost, and a deployment that cut over and then lost it looks exactly like one
+that never had it. The runtime, the installer and every update path say so and
+refuse to touch state, because guessing `legacy` would silently roll the
+scheduler back to deadlines and retry debt the authoritative backend has
+already moved past.
 
 Recover it the way you would any lost durable fact:
 
 1. stop the agents (`launchctl bootout gui/$(id -u)/quota-sentinel.feishu-listener`);
 2. decide which backend actually holds the current state by inspecting
    `<provider>-state.json` and the legacy slot files side by side;
-3. restore `backend-authority.json` from a backup if you have one —
-   otherwise re-run `./quota-sentinel.sh init-authority` **only if you have
-   confirmed the deployment never cut over**, since that writes `legacy`;
-4. restart the agent.
+3. restore `backend-authority.json` from a backup if you have one;
+4. only if you have confirmed the deployment **never cut over**, record that
+   assertion instead:
+   `./quota-sentinel.sh bootstrap-authority --assume-legacy`;
+5. restart the agent.
 
 #### Deleting the legacy files
 
