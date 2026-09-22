@@ -150,6 +150,17 @@ class AuthorityBase(unittest.TestCase):
             if path.is_file()
         }
 
+    def run_cli(self, *argv):
+        """Run the real CLI in-process; returns (rc, stdout, stderr)."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from quota_sentinel.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main(["--state-dir", str(self.state_dir), *argv])
+        return rc, out.getvalue(), err.getvalue()
+
     def clear_state_dir(self) -> None:
         for path in list(self.state_dir.iterdir()):
             if path.is_file():
@@ -827,9 +838,9 @@ class CrossProcessTests(AuthorityBase):
 class MissingManifestTests(AuthorityBase):
     """M3/M4 at the unit level: a LOST ownership fact fails closed.
 
-    The end-to-end versions of these live in
-    tests/state-authority-regression.zsh; these pin the library contract
-    that the shell relies on.
+    The end-to-end versions of these live in the CLI tests below
+    (``ExplicitBootstrapTests``) and in the scheduler suite; these pin the
+    library contract they rely on.
     """
 
     def _authoritative_json_deployment(self):
@@ -1005,8 +1016,8 @@ class LifecycleLockTests(AuthorityBase):
         """The property that closes the window above.
 
         Cutover and rollback acquire the scheduler's real run.lock through
-        the same shlock protocol the shell uses, so a writer holding the
-        lock makes them fail rather than interleave.
+        the shared shlock protocol, so a writer holding the lock makes them
+        fail rather than interleave.
         """
         from quota_sentinel.state import (
             RunLockBusyError,
@@ -1018,24 +1029,21 @@ class LifecycleLockTests(AuthorityBase):
                 acquire_run_lock(self.state_dir, timeout=0)
             self.assertTrue(
                 self.state_dir.joinpath("run.lock").exists(),
-                "the lock file is what the shell and the CLI contend on",
+                "the lock file is what every entry point contends on",
             )
         # Released -> immediately acquirable again (no stale lock).
         with acquire_run_lock(self.state_dir, timeout=0) as lock:
             self.assertFalse(lock.released)
         self.assertFalse(self.state_dir.joinpath("run.lock").exists())
 
-    def test_runlock_is_the_shells_protocol(self):
-        """Same binary, same file, same pid semantics — not a second lock."""
+    def test_runlock_uses_the_shared_shlock_protocol(self):
+        """Same binary, same file, same pid semantics — never a second lock."""
         from quota_sentinel.state import RUN_LOCK_FILENAME, SHLOCK_BIN
         from quota_sentinel.state import runlock as runlock_module
 
         self.assertEqual(RUN_LOCK_FILENAME, "run.lock")
         self.assertEqual(SHLOCK_BIN, "/usr/bin/shlock")
         self.assertTrue(os.access(SHLOCK_BIN, os.X_OK))
-        shell = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
-        self.assertIn('readonly RUN_LOCK_FILE="$STATE_DIR/run.lock"', shell)
-        self.assertIn('readonly SHLOCK_BIN="/usr/bin/shlock"', shell)
         # ... and the acquisition actually records OUR pid.
         with runlock_module.acquire_run_lock(self.state_dir, timeout=0) as lock:
             recorded = int(
@@ -1055,6 +1063,75 @@ class LifecycleLockTests(AuthorityBase):
         self.assertTrue(self.state_dir.joinpath("run.lock").exists())
         second.release()
         self.assertFalse(self.state_dir.joinpath("run.lock").exists())
+
+    def test_l1_public_lifecycle_refuses_while_a_writer_holds_run_lock(self):
+        """AB8/AB9: the public verbs cannot interleave with a writer.
+
+        Held lock -> both `cutover` and `rollback` refuse, and the WHOLE
+        deployment is byte-identical afterwards: no partial switch, no
+        manifest rewrite, no temp file.
+        """
+        from quota_sentinel.state import acquire_run_lock
+
+        self.write_legacy("codex", legacy_state(0))
+        with acquire_run_lock(self.state_dir, timeout=0):
+            before = self.snapshot()
+            for verb in ("cutover", "rollback"):
+                with self.subTest(verb=verb):
+                    rc, _, err = self.run_cli(verb, "--lock-timeout", "0")
+                    self.assertEqual(rc, 4, err)
+                    self.assertIn("run.lock", err)
+                    self.assertEqual(self.snapshot(), before)
+        self.assertEqual(read_authority(self.state_dir).backend, BACKEND_LEGACY)
+
+    def test_l1_failed_lifecycle_verb_still_releases_run_lock(self):
+        """AB10: a verb that fails INSIDE the lock must release it.
+
+        `rollback` refuses once JSON state has advanced; that refusal happens
+        under run.lock, so a leak here would wedge every later scheduler run.
+        """
+        from quota_sentinel.state import acquire_run_lock
+
+        self.write_legacy("codex", legacy_state(0))
+        cutover_to_json(self.state_dir)
+        store = AuthoritativeStateStore(self.state_dir)
+        store.commit(
+            "codex",
+            legacy_state(0),
+            replace(legacy_state(0), next_due_at=4242),
+        )
+        before = self.snapshot()
+        rc, _, err = self.run_cli("rollback", "--lock-timeout", "0")
+        self.assertEqual(rc, 4, err)
+        self.assertIn("pure undo", err)
+        # The lock is gone (not merely released) and immediately re-acquirable.
+        self.assertFalse(self.state_dir.joinpath("run.lock").exists())
+        with acquire_run_lock(self.state_dir, timeout=0) as lock:
+            self.assertFalse(lock.released)
+        # ... and the failed verb changed nothing.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_l1_missing_manifest_read_names_the_operator_remedy(self):
+        """AB1: a read against an uninitialized deployment is loud, and it
+        names the ONLY thing that may create the fact."""
+        self.write_legacy("codex", legacy_state(0))
+        self.deinitialize()
+        before = self.snapshot()
+        for verb, argv in (
+            ("status", ()),
+            ("next-due", ("codex",)),
+            ("state-dump", ("codex",)),
+        ):
+            with self.subTest(verb=verb):
+                rc, out, err = self.run_cli(verb, *argv)
+                self.assertEqual(rc, 4, err)
+                self.assertIn("UNKNOWN", err)
+                self.assertIn(
+                    "quota-sentinel bootstrap-authority --assume-legacy", err
+                )
+        # A failed read creates nothing: absence is not repaired implicitly.
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(authority_path(self.state_dir).exists())
 
 
 class LifecyclePrerequisiteTests(AuthorityBase):
@@ -1313,19 +1390,35 @@ class WholeRosterSwitchTests(AuthorityBase):
                 )
 
 
-class ExplicitBootstrapTests(AuthorityBase):
-    """E2 (P1-2/P2): only an operator assertion may create authority."""
+class ReadPurityTests(AuthorityBase):
+    """Reads and help must never create state (SP2/SU-B1).
 
-    def run_cli(self, *argv):
-        """Run the real CLI in-process; returns (rc, stdout, stderr)."""
+    A diagnostic against a missing deployment leaves the filesystem exactly as
+    it found it; creating the directory would make "read" a mutation.
+    """
+
+    def test_help_and_a_failed_read_create_no_state_dir(self):
         import io
         from contextlib import redirect_stderr, redirect_stdout
         from quota_sentinel.__main__ import main
 
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            rc = main(["--state-dir", str(self.state_dir), *argv])
-        return rc, out.getvalue(), err.getvalue()
+        missing = Path(self._tmp.name) / "never-created"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                main(["--state-dir", str(missing), "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertFalse(missing.exists())
+
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = main(["--state-dir", str(missing), "next-due", "codex"])
+        self.assertEqual(rc, 4, err.getvalue())
+        self.assertIn("UNKNOWN", err.getvalue())
+        self.assertFalse(missing.exists())
+
+
+class ExplicitBootstrapTests(AuthorityBase):
+    """E2 (P1-2/P2): only an operator assertion may create authority."""
 
     def test_b1_explicit_assertion_creates_legacy_epoch_zero(self):
         self.deinitialize()
@@ -1470,6 +1563,21 @@ class ExplicitBootstrapTests(AuthorityBase):
             ])
         self.assertEqual(rc, 0)
         self.assertEqual(read_authority(self.state_dir), bootstrap_authority())
+
+
+class LockTimeoutConfigurationTests(unittest.TestCase):
+    def test_lifecycle_wait_matches_shell_and_accepts_environment_override(self):
+        from unittest import mock
+        from quota_sentinel.__main__ import build_parser
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QUOTA_SENTINEL_RUN_LOCK_WAIT", None)
+            self.assertEqual(build_parser().parse_args(["cutover"]).lock_timeout, 120)
+        with mock.patch.dict(os.environ, {"QUOTA_SENTINEL_RUN_LOCK_WAIT": "7"}):
+            parser = build_parser()
+            self.assertEqual(parser.parse_args(["rollback"]).lock_timeout, 7)
+            self.assertEqual(parser.parse_args(["bootstrap-authority"]).lock_timeout, 7)
+            self.assertEqual(parser.parse_args(["cutover", "--lock-timeout", "3"]).lock_timeout, 3)
 
 
 if __name__ == "__main__":

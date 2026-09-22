@@ -1,0 +1,393 @@
+"""Public Quota Sentinel operations over the existing Python domain policy."""
+
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, Mapping, Optional, Sequence
+
+from quota_sentinel.quota.adapters import PROVIDERS
+from quota_sentinel.scheduler import policy, service
+from quota_sentinel.scheduler.models import NO_OBSERVATION, Decision, QuotaObservation
+from quota_sentinel.state import acquire_run_lock, read_authority
+from quota_sentinel.state.runlock import RunLockBusyError, RunLockError
+from quota_sentinel.runtime.cards import format_reset_time
+
+from .runtime.locks import LockError, acquire_quota_lock
+
+logger = logging.getLogger("quota_sentinel.app")
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    initial_attempts: int = 3
+    watchdog_attempts: int = 2
+    retry_interval: int = 30
+    watchdog_retry_gap: int = 780
+    quota_wait: int = 20
+    timer_recheck: int = 60
+
+    def __post_init__(self) -> None:
+        for name in ("initial_attempts", "watchdog_attempts", "retry_interval"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        for name in ("watchdog_retry_gap", "quota_wait", "timer_recheck"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+    @classmethod
+    def from_env(cls, environment: Optional[Mapping[str, str]] = None) -> "AppConfig":
+        """Read the documented overrides, with the shell's exact tolerance.
+
+        A non-numeric value falls back to the default (the shell's
+        ``env_int`` does the same), while a literal ``0`` reaches
+        ``__post_init__`` and fails loudly — a zero attempt limit or retry
+        interval would spin without ever attempting a task.
+        """
+        env = os.environ if environment is None else environment
+
+        def env_int(name: str, default: int) -> int:
+            raw = env.get(name)
+            if raw is None or not raw.strip().isdigit():
+                return default
+            return int(raw)
+
+        return cls(
+            initial_attempts=env_int("QUOTA_SENTINEL_INITIAL_ATTEMPTS", 3),
+            watchdog_attempts=env_int("QUOTA_SENTINEL_WATCHDOG_ATTEMPTS", 2),
+            retry_interval=env_int("QUOTA_SENTINEL_RETRY_INTERVAL", 30),
+            watchdog_retry_gap=env_int("QUOTA_SENTINEL_WATCHDOG_RETRY_GAP", 780),
+        )
+
+
+def _observation(reading: object) -> QuotaObservation:
+    quota = getattr(reading, "quota", None)
+    if quota is None:
+        return NO_OBSERVATION
+    return QuotaObservation(
+        fresh=bool(getattr(reading, "fresh", False) and quota.fresh),
+        reset_at=quota.five_hour.reset_at,
+        source=quota.source,
+    )
+
+
+class Application:
+    """Coordinate locks, probes, attempts and notifications.
+
+    The injected external adapters make every process/network operation
+    replaceable in tests. State transitions always use the authoritative
+    router and the scheduler policy package.
+    """
+
+    def __init__(
+        self,
+        state_dir: Path,
+        model_runner: object,
+        quota_collector_factory: Callable[[Path], object],
+        notifier: object,
+        *,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        config: AppConfig = AppConfig(),
+        workspace_parent: Optional[Path] = None,
+        preflight: Optional[Callable[[Sequence[str]], None]] = None,
+    ) -> None:
+        self.state_dir = Path(state_dir)
+        self.model_runner = model_runner
+        self.quota_collector_factory = quota_collector_factory
+        self.notifier = notifier
+        self.clock = clock
+        self.sleep = sleep
+        self.config = config
+        self.workspace_parent = workspace_parent
+        self.preflight = preflight
+
+    def _require_ready(self, providers: Sequence[str]) -> None:
+        """Refuse to spend model quota on a run that cannot be delivered.
+
+        The default is the notifier's own credential gate, which is the part
+        of the shell's ``validate_run_requirements`` this module can know
+        about; the CLI injects the full requirements check (binaries, Pi
+        auth, provider hooks) through ``preflight``.
+        """
+        if self.preflight is not None:
+            self.preflight(providers)
+        else:
+            self.notifier.validate_ready()
+
+    def _now(self) -> int:
+        return int(self.clock())
+
+    def _providers(self, providers: Sequence[str]) -> tuple[str, ...]:
+        names = tuple(providers) or PROVIDERS
+        if len(set(names)) != len(names) or any(p not in PROVIDERS for p in names):
+            raise ValueError(f"invalid provider roster: {names!r}")
+        return names
+
+    def _workspace(self):
+        parent = str(self.workspace_parent) if self.workspace_parent else None
+        return tempfile.TemporaryDirectory(prefix="quota-sentinel.", dir=parent)
+
+    def _burst(
+        self, providers: Sequence[str], workspace: Path, phase: str, limit: int
+    ) -> tuple[Dict[str, str], Dict[str, Path]]:
+        remaining = list(providers)
+        results: Dict[str, str] = {p: "发送失败" for p in remaining}
+        pi_raw: Dict[str, Path] = {}
+        for provider in remaining:
+            self.model_runner.prepare(provider, workspace)
+        for provider in remaining:
+            service.begin_attempt(self.state_dir, provider, self._now())
+
+        for round_number in range(1, limit + 1):
+            if not remaining:
+                break
+            if round_number > 1:
+                for provider in remaining:
+                    service.record_attempt(self.state_dir, provider, self._now())
+
+            current = tuple(remaining)
+            with ThreadPoolExecutor(max_workers=len(current)) as pool:
+                pending = {
+                    provider: pool.submit(
+                        self.model_runner.run, provider, workspace,
+                        phase, round_number, limit,
+                    )
+                    for provider in current
+                }
+                succeeded = []
+                failed = []
+                for provider in current:
+                    try:
+                        outcome = pending[provider].result()
+                    except Exception:
+                        logger.exception("model %s could not complete", provider)
+                        failed.append(provider)
+                        continue
+                    pi_raw[provider] = outcome.quota_path
+                    if outcome.success:
+                        succeeded.append(provider)
+                        results[provider] = "发送成功"
+                    else:
+                        failed.append(provider)
+            # A crash before commit leaves debt recorded and errs toward an
+            # extra attempt, never toward losing a due task.
+            for provider in succeeded:
+                service.commit_success(self.state_dir, provider, self._now())
+            remaining = failed
+            if remaining and round_number < limit:
+                self.sleep(self.config.retry_interval)
+        return results, pi_raw
+
+    def _sync(self, provider: str, reading: object, now: int) -> None:
+        state = service.load_state(self.state_dir, provider)
+        transition, _ = policy.sync_deadline(state, _observation(reading), now)
+        service.apply_transition(self.state_dir, provider, transition)
+
+    def _run_selected(
+        self, providers: Sequence[str], workspace: Path, collector: object
+    ) -> Dict[str, str]:
+        names = self._providers(providers)
+        # Before the first attempt, never after: a missing push credential
+        # discovered once three 300s model timeouts have been spent is a
+        # failure the operator paid for and cannot use.
+        self._require_ready(names)
+        results, pi_raw = self._burst(
+            names, workspace, "initial", self.config.initial_attempts
+        )
+        collector.save_pi_snapshots(pi_raw)
+        readings: Mapping[str, object] = {}
+        try:
+            with acquire_quota_lock(self.state_dir, timeout=self.config.quota_wait):
+                readings = collector.collect(pi_raw)
+                now = self._now()
+                for provider in names:
+                    if results[provider] != "发送成功":
+                        continue
+                    observation = _observation(readings.get(provider))
+                    reset_at = policy.valid_reset_at(observation, now)
+                    if reset_at is not None:
+                        service.record_last_window(self.state_dir, provider, reset_at)
+                        self._sync(provider, readings[provider], now)
+                        logger.info(
+                            "run: post-run sync %s fresh_reset=%s",
+                            provider, reset_at,
+                        )
+        except LockError:
+            # Any acquisition failure counts as busy, exactly as the shell
+            # treats it. The attempts already happened, so the task card is
+            # still sent below; only the deadline calibration is skipped.
+            logger.warning("post-run quota.lock unavailable; fallback deadlines remain")
+        self.notifier.task(names, results, readings, self._now())
+        return results
+
+    def run(self, providers: Sequence[str] = ()) -> Dict[str, str]:
+        names = self._providers(providers)
+        with acquire_run_lock(self.state_dir, timeout=0):
+            read_authority(self.state_dir)
+            with self._workspace() as temp:
+                workspace = Path(temp)
+                return self._run_selected(
+                    names, workspace, self.quota_collector_factory(workspace)
+                )
+
+    def check(self) -> tuple[str, ...]:
+        try:
+            lock = acquire_run_lock(self.state_dir, timeout=0)
+        except RunLockError:
+            # Every acquisition failure — busy, or shlock missing entirely —
+            # is a skip for the shell's watchdog: a scheduler tick that
+            # cannot serialize must not run models, and must not be fatal.
+            logger.info("check: run.lock busy, skipped")
+            return ()
+        with lock:
+            started = self._now()
+            read_authority(self.state_dir)
+            with self._workspace() as temp:
+                workspace = Path(temp)
+                collector = self.quota_collector_factory(workspace)
+                now = self._now()
+                retry = service.retry_due_providers(
+                    self.state_dir, PROVIDERS, now,
+                    self.config.watchdog_retry_gap,
+                )
+                retry_results: Dict[str, str] = {}
+                pi_raw: Mapping[str, Path] = {}
+                if retry:
+                    logger.info(
+                        "check: pending debt on %s; watchdog retry burst first",
+                        " ".join(retry),
+                    )
+                    retry_results, pi_raw = self._burst(
+                        retry, workspace, "watchdog-retry",
+                        self.config.watchdog_attempts,
+                    )
+                    collector.save_pi_snapshots(pi_raw)
+
+                try:
+                    quota_lock = acquire_quota_lock(self.state_dir, timeout=0)
+                except LockError:
+                    logger.info("check: quota.lock busy, skipped")
+                    return ()
+                with quota_lock:
+                    readings = collector.collect(pi_raw)
+                    now = self._now()
+                    # Phase C decides only providers WITHOUT a pending debt,
+                    # read LIVE here rather than from the gap-filtered retry
+                    # list above. A provider still waiting out its watchdog
+                    # gap is not due just because an older deadline matured:
+                    # deciding it would start a fresh three-attempt initial
+                    # burst on every tick of the wait loop and card each one.
+                    pending = set(
+                        service.pending_providers(self.state_dir, PROVIDERS)
+                    )
+                    due = []
+                    for provider in PROVIDERS:
+                        if provider in pending:
+                            logger.info(
+                                "check: %s pending (debt unpaid); normal due "
+                                "evaluation skipped", provider,
+                            )
+                            continue
+                        result = service.decide_due(
+                            self.state_dir, provider, now,
+                            _observation(readings.get(provider)),
+                        )
+                        if result.decision is Decision.RUN_NOW:
+                            due.append(provider)
+
+                recovered = [
+                    provider for provider in retry
+                    if retry_results.get(provider) == "发送成功"
+                ]
+                if recovered:
+                    self.notifier.task(
+                        recovered, retry_results, readings, self._now()
+                    )
+                elapsed = self._now() - started
+                if not due:
+                    # The shell logged the roster's deadlines on a quiet tick;
+                    # without this an operator reading the daily run log sees
+                    # nothing at all and cannot tell a healthy tick from a
+                    # scheduler that stopped running.
+                    logger.info("check: nothing due (%s) (%ds)",
+                                self._deadline_summary(), elapsed)
+                else:
+                    logger.info("check: due providers: %s (%ds)",
+                                " ".join(due), elapsed)
+                if due:
+                    self._run_selected(due, workspace, collector)
+                return tuple(due)
+
+    def _deadline_summary(self) -> str:
+        """The shell's readable form: a Shanghai wall clock, not an epoch."""
+        states = service.load_roster(self.state_dir, PROVIDERS)
+        rendered = []
+        for provider in PROVIDERS:
+            next_due = states[provider].next_due_at
+            rendered.append("%s next %s" % (
+                provider,
+                format_reset_time(next_due) if next_due is not None else "unset",
+            ))
+        return ", ".join(rendered)
+
+    def usage(self) -> None:
+        started = self._now()
+        logger.info("usage: requested")
+        read_authority(self.state_dir)
+        with self._workspace() as temp:
+            workspace = Path(temp)
+            collector = self.quota_collector_factory(workspace)
+            try:
+                with acquire_quota_lock(
+                    self.state_dir, timeout=self.config.quota_wait
+                ):
+                    readings = collector.collect()
+            except LockError:
+                # A broken lock is indistinguishable from a busy one at this
+                # boundary, and the operator's /usage must still get an
+                # answer: silence would look like the bot is down.
+                logger.warning(
+                    "usage: quota busy after %ss; replying busy",
+                    self.config.quota_wait,
+                )
+                self.notifier.busy(self._now())
+                return
+
+            try:
+                with acquire_run_lock(self.state_dir, timeout=0):
+                    now = self._now()
+                    for provider in PROVIDERS:
+                        self._sync(provider, readings.get(provider), now)
+            except RunLockBusyError:
+                logger.info("usage: scheduler busy; deadline sync skipped")
+            self.notifier.usage(readings, self._now())
+            logger.info("usage: completed (%ds)", self._now() - started)
+
+    def status(self) -> Mapping[str, object]:
+        read_authority(self.state_dir)
+        return service.load_roster(self.state_dir, PROVIDERS)
+
+    def wait(self) -> None:
+        logger.info("timer: watching deadlines (recheck every %ss)",
+                    self.config.timer_recheck)
+        while True:
+            now = self._now()
+            next_due = service.next_due(self.state_dir, PROVIDERS)
+            if next_due is not None and now < next_due:
+                self.sleep(min(next_due - now, self.config.timer_recheck))
+                continue
+            self.check()
+            next_due = service.next_due(self.state_dir, PROVIDERS)
+            if next_due is not None and self._now() < next_due:
+                self.sleep(1)
+            else:
+                self.sleep(self.config.timer_recheck)
+
+
+__all__ = ["AppConfig", "Application"]

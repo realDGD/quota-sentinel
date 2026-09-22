@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Phase 5 tests: notification selection policy.
 
-Transport and card rendering stay in the shell; this module owns WHETHER to
-notify, for whom, and in which layout. The suite pins the rules that have
-historically drifted, and proves the module is pure.
+This module owns WHETHER to notify, for whom, and in which layout; transport
+and card rendering live in `quota_sentinel.runtime`. The suite pins the rules
+that have historically drifted, and proves the module is pure.
 
 Run: PYTHONPATH=. uv run --frozen --no-sync python tests/python-notification-regression.py
 """
 from __future__ import annotations
 
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -28,7 +27,6 @@ from quota_sentinel.notifications import (
 )
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
-SHELL = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
 ROSTER = list(DEFAULT_PROVIDERS)
 
 
@@ -85,44 +83,6 @@ class PlanTests(unittest.TestCase):
         for plan in (plan_task(["codex"]), plan_usage(ROSTER), plan_recovery(["codex"])):
             self.assertTrue(plan.deduplication_key_prefix)
             self.assertNotIn(" ", plan.deduplication_key_prefix)
-
-
-class ShellAgreementTests(unittest.TestCase):
-    """The shell must not keep a second copy of the roster or the rules."""
-
-    def test_shell_roster_matches_the_declared_roster(self):
-        match = re.search(r"^readonly PROVIDERS=\(([^)]*)\)", SHELL, re.M)
-        self.assertIsNotNone(match, "the shell no longer declares PROVIDERS")
-        shell_roster = tuple(match.group(1).split())
-        self.assertEqual(shell_roster, tuple(ROSTER))
-        # ... and the usage plan's roster IS that roster.
-        self.assertEqual(plan_usage(shell_roster).providers, shell_roster)
-
-    def test_shell_delegates_layout_selection(self):
-        start = SHELL.index("dispatch_task_notification() {")
-        end = SHELL.index("\n}", start)
-        body = SHELL[start:end]
-        self.assertIn("notification_plan_field layout task", body)
-        # The old inline "contains opencode?" rule must not come back.
-        self.assertNotIn("provider_list_includes opencode", body)
-
-    def test_shell_delegates_the_usage_roster(self):
-        start = SHELL.index("send_usage_notification() {")
-        end = SHELL.index("\n}", start)
-        body = SHELL[start:end]
-        self.assertIn("notification_plan_field providers usage", body)
-
-    def test_shell_keeps_owning_transport_and_rendering(self):
-        """The boundary is explicit: the plan says what and for whom, the
-        shell still builds and sends the card."""
-        for builder in (
-            "build_feishu_v2_task_payload",
-            "build_feishu_v2_stacked_payload",
-            "dispatch_notification",
-            "task_notification_message",
-        ):
-            with self.subTest(builder=builder):
-                self.assertIn(builder, SHELL)
 
 
 class PurityTests(unittest.TestCase):

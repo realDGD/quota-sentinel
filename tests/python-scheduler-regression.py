@@ -13,15 +13,12 @@ before it. Every case names the invariant it protects:
   * at-least-once directionality: a crash prefix of any transition may
     duplicate work but may never lose a due task;
   * the cumulative near-movement loophole stays closed (the anchor does
-    not follow repeated small movements);
-  * the shell holds no second copy of any policy value.
+    not follow repeated small movements).
 
 Run: PYTHONPATH=. uv run --frozen --no-sync python tests/python-scheduler-regression.py
 """
 from __future__ import annotations
 
-import re
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -49,8 +46,6 @@ from quota_sentinel.state import (
     cutover_to_json,
     write_authority,
 )
-
-SHELL = REPO / "quota-sentinel.sh"
 
 
 def state(**kwargs) -> ProviderState:
@@ -242,6 +237,77 @@ class PurePolicyTests(unittest.TestCase):
         self.assertEqual(transition.after.reset_anchor, anchor_reset)
         self.assertEqual(transition.after.last_known_reset, near)
         self.assertIn("reset anchor initialized", transition.reason)
+
+    def test_near_movement_rewrites_the_deadline_to_the_new_reset_plus_buffer(
+        self,
+    ):
+        """Dynamic-schedule case 2 / P1 B/V1: a same-window jitter is accepted
+        immediately, and the DEADLINE follows it while the anchor does not.
+
+        This is the half the bookkeeping-only anchor test above cannot see: the
+        moved reset must actually re-time the next run.
+        """
+        anchor = self.NOW + 1000
+        before = state(
+            last_known_reset=anchor,
+            reset_anchor=anchor,
+            next_due_at=anchor + policy.RESET_BUFFER_SECONDS,
+            last_attempt_at=1,
+        )
+        moved = anchor + policy.RESET_NEAR_MOVEMENT_SECONDS
+        transition, action = policy.sync_deadline(before, fresh(moved), self.NOW)
+        self.assertEqual(action, SyncAction.NEAR_MOVEMENT)
+        self.assertEqual(transition.after.last_known_reset, moved)
+        self.assertEqual(transition.after.reset_anchor, anchor)
+        self.assertEqual(
+            transition.after.next_due_at, moved + policy.RESET_BUFFER_SECONDS
+        )
+        self.assertTrue(transition.writes)
+        # ... and the re-timed deadline is still ahead, so nothing runs yet.
+        _, decision = policy.evaluate_due(transition.after, fresh(moved), self.NOW)
+        self.assertEqual(decision, Decision.WAIT)
+
+    def test_earlier_fresh_reset_pulls_a_committed_deadline_earlier(self):
+        """P1 C/V2: an un-matured future deadline is not sacred — a trusted
+        fresh reset may move it EARLIER, and that earlier deadline then fires.
+
+        The persisted value is what matters: the sequence starts from a
+        committed next_due_at, not from a state where sync seeds it.
+        """
+        anchor = self.NOW + 3600
+        before = state(
+            last_known_reset=anchor,
+            reset_anchor=anchor,
+            next_due_at=anchor + policy.RESET_BUFFER_SECONDS,
+            last_attempt_at=1,
+        )
+        earlier = anchor - policy.RESET_NEAR_MOVEMENT_SECONDS
+        transition, action = policy.sync_deadline(before, fresh(earlier), self.NOW)
+        self.assertEqual(action, SyncAction.NEAR_MOVEMENT)
+        self.assertEqual(transition.after.reset_anchor, anchor)
+        self.assertLess(transition.after.next_due_at, before.next_due_at)
+        self.assertEqual(
+            transition.after.next_due_at,
+            earlier + policy.RESET_BUFFER_SECONDS,
+        )
+        # Once that earlier deadline matures it runs; matured debt needs no
+        # fresh data to be honoured.
+        _, decision = policy.evaluate_due(
+            transition.after, STALE, transition.after.next_due_at
+        )
+        self.assertEqual(decision, Decision.RUN_NOW)
+
+    def test_calibration_never_touches_last_task_or_last_window(self):
+        """Dynamic-schedule case 8: the /usage sync path may move deadlines
+        and the anchor, but a task marker or a triggered window means a MODEL
+        RAN — calibration alone must never set one."""
+        before = state(last_task_at=5, last_triggered_window="5")
+        transition, action = policy.sync_deadline(
+            before, fresh(self.NOW + 1000), self.NOW
+        )
+        self.assertEqual(action, SyncAction.ANCHOR_ESTABLISHED)
+        self.assertEqual(transition.after.last_task_at, 5)
+        self.assertEqual(transition.after.last_triggered_window, "5")
 
     def test_stale_observation_never_mutates(self):
         for before in (
@@ -521,87 +587,6 @@ class ObservationTests(unittest.TestCase):
         self.assertFalse(observation_for(self.path, True).fresh)
 
 
-class ShellOwnershipTests(unittest.TestCase):
-    """D. the shell must not keep a second copy of any policy value."""
-
-    SHELL_TEXT = SHELL.read_text(encoding="utf-8")
-
-    def test_no_numeric_policy_literals_remain(self):
-        names = (
-            "RUN_INTERVAL_SECONDS",
-            "RESET_BUFFER_SECONDS",
-            "RESET_NEAR_MOVEMENT_SECONDS",
-            "RESET_CONFIRM_MIN_AGE_SECONDS",
-            "RESET_CONFIRM_MATCH_SECONDS",
-            "MAX_WINDOW_FUTURE_SECONDS",
-            "RETRY_INTERVAL_SECONDS",
-            "INITIAL_ATTEMPT_LIMIT",
-            "WATCHDOG_ATTEMPT_LIMIT",
-            "WATCHDOG_RETRY_GAP_SECONDS",
-        )
-        for name in names:
-            with self.subTest(name=name):
-                # No assignment form (`name=123`, `readonly name=123`) may
-                # exist anywhere in the shell: values arrive from Python.
-                pattern = re.compile(
-                    rf"(^|[^A-Za-z0-9_])(readonly\s+|typeset\s+-\w+\s+)?"
-                    rf"{name}\s*=\s*[0-9]"
-                )
-                for match in pattern.finditer(self.SHELL_TEXT):
-                    line = self.SHELL_TEXT[: match.start()].count("\n") + 1
-                    self.fail(
-                        f"{name} is assigned a literal at line {line}: the "
-                        "scheduler policy must have exactly one owner"
-                    )
-
-    def test_shell_fetches_policy_from_the_domain(self):
-        self.assertIn("scheduler_policy_config()", self.SHELL_TEXT)
-        self.assertIn("scheduler-config", self.SHELL_TEXT)
-
-    def test_shell_holds_no_state_transition_policy(self):
-        """The decision functions must delegate; none of them may contain
-        their own arithmetic on deadlines or tolerances."""
-        forbidden = (
-            "RESET_BUFFER_SECONDS +",
-            "+ RESET_BUFFER_SECONDS",
-            "RESET_NEAR_MOVEMENT_SECONDS",
-            "RESET_CONFIRM_",
-            "MAX_WINDOW_FUTURE_SECONDS",
-        )
-        regions = {}
-        for name in (
-            "sync_provider_deadline_from_quota",
-            "evaluate_provider",
-            "valid_provider_reset_at",
-            "provider_schedule_block_reason",
-            "provider_fallback_due",
-        ):
-            start = self.SHELL_TEXT.index(f"{name}() {{")
-            end = self.SHELL_TEXT.index("\n}", start)
-            regions[name] = self.SHELL_TEXT[start:end]
-        for name, body in regions.items():
-            for token in forbidden:
-                with self.subTest(function=name, token=token):
-                    self.assertNotIn(token, body)
-
-    def test_shell_decision_functions_call_the_bridge(self):
-        for name, verb in (
-            ("sync_provider_deadline_from_quota", "scheduler-sync"),
-            ("evaluate_provider", "scheduler-decide"),
-            ("provider_fallback_due", "scheduler-fallback-due"),
-            ("valid_provider_reset_at", "scheduler-valid-reset"),
-            ("read_next_due", "scheduler-next-due"),
-            ("provider_retry_due", "scheduler-retry-due"),
-        ):
-            with self.subTest(function=name):
-                start = self.SHELL_TEXT.index(f"{name}() {{")
-                end = self.SHELL_TEXT.index("\n}", start)
-                self.assertIn(verb, self.SHELL_TEXT[start:end])
-
-    def test_bridge_runs_on_the_project_interpreter(self):
-        self.assertIn('PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN"', self.SHELL_TEXT)
-
-
 class TransitionPersistenceTests(unittest.TestCase):
     """E. transitions commit identically through both backends."""
 
@@ -698,6 +683,62 @@ class TransitionPersistenceTests(unittest.TestCase):
         from quota_sentinel.state import StateStoreError
         with self.assertRaises(StateStoreError):
             service.commit_success(self.state_dir, provider, 500)
+
+    def test_matured_deadline_runs_then_fresh_calibrates(self):
+        """P1 A2/F at the service level: a committed deadline that has matured
+        is actually run — the debt is durable before the attempt, success
+        commits the fallback, and a post-run fresh reading then calibrates the
+        next deadline on top of it."""
+        provider = "codex"
+        now = 1_000_000
+        # A committed deadline that is already in the past.
+        service.commit_success(
+            self.state_dir, provider, now - policy.RUN_INTERVAL_SECONDS - 1000
+        )
+        matured = service.load_state(self.state_dir, provider)
+        self.assertLess(matured.next_due_at, now)
+
+        # The matured deadline decides RUN_NOW and is NOT pushed forward by
+        # the fresh probe that arrived at due time.
+        result = service.decide_due(
+            self.state_dir, provider, now, fresh(now + 5000)
+        )
+        self.assertEqual(result.decision, Decision.RUN_NOW)
+        self.assertFalse(result.changed)
+        self.assertEqual(
+            service.load_state(self.state_dir, provider).next_due_at,
+            matured.next_due_at,
+        )
+
+        # The attempt's debt is durable BEFORE the model call ...
+        service.begin_attempt(self.state_dir, provider, now)
+        pending = service.load_state(self.state_dir, provider)
+        self.assertTrue(pending.retry_pending)
+        self.assertEqual(pending.last_attempt_at, now)
+        self.assertEqual(pending.next_due_at, matured.next_due_at)
+
+        # ... and success commits the 5h01 fallback anchored to the run.
+        service.commit_success(self.state_dir, provider, now + 10)
+        committed = service.load_state(self.state_dir, provider)
+        self.assertFalse(committed.retry_pending)
+        self.assertEqual(committed.last_task_at, now + 10)
+        self.assertEqual(
+            committed.next_due_at, now + 10 + policy.RUN_INTERVAL_SECONDS
+        )
+
+        # A post-run fresh reading now calibrates earlier than the fallback.
+        fresh_reset = now + 4000
+        synced = service.decide_due(
+            self.state_dir, provider, now + 20, fresh(fresh_reset)
+        )
+        after = service.load_state(self.state_dir, provider)
+        self.assertEqual(synced.decision, Decision.WAIT)
+        self.assertEqual(after.last_known_reset, fresh_reset)
+        self.assertEqual(
+            after.next_due_at, fresh_reset + policy.RESET_BUFFER_SECONDS
+        )
+        self.assertEqual(after.last_task_at, now + 10)
+        self.assertEqual(after.last_triggered_window, committed.last_triggered_window)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ RUN_LOCK_FILENAME = "run.lock"
 # binary would be a different lock protocol over the same file.
 SHLOCK_BIN = "/usr/bin/shlock"
 
-DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_LOCK_TIMEOUT_SECONDS = 120.0
 DEFAULT_POLL_SECONDS = 0.25
 
 

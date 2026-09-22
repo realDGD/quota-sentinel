@@ -5,6 +5,14 @@
 # so the daemon can never re-resolve the lock or mutate its own environment;
 # install-launchagents.sh performs `uv sync --locked` as the setup phase.
 # In-process this host also runs task_orchestrator (the "when" layer).
+#
+# `from __future__ import annotations` keeps the declared floor honest:
+# pyproject.toml says >=3.9, and `str | None` in an evaluated annotation is a
+# TypeError before 3.10. The daemons only ever run inside the project venv,
+# but a module that cannot even be imported on the declared minimum is a
+# claim the repository should not make.
+
+from __future__ import annotations
 
 import json
 import logging
@@ -32,12 +40,15 @@ KEYCHAIN_ACCOUNT = "quota-sentinel"
 APP_ID_SERVICE = "quota-sentinel.feishu-app-id"
 APP_SECRET_SERVICE = "quota-sentinel.feishu-app-secret"
 USER_ID_SERVICE = "quota-sentinel.feishu-user-id"
-SCRIPT_PATH = str(Path(__file__).resolve().parent / "quota-sentinel.sh")
-LOG_DIR = Path(SCRIPT_PATH).parent / "logs"
+REPO_DIR = Path(__file__).resolve().parent
+LOG_DIR = REPO_DIR / "logs"
+# /usage is the Python CLI. This daemon already runs inside the project
+# environment, so the project interpreter is the whole invocation.
+USAGE_COMMAND: tuple[str, ...] = (sys.executable, "-m", "quota_sentinel", "usage")
 AUTHORIZED_USER_ID: str | None = None
 TASK_ORCHESTRATOR: TaskOrchestrator | None = None
 
-# Outer bound for one /usage subprocess. Must stay above the shell-side
+# Outer bound for one /usage subprocess. Must stay above the scheduler-side
 # worst case including child kill grace: lock 20s + Native Codex ~15s +
 # CodexBar Codex 2x(20+10)s + Native agy ~21s + CodexBar agy (35+10)s +
 # Native opencode ~16s + CodexBar opencode (20+10)s ≈ 207s; Feishu auth 45s
@@ -168,7 +179,7 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
     def execute_usage() -> None:
         nonlocal process
         process = subprocess.Popen(
-            ["/bin/zsh", SCRIPT_PATH, "usage"],
+            list(USAGE_COMMAND),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -178,7 +189,7 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
         if process.returncode != 0:
             raise subprocess.CalledProcessError(
                 process.returncode,
-                ["/bin/zsh", SCRIPT_PATH, "usage"],
+                list(USAGE_COMMAND),
                 stderr=stderr,
             )
 
@@ -212,7 +223,7 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
 
 def submit_usage_command(sender_id: str, message_id: str) -> bool:
     # The Feishu SDK invokes handlers on its asyncio receive loop. Running the
-    # shell synchronously there would block ACKs and WebSocket heartbeats.
+    # scheduler synchronously there would block ACKs and WebSocket heartbeats.
     if not command_slot.acquire(blocking=False):
         # Only the configured recipient can reach this path, and all results go
         # to that same private chat. Let the in-flight result satisfy repeated

@@ -6,7 +6,13 @@
   <string>quota-sentinel.timer</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__REPO_DIR__/quota-sentinel.sh</string>
+    <string>/opt/homebrew/bin/uv</string>
+    <string>run</string>
+    <string>--project</string>
+    <string>__REPO_DIR__</string>
+    <string>--frozen</string>
+    <string>--no-sync</string>
+    <string>quota-sentinel</string>
     <string>wait</string>
   </array>
   <key>Disabled</key>

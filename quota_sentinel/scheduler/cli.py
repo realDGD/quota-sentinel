@@ -165,12 +165,12 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_cutover(args: argparse.Namespace) -> int:
     """INTERNAL: the ownership switch, WITHOUT acquiring run.lock.
 
-    The caller (quota-sentinel.sh) already holds it. Taking it again from
+    The caller already holds it. Taking it again from
     this process would fail against its own caller, so this verb
     deliberately does not — which is exactly why it is not an operator
     command. Operators use a lock-acquiring entry point instead:
 
-        ./quota-sentinel.sh cutover      (shell, holds run.lock)
+        quota-sentinel cutover           (public verb, takes run.lock)
         uv run quota-sentinel cutover    (public, acquires run.lock)
 
     There is no provider argument. Authority is one global fact, so the
@@ -190,7 +190,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     """INTERNAL: return ownership to legacy, WITHOUT acquiring run.lock.
 
     Same precondition and reasoning as ``scheduler-cutover``. The
-    lock-acquiring equivalents are ``./quota-sentinel.sh rollback`` and
+    lock-acquiring equivalents are ``quota-sentinel rollback`` and
     ``uv run quota-sentinel rollback``. Whole roster only, like cutover.
     """
     result = rollback_to_legacy(args.state_dir)

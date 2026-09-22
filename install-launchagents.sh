@@ -17,7 +17,7 @@
 # authority manifest. Upgrading the code, asserting ownership and moving
 # ownership are three separate actions on purpose: an operator can install,
 # watch the existing backend behave, and only then run
-# `./quota-sentinel.sh cutover`. The installer REQUIRES an existing,
+# `quota-sentinel cutover`. The installer REQUIRES an existing,
 # parseable authority manifest and refuses to guess one.
 #
 set -euo pipefail
@@ -87,7 +87,7 @@ print -r -- "synced     $REPO_DIR/.venv (uv.lock verified)"
 # label is rendered — when there is none. Creating one is an explicit
 # operator decision, never an installer side effect:
 #
-#     ./quota-sentinel.sh bootstrap-authority --assume-legacy
+#     uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy
 #
 # ORDERING: this runs BEFORE the agents are (re)started, so a deployment
 # whose owner is unknown never gets a scheduler started over it. The retired
@@ -110,7 +110,7 @@ authority_out="$(
   print -ru2 -- ""
   print -ru2 -- "  * manifest lost -> restore backend-authority.json from backup; do NOT recreate it."
   print -ru2 -- "  * confirmed pre-protocol deployment -> assert it once, explicitly:"
-  print -ru2 -- "      ./quota-sentinel.sh bootstrap-authority --assume-legacy"
+  print -ru2 -- "      uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy"
   exit 1
 }
 print -r -- "authority  $(print -r -- "$authority_out" | head -1)"

@@ -130,7 +130,7 @@ class TestFeishuListener(unittest.TestCase):
         self.assertEqual(task_name, "usage")
         self.assertEqual(trigger, "feishu:msg-history")
         mock_popen.assert_called_once_with(
-            ["/bin/zsh", feishu_listener.SCRIPT_PATH, "usage"],
+            list(feishu_listener.USAGE_COMMAND),
             stdout=feishu_listener.subprocess.PIPE,
             stderr=feishu_listener.subprocess.PIPE,
             text=True,

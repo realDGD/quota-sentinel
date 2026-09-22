@@ -33,6 +33,10 @@ touched here:
 * UV10 deployment contract: uv run --frozen --no-sync never mutates the
        environment (byte-signature of .venv/bin stable across a run) —
        runtime does not self-heal; re-sync belongs to the installer.
+* UV11 the scheduler/state import graph stays stdlib-only on the system
+       interpreter (/usr/bin/python3 -S), the class-C boundary.
+* UV12 the console script (`quota-sentinel`) is the single production
+       entrypoint, declared once in pyproject.toml.
 """
 from __future__ import annotations
 
@@ -344,15 +348,26 @@ class UvProjectTests(unittest.TestCase):
             "stdlib-only so a broken project venv cannot stop the timer",
         )
 
-    def test_uv12_shell_bridge_invocation_stays_class_c(self):
-        """Pin the exact invocation the shell uses, in the shell itself."""
-        shell = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
-        self.assertIn(
-            'PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN" -S -m quota_sentinel',
-            shell,
-            "the scheduler bridge must keep running on the system interpreter "
-            "with -S (see ARCHITECTURE.md, class C)",
+    def test_uv12_console_script_is_the_single_entrypoint(self):
+        """The console script is the only production entrypoint.
+
+        Everything that used to shell out to the retired zsh implementation
+        now goes through this one declaration, so a rename or a second
+        entrypoint would silently strand the daemons.
+        """
+        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+        scripts = re.search(
+            r"^\[project\.scripts\]\s*$((?:\s*[^\[]*)*)", pyproject, re.M
         )
+        self.assertIsNotNone(scripts, "pyproject lost [project.scripts]")
+        self.assertIn(
+            'quota-sentinel = "quota_sentinel.__main__:main"',
+            scripts.group(1),
+            "the console script must keep pointing at the CLI's main()",
+        )
+        from quota_sentinel.__main__ import main
+
+        self.assertTrue(callable(main))
 
 
 if __name__ == "__main__":

@@ -10,14 +10,15 @@ shell uses (see ``quota_sentinel.state.runlock``), so an operator cannot
 interleave a backend switch with an in-flight ``check`` or model run. The
 read verbs acquire nothing because they mutate nothing.
 
-**Internal bridge verbs** (``scheduler-*``) are what ``quota-sentinel.sh``
-calls *while it already holds run.lock*. They deliberately do NOT acquire
-the lock themselves — the shell owns it, and a second acquisition from a
-different PID would deadlock against its own caller. They are named
-INTERNAL in their help for that reason: running one by hand bypasses the
-serialization the whole design rests on. There is no way for a CLI to
-verify that a caller holds a lock it did not take, so no such check is
-faked here; the safety comes from the public surface not needing one.
+**Internal bridge verbs** (``scheduler-*``) are a lock-free internal API:
+they deliberately do NOT acquire run.lock, because their caller owns it. The
+retired zsh implementation was that caller — it held run.lock and paid one
+interpreter start-up per decision batch. Nothing in the repository calls them
+now (the Python Application drives the scheduler in-process), so they are
+retained only as a pinned internal surface: running one by hand bypasses the
+serialization the whole design rests on. There is no way for a CLI to verify
+that a caller holds a lock it did not take, so no such check is faked here;
+the safety comes from the public surface not needing one.
 
 Verbs, grouped by what they are allowed to do:
 
@@ -44,8 +45,12 @@ the caller, so this can never change what status reports.
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -54,6 +59,7 @@ from quota_sentinel.state import (
     FileStateStore,
     ProviderState,
     ResetCandidate,
+    RunLockError,
     StateStoreError,
     acquire_run_lock,
     bootstrap_legacy_authority,
@@ -74,6 +80,14 @@ def default_state_dir() -> Path:
     if env:
         return Path(env)
     return Path.home() / "Library/Application Support/Quota-Sentinel"
+
+
+# Every mode the shell accepted for card-preview / send-test-card. "both"
+# keeps its historical meaning: the original codex+antigravity pair.
+PREVIEW_MODES = (
+    "usage", "single", "codex", "antigravity", "opencode", "progress",
+    "both", "all", "auto",
+)
 
 
 def _show(value: object) -> str:
@@ -113,6 +127,20 @@ def run_authority(state_dir: Path) -> int:
     print(f"backend={authority.backend}")
     print(f"epoch={authority.epoch}")
     return 0
+
+
+def _default_lifecycle_lock_timeout() -> float:
+    """Preserve the shell's QUOTA_SENTINEL_RUN_LOCK_WAIT override."""
+    raw = os.environ.get("QUOTA_SENTINEL_RUN_LOCK_WAIT", "")
+    if not raw:
+        return runlock.DEFAULT_LOCK_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return runlock.DEFAULT_LOCK_TIMEOUT_SECONDS
+    if not math.isfinite(value) or value < 0:
+        return runlock.DEFAULT_LOCK_TIMEOUT_SECONDS
+    return value
 
 
 def _lock_timeout(args: argparse.Namespace) -> float:
@@ -262,6 +290,163 @@ def run_migrate(state_dir: Path, providers: Optional[List[str]]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Runtime verbs: the operational surface the shell used to own.
+#
+# Each one builds the REAL runtime adapters through quota_sentinel.runtime
+# .factory and is imported lazily: the scheduler bridge (`scheduler-*`) runs
+# on the system interpreter on the hot path, and dragging urllib, subprocess
+# probing and card rendering into that import graph would tax every tick for
+# nothing (pinned by tests/uv-project-regression.py UV11).
+# ---------------------------------------------------------------------------
+
+def _runtime(state_dir: Path):
+    from quota_sentinel.runtime import factory, runlog
+    runlog.configure()
+    return factory
+
+
+def _run_runtime(state_dir: Path, action, verb: str) -> int:
+    """Run one runtime verb, turning refusals into the shell's exit codes.
+
+    A missing credential (`NotReadyError`) and a failed delivery
+    (`FeishuError`) are both operator-facing refusals: the shell `die`d on
+    both, so they exit 1 with one clear line instead of a traceback.
+
+    Every command also brackets itself in the run log, as the shell's
+    `main()` did: "command: <verb> (pid N)" and "command: finished (Ns)" are
+    how an operator tells a quiet tick from a scheduler that stopped.
+    """
+    factory = _runtime(state_dir)
+    from quota_sentinel.runtime.feishu import FeishuError
+    cli_log = logging.getLogger("quota_sentinel.cli")
+    started = time.monotonic()
+    cli_log.info("command: %s (pid %d)", verb, os.getpid())
+    try:
+        action(factory)
+    except (factory.NotReadyError, FeishuError) as exc:
+        print(f"quota_sentinel: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        cli_log.info("command: finished (%ds)", int(time.monotonic() - started))
+    return 0
+
+
+def run_check(state_dir: Path, args: argparse.Namespace) -> int:
+    return _run_runtime(
+        state_dir, lambda factory: factory.create_application(state_dir).check(),
+        "check",
+    )
+
+
+def run_wait(state_dir: Path, args: argparse.Namespace) -> int:
+    def watch(factory) -> None:
+        try:
+            factory.create_application(state_dir).wait()
+        except KeyboardInterrupt:
+            pass
+
+    return _run_runtime(state_dir, watch, "wait")
+
+
+def run_run(state_dir: Path, args: argparse.Namespace) -> int:
+    providers = () if args.target in ("all", "both") else (args.target,)
+    results: dict = {}
+
+    def execute(factory) -> None:
+        results.update(factory.create_application(state_dir).run(providers))
+
+    factory = _runtime(state_dir)
+    cli_log = logging.getLogger("quota_sentinel.cli")
+    started = time.monotonic()
+    cli_log.info("command: run %s (pid %d)", args.target, os.getpid())
+    try:
+        execute(factory)
+    except (factory.NotReadyError,) as exc:
+        print(f"quota_sentinel: {exc}", file=sys.stderr)
+        return 1
+    except RunLockError:
+        # The shell's `die "Another model run is already in progress"`.
+        print(
+            "quota_sentinel: another model run is already in progress",
+            file=sys.stderr,
+        )
+        return 1
+    except FeishuError as exc:
+        print(f"quota_sentinel: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        cli_log.info("command: finished (%ds)", int(time.monotonic() - started))
+    failed = sorted(p for p, result in results.items() if result != "发送成功")
+    if failed:
+        # The attempts happened and were reported; the non-zero code still
+        # tells a calling watchdog that not every provider succeeded.
+        print(f"quota_sentinel: failed providers: {', '.join(failed)}",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def run_usage(state_dir: Path, args: argparse.Namespace) -> int:
+    return _run_runtime(
+        state_dir, lambda factory: factory.create_application(state_dir).usage(),
+        "usage",
+    )
+
+
+def run_status(state_dir: Path, args: argparse.Namespace) -> int:
+    factory = _runtime(state_dir)
+    problems = factory.readiness_problems(state_dir)
+    if problems:
+        print("quota_sentinel: not ready: " + "; ".join(problems), file=sys.stderr)
+        return 1
+    for line in factory.status_lines(state_dir):
+        print(line)
+    return 0
+
+
+def run_card_preview(state_dir: Path, args: argparse.Namespace) -> int:
+    """Render one card offline. Never sends, never needs credentials."""
+    factory = _runtime(state_dir)
+    now = int(time.time())
+    payload = factory.preview_payload(
+        args.mode, user_id="mock-user-id",
+        request_uuid="preview-%s-%d" % (args.mode, now), now=now,
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_send_test_card(state_dir: Path, args: argparse.Namespace) -> int:
+    factory = _runtime(state_dir)
+    now = int(time.time())
+
+    def deliver(factory_module) -> None:
+        payload = factory_module.preview_payload(
+            args.mode, user_id=factory_module.notifier_user_id(),
+            request_uuid="test-%s-%d" % (args.mode, now), now=now,
+        )
+        factory_module.send_payload(payload)
+
+    return _run_runtime(state_dir, deliver, "send-test-card")
+
+
+def run_discover_feishu_user(state_dir: Path, args: argparse.Namespace) -> int:
+    from quota_sentinel.runtime.feishu import FeishuClient, FeishuError
+    if not args.identifier:
+        print("quota_sentinel: an email address or mobile number is required",
+              file=sys.stderr)
+        return 2
+    _runtime(state_dir)
+    try:
+        user_id = FeishuClient().discover_user(args.identifier)
+    except (FeishuError, ValueError) as exc:
+        print(f"quota_sentinel: {exc}", file=sys.stderr)
+        return 1
+    print(f"Configured Feishu user ID: {user_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Stable product prog: identical help text whether invoked as the
     # console script or `python -m quota_sentinel` (parity is pinned by
@@ -298,7 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name, help=help_text)
         command.add_argument(
             "--lock-timeout", type=float,
-            default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
+            default=_default_lifecycle_lock_timeout(),
             help="seconds to wait for an in-flight scheduler run "
                  "(default: %(default)s)",
         )
@@ -319,7 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--lock-timeout", type=float,
-        default=runlock.DEFAULT_LOCK_TIMEOUT_SECONDS,
+        default=_default_lifecycle_lock_timeout(),
         help="seconds to wait for an in-flight scheduler run "
              "(default: %(default)s)",
     )
@@ -348,6 +533,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("providers", nargs="*", default=None,
                          help="override the default provider roster")
+    # The operational surface. These are the verbs the daemons, the
+    # LaunchAgents and the operator use; none of them runs a shell.
+    for name, help_text, handler in (
+        ("check",
+         "one scheduler tick: repay watchdog debt first, then run whatever is due",
+         run_check),
+        ("wait",
+         "watch deadlines and run the scheduler as each one matures",
+         run_wait),
+        ("usage",
+         "render and send the /usage card for the whole roster",
+         run_usage),
+        ("status",
+         "report readiness and the next due time for every provider",
+         run_status),
+    ):
+        command = sub.add_parser(name, help=help_text)
+        command.set_defaults(
+            handler=lambda a, h=handler: h(a.state_dir, a)
+        )
+    run_now = sub.add_parser(
+        "run",
+        help="run providers now (default: the whole roster); exits 1 when any "
+             "selected provider fails, 0 only on full success",
+    )
+    run_now.add_argument(
+        "target", nargs="?", default="all",
+        choices=("codex", "antigravity", "opencode", "all", "both"),
+        help="a single provider, or the whole roster (default: %(default)s)",
+    )
+    run_now.set_defaults(handler=lambda a: run_run(a.state_dir, a))
+    preview = sub.add_parser(
+        "card-preview",
+        help="print the card for a mode without sending it or reading credentials",
+    )
+    preview.add_argument("mode", nargs="?", default="both", choices=PREVIEW_MODES)
+    preview.set_defaults(handler=lambda a: run_card_preview(a.state_dir, a))
+    test_card = sub.add_parser(
+        "send-test-card",
+        help="send one test card for a mode to the configured Feishu user",
+    )
+    test_card.add_argument("mode", nargs="?", default="both", choices=PREVIEW_MODES)
+    test_card.set_defaults(handler=lambda a: run_send_test_card(a.state_dir, a))
+    discover = sub.add_parser(
+        "discover-feishu-user",
+        help="resolve a personal email or mobile to a Feishu user ID and store it",
+    )
+    discover.add_argument("identifier", nargs="?", default="")
+    discover.set_defaults(
+        handler=lambda a: run_discover_feishu_user(a.state_dir, a)
+    )
     # Scheduler-domain verbs (Phase 3C bridge). Registered from their own
     # module so the parser stays a table of contents, not a second API.
     scheduler_cli.register(sub)

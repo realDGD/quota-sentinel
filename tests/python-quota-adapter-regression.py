@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Behavioural regression suite for quota_sentinel.quota.
 
-The Python quota layer is a literal transcription of the jq programs in
-`quota-sentinel.sh`, so this suite locks down both directions:
+The Python quota layer is a literal transcription of the jq programs the
+retired zsh implementation used to carry, so this suite locks down both
+directions:
 
 * the accepted cases (the three real fixtures plus synthetic CodexBar
   payloads) produce exactly the documented shape, with `monthly` present only
@@ -15,26 +16,35 @@ The Python quota layer is a literal transcription of the jq programs in
 * `renormalize_document` performs the epoch conversion at the read boundary
   (numeric, `...Z`, fractional `...123Z`, explicit offsets) and refuses a
   document whose fiveHour/weekly reset is null.
+* the two live native-tier helpers (`antigravity_usage.py`,
+  `opencode_usage.py`) normalise and reject their vendor payloads exactly as
+  pinned, and their bounded-subprocess / credential-path contracts hold.
 
-`JqParityTests` re-extracts the jq programs from the shell script and diffs
-the real jq output against `as_document()` for the golden payloads. It is
-skipped when jq or the script is unavailable, but when it runs it is the
-arbiter of "exactly what the jq produces".
+`JqParityTests` diffs real jq output against `as_document()` for the golden
+payloads, using the programs embedded below as the frozen reference. It is
+skipped when jq is unavailable, but when it runs it is the arbiter of
+"exactly what the jq produced".
 """
 from __future__ import annotations
 
+import ast
+import copy
 import json
 import os
-import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import antigravity_usage as antigravity_quota
+import opencode_usage as opencode_quota
 
 from quota_sentinel.quota import (
     ADAPTERS,
@@ -64,7 +74,6 @@ from quota_sentinel.quota import normalize as normalize_module
 
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
-SHELL_PATH = REPO_ROOT / "quota-sentinel.sh"
 
 # Frozen `now` for the CodexBar live programs, which stamp `capturedAt`.
 NOW = 1788000000
@@ -1125,11 +1134,11 @@ class CachedTierTests(unittest.TestCase):
 
 
 # The seven jq programs this package transcribes, copied byte-for-byte from
-# `quota-sentinel.sh` at the HEAD revision (the `normalize_*_quota` functions
-# and `renormalise_quota_file`). They are embedded so the parity evidence keeps
-# pinning the transcription even after the shell stops carrying jq programs
-# and delegates to this package; `test_shell_programs_have_not_drifted`
-# re-extracts them from the script whenever it still has them.
+# the retired zsh implementation at the branch point (the `normalize_*_quota`
+# functions and `renormalise_quota_file`). They are embedded as the frozen
+# parity fixture: `JqParityTests` runs them under the real jq binary and diffs
+# the output against `as_document()`, so the transcription stays pinned even
+# though the shell no longer exists to be re-extracted from.
 JQ_PROGRAMS = {
     "normalize_pi_codex": r"""
     .headers as $h |
@@ -1275,16 +1284,6 @@ JQ_PROGRAMS = {
   """,
 }
 
-SHELL_FUNCTIONS = {
-    "normalize_pi_codex": "normalize_pi_codex_quota",
-    "normalize_pi_antigravity": "normalize_pi_antigravity_quota",
-    "normalize_pi_opencode": "normalize_pi_opencode_quota",
-    "normalize_codexbar_codex": "normalize_codexbar_codex_quota",
-    "normalize_codexbar_antigravity": "normalize_codexbar_antigravity_quota",
-    "normalize_codexbar_opencode": "normalize_codexbar_opencode_quota",
-    "renormalise_quota_file": "renormalise_quota_file",
-}
-
 
 def find_jq():
     found = shutil.which("jq")
@@ -1299,45 +1298,15 @@ def find_jq():
 JQ_BIN = find_jq()
 
 
-def extract_jq_programs():
-    """Pull each normaliser's jq program out of quota-sentinel.sh."""
-    try:
-        text = SHELL_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    programs = {}
-    for key, shell_name in SHELL_FUNCTIONS.items():
-        body = re.search(
-            r"^%s\(\) \{(.*?)^\}" % re.escape(shell_name), text, re.S | re.M
-        )
-        if body is None:
-            return {}
-        program = re.search(
-            r'"\$JQ_BIN" -e \'(.*?)\'\s+"\$input"', body.group(1), re.S
-        )
-        if program is None:
-            return {}
-        programs[key] = program.group(1)
-    return programs
-
-
 @unittest.skipUnless(JQ_BIN, "jq unavailable; jq parity not checked")
 class JqParityTests(unittest.TestCase):
     """Diff the transcription against the real jq programs.
 
-    The Pi comparisons run the shell's own `renormalise_quota_file` program
-    after the normaliser, because `normalize_pi_*` models the composed
-    `normalize | renormalise` path the shell feeds into effective quota (and
+    The Pi comparisons run the retired shell's `renormalise_quota_file`
+    program after the normaliser, because `normalize_pi_*` models the composed
+    `normalize | renormalise` path the shell fed into effective quota (and
     the typed `captured_at` field needs the epoch conversion).
     """
-
-    def test_shell_programs_have_not_drifted(self):
-        """If quota-sentinel.sh still carries the jq programs, they must be
-        the ones this package transcribes."""
-        live = extract_jq_programs()
-        if not live:
-            self.skipTest("quota-sentinel.sh no longer carries the jq programs")
-        self.assertEqual(live, JQ_PROGRAMS)
 
     def run_jq(self, key, payload):
         prefix = ""
@@ -1473,6 +1442,556 @@ class JqParityTests(unittest.TestCase):
                 self.assertTrue(code != 0 or not output.strip())
                 with self.assertRaises(QuotaNormalizationError):
                     renormalize_document(document)
+
+
+# ---------------------------------------------------------------------------
+# Native tier-1 helpers.
+#
+# `antigravity_usage.py` and `opencode_usage.py` are LIVE production code:
+# `quota_sentinel.runtime.quota_probe` executes them as external helpers and
+# parses their stdout with `parse_document`, and it regex-extracts the
+# `antigravity_usage: <reason>` / `opencode_usage: <reason>` stderr prefix.
+# Ported verbatim from the retired tests/antigravity-native-regression.py and
+# tests/opencode-native-regression.py (only their shell-tier tests, which
+# sourced the deleted zsh implementation, are gone); the probe suite stubs
+# these helpers out, so this is the only place their internals are pinned.
+# ---------------------------------------------------------------------------
+
+def agy_report():
+    return {
+        "status": "SUCCESS", "num_turns": 0,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "command": {"name": "usage", "data": {"groups": [
+            {"name": "Claude and GPT models", "buckets": []},
+            {"name": "Gemini Models", "buckets": [
+                {"window": "5h", "remaining_fraction": 0.755,
+                 "reset_time": "2026-09-16T13:08:03Z"},
+                {"window": "weekly", "remaining_fraction": 0.9,
+                 "reset_time": "2026-09-23T08:08:03Z"},
+            ]},
+        ]}},
+    }
+
+
+class AntigravityNativeHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def binary(self, body, name="agy"):
+        path = self.directory / name
+        path.write_text(f"#!{sys.executable}\n" + body)
+        path.chmod(0o700)
+        return path
+
+    def agy(self, version="1.2.4"):
+        return self.binary(
+            "import json,os,sys\n"
+            f"if sys.argv[1:]==['--version']: print({version!r})\n"
+            "else:\n"
+            " assert sys.argv[1:]==['-p','/usage','--output-format','json']\n"
+            " assert not os.listdir('.')\n"
+            " assert os.stat('.').st_mode & 0o777 == 0o700\n"
+            f" print({json.dumps(agy_report())!r})\n"
+        )
+
+    def test_gemini_both_windows_fresh_absolute_reset_and_rounding(self):
+        result = antigravity_quota.normalize_report(agy_report(), 1789530000)
+        self.assertEqual(result["source"], "Native · agy /usage")
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["capturedAt"], 1789530000)
+        self.assertEqual(result["fiveHour"]["remainingPercent"], 76)
+        self.assertEqual(result["weekly"]["remainingPercent"], 90)
+        self.assertEqual(result["fiveHour"]["resetAt"], 1789564083)
+        self.assertEqual(
+            antigravity_quota.normalize_report(
+                agy_report(), 1789530900)["fiveHour"], result["fiveHour"]
+        )
+
+    def test_fraction_endpoints_and_unknown_values(self):
+        for fraction, expected in [(0, 0), (1, 100)]:
+            data = agy_report()
+            data["command"]["data"]["groups"][1]["buckets"][0][
+                "remaining_fraction"] = fraction
+            self.assertEqual(
+                antigravity_quota.normalize_report(data, 1)["fiveHour"][
+                    "remainingPercent"],
+                expected,
+            )
+        for value in (None, True, "0.5", -0.1, 1.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                data = agy_report()
+                data["command"]["data"]["groups"][1]["buckets"][0][
+                    "remaining_fraction"] = value
+                with self.assertRaises(antigravity_quota.QuotaError):
+                    antigravity_quota.normalize_report(data, 1)
+
+    def test_missing_disabled_unknown_and_duplicate_windows_rejected(self):
+        for mutation in ("missing", "enabled", "usage_known", "duplicate"):
+            data = agy_report()
+            buckets = data["command"]["data"]["groups"][1]["buckets"]
+            if mutation == "missing":
+                buckets.pop()
+            elif mutation == "duplicate":
+                buckets.append(copy.deepcopy(buckets[0]))
+            else:
+                buckets[0][mutation] = False
+            with self.assertRaises(antigravity_quota.QuotaError):
+                antigravity_quota.normalize_report(data, 1)
+        data = agy_report()
+        data["command"]["data"]["groups"][1]["enabled"] = False
+        with self.assertRaises(antigravity_quota.QuotaError):
+            antigravity_quota.normalize_report(data, 1)
+
+    def test_reset_missing_invalid_or_timezone_naive_rejected(self):
+        for reset in (
+            None, "garbage", "2026-09-16T13:08:03", "1960-01-01T00:00:00Z"
+        ):
+            data = agy_report()
+            data["command"]["data"]["groups"][1]["buckets"][0][
+                "reset_time"] = reset
+            with self.assertRaises(antigravity_quota.QuotaError):
+                antigravity_quota.normalize_report(data, 1)
+
+    def test_wrong_command_status_group_or_inference_rejected(self):
+        variations = []
+        for key, value in (("status", "ERROR"), ("num_turns", 1),
+                           ("num_turns", False), ("error", "secret")):
+            data = agy_report(); data[key] = value; variations.append(data)
+        data = agy_report(); data["command"]["name"] = "model"
+        variations.append(data)
+        data = agy_report(); data["command"]["data"]["groups"].pop()
+        variations.append(data)
+        data = agy_report()
+        data["command"]["data"]["groups"].append(
+            copy.deepcopy(data["command"]["data"]["groups"][1])
+        )
+        variations.append(data)
+        for field in ("input_tokens", "output_tokens", "total_tokens",
+                      "thinking_tokens", "cache_read_tokens"):
+            data = agy_report(); data["usage"][field] = 1; variations.append(data)
+        data = agy_report(); del data["usage"]["total_tokens"]
+        variations.append(data)
+        for data in variations:
+            with self.assertRaises(antigravity_quota.QuotaError):
+                antigravity_quota.normalize_report(data, 1)
+
+    def test_supported_binary_only_builtin_command_private_empty_cwd(self):
+        self.assertTrue(antigravity_quota.fetch_quota(self.agy(), 3)["fresh"])
+
+    def test_old_version_never_invokes_print_or_model(self):
+        marker = self.directory / "unexpected-call"
+        binary = self.binary(
+            "import pathlib,sys\n"
+            "if sys.argv[1:]==['--version']: print('1.1.10')\n"
+            "else: pathlib.Path(" + repr(str(marker)) + ").touch()\n"
+        )
+        with self.assertRaisesRegex(
+            antigravity_quota.QuotaError, "unsupported_agy_version"
+        ):
+            antigravity_quota.fetch_quota(binary, 3)
+        self.assertFalse(marker.exists())
+        self.assertTrue(antigravity_quota.version_supported(b"1.1.11\n"))
+        self.assertFalse(antigravity_quota.version_supported(b"unknown"))
+
+    def test_output_and_nonzero_exit_are_bounded(self):
+        with self.assertRaisesRegex(
+            antigravity_quota.QuotaError, "output_too_large"
+        ):
+            antigravity_quota.run_bounded(
+                [sys.executable, "-c", "print('x'*1000)"], self.directory, 2, 100
+            )
+        with self.assertRaisesRegex(
+            antigravity_quota.QuotaError, "command_failed"
+        ):
+            antigravity_quota.run_bounded(
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                self.directory, 2, 100,
+            )
+
+    def test_timeout_reaps_child_does_not_touch_external_process(self):
+        # The child records its OWN pid (the process-group leader) before it
+        # spawns a descendant, so the reaping assertion does not depend on the
+        # grandchild winning a scheduling race against the timeout.
+        pid_file = self.directory / "child.pid"
+        body = (
+            "import os,pathlib,subprocess,sys,time\n"
+            "pathlib.Path(" + repr(str(pid_file)) + ").write_text(str(os.getpid()))\n"
+            "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+            "time.sleep(60)\n"
+        )
+        binary = self.binary(body)
+        external = subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep(60)"]
+        )
+        started = time.monotonic()
+        try:
+            try:
+                antigravity_quota.run_bounded(
+                    [str(binary)], self.directory, 2.0, 100
+                )
+                self.fail("run_bounded did not time out")
+            except antigravity_quota.QuotaError as exc:
+                self.assertIn("command_timeout", str(exc))
+            except PermissionError:
+                # macOS can recycle the process-group id inside the helper's
+                # SIGTERM -> SIGKILL window, which surfaces as EPERM from
+                # killpg. The reaping assertions below are the property this
+                # test exists for.
+                pass
+            self.assertLess(time.monotonic() - started, 6)
+            time.sleep(0.1)
+            self.assertTrue(pid_file.exists(), "the child never recorded its pid")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 0)
+            self.assertIsNone(external.poll())
+        finally:
+            external.terminate(); external.wait()
+
+    def test_cli_logs_fixed_reason_not_subprocess_secret(self):
+        binary = self.binary(
+            "import sys\n"
+            "if sys.argv[1:]==['--version']: print('1.2.4')\n"
+            "else: print('app_secret=TOPSECRET',file=sys.stderr);"
+            " raise SystemExit(7)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "antigravity_usage.py"),
+             "--agy", str(binary)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("command_failed", result.stderr)
+        self.assertNotIn("TOPSECRET", result.stderr)
+
+    def test_cli_sigterm_cleans_up_owned_quota_process(self):
+        marker = self.directory / "quota.pid"
+        binary = self.binary(
+            "import os,pathlib,sys,time\n"
+            "if sys.argv[1:]==['--version']: print('1.2.4')\n"
+            "else:\n"
+            " pathlib.Path(" + repr(str(marker)) + ").write_text("
+            "str(os.getpid()))\n"
+            " time.sleep(60)\n"
+        )
+        helper = subprocess.Popen(
+            [sys.executable, "-B", str(REPO_ROOT / "antigravity_usage.py"),
+             "--agy", str(binary)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            helper.send_signal(signal.SIGTERM)
+            out, err = helper.communicate(timeout=3)
+            self.assertEqual(helper.returncode, 1)
+            self.assertEqual(out, "")
+            self.assertIn("command_cancelled", err)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(marker.read_text()), 0)
+        finally:
+            if helper.poll() is None:
+                helper.terminate(); helper.wait(timeout=3)
+
+
+# Real values observed from https://opencode.ai/zen/go/v1/usage: percent is the
+# USED fraction, so remaining is its complement.
+OCG_ROLLING_RESET_ISO = "2026-09-17T08:18:58.000Z"
+OCG_ROLLING_RESET_EPOCH = 1789633138
+OCG_WEEKLY_RESET_ISO = "2026-09-21T00:00:00.000Z"
+OCG_WEEKLY_RESET_EPOCH = 1789948800
+OCG_MONTHLY_RESET_ISO = "2026-10-17T03:04:30.000Z"
+OCG_MONTHLY_RESET_EPOCH = 1792206270
+
+
+def ocg_report():
+    return {"usage": {
+        "rolling": {"status": "ok", "percent": 12,
+                    "resetsAt": OCG_ROLLING_RESET_ISO},
+        "weekly": {"status": "ok", "percent": 4,
+                   "resetsAt": OCG_WEEKLY_RESET_ISO},
+        "monthly": {"status": "ok", "percent": 2,
+                    "resetsAt": OCG_MONTHLY_RESET_ISO},
+    }}
+
+
+class OpencodeNativeHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def script(self, body, name):
+        path = self.directory / name
+        path.write_text(f"#!{sys.executable}\n" + body)
+        path.chmod(0o700)
+        return path
+
+    def curl(self, body=None, status="200", name="curl"):
+        payload = json.dumps(ocg_report() if body is None else body)
+        # Mirror the real invocation: body, then --write-out's "\n<status>".
+        return self.script(
+            "import json,pathlib,sys\n"
+            "pathlib.Path(sys.argv[0] + '.argv').write_text("
+            "json.dumps(sys.argv[1:]))\n"
+            "pathlib.Path(sys.argv[0] + '.stdin').write_text(sys.stdin.read())\n"
+            f"sys.stdout.write({payload!r} + '\\n' + {status!r})\n",
+            name,
+        )
+
+    def test_used_percent_becomes_remaining_in_all_three_windows(self):
+        result = opencode_quota.normalize_report(ocg_report(), 1789630000)
+        self.assertEqual(result["source"], "Native · opencode-go /usage")
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["capturedAt"], 1789630000)
+        self.assertEqual(result["fiveHour"], {
+            "remainingPercent": 88, "resetAt": OCG_ROLLING_RESET_EPOCH})
+        self.assertEqual(result["weekly"], {
+            "remainingPercent": 96, "resetAt": OCG_WEEKLY_RESET_EPOCH})
+        self.assertEqual(result["monthly"], {
+            "remainingPercent": 98, "resetAt": OCG_MONTHLY_RESET_EPOCH})
+
+    def test_monthly_is_optional_and_a_bad_one_is_dropped_not_fatal(self):
+        data = ocg_report()
+        del data["usage"]["monthly"]
+        self.assertNotIn("monthly", opencode_quota.normalize_report(data, 1))
+        for monthly in (
+            {"status": "ok", "percent": None, "resetsAt": OCG_MONTHLY_RESET_ISO},
+            {"status": "ok", "percent": 2, "resetsAt": "garbage"},
+            "not-an-object",
+        ):
+            data = ocg_report()
+            data["usage"]["monthly"] = monthly
+            with self.subTest(monthly=monthly):
+                self.assertNotIn(
+                    "monthly", opencode_quota.normalize_report(data, 1)
+                )
+
+    def test_percent_endpoints_and_rate_limited_status(self):
+        for percent, expected in ((0, 100), (100, 0)):
+            data = ocg_report()
+            for window in data["usage"].values():
+                window["percent"] = percent
+            self.assertEqual(
+                opencode_quota.normalize_report(data, 1)["fiveHour"][
+                    "remainingPercent"],
+                expected,
+            )
+        data = ocg_report()
+        data["usage"]["rolling"]["status"] = "rate-limited"
+        self.assertEqual(
+            opencode_quota.normalize_report(data, 1)["fiveHour"][
+                "remainingPercent"],
+            88,
+        )
+
+    def test_required_window_missing_or_malformed_rejected(self):
+        for api_name in ("rolling", "weekly"):
+            data = ocg_report()
+            del data["usage"][api_name]
+            with self.assertRaises(opencode_quota.QuotaError):
+                opencode_quota.normalize_report(data, 1)
+        variations = []
+        for bad_status in ("", None, "unknown", 1):
+            data = ocg_report()
+            data["usage"]["rolling"]["status"] = bad_status
+            variations.append(data)
+        for bad_percent in (None, True, "12", -1, 101, float("nan"),
+                            float("inf")):
+            data = ocg_report()
+            data["usage"]["rolling"]["percent"] = bad_percent
+            variations.append(data)
+        for bad_reset in (None, "garbage", "2026-09-17T08:18:58",
+                          "1960-01-01T00:00:00Z", 0):
+            data = ocg_report()
+            data["usage"]["weekly"]["resetsAt"] = bad_reset
+            variations.append(data)
+        data = ocg_report(); variations.append({"usage": "nope"})
+        data = ocg_report(); del data["usage"]["rolling"]["resetsAt"]
+        variations.append(data)
+        for data in variations:
+            with self.subTest(data=data):
+                with self.assertRaises(opencode_quota.QuotaError):
+                    opencode_quota.normalize_report(data, 1)
+
+    def test_output_and_nonzero_exit_are_bounded(self):
+        with self.assertRaisesRegex(opencode_quota.QuotaError, "output_too_large"):
+            opencode_quota.run_bounded(
+                [sys.executable, "-c", "print('x'*1000)"], self.directory, 2, 100
+            )
+        with self.assertRaisesRegex(opencode_quota.QuotaError, "command_failed"):
+            opencode_quota.run_bounded(
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                self.directory, 2, 100,
+            )
+
+    def test_timeout_reaps_child_does_not_touch_external_process(self):
+        # The child records its OWN pid (the process-group leader) before it
+        # spawns a descendant, so the reaping assertion does not depend on the
+        # grandchild winning a scheduling race against the timeout.
+        pid_file = self.directory / "child.pid"
+        body = (
+            "import os,pathlib,subprocess,sys,time\n"
+            "pathlib.Path(" + repr(str(pid_file)) + ").write_text(str(os.getpid()))\n"
+            "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+            "time.sleep(60)\n"
+        )
+        binary = self.script(body, "slow")
+        external = subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep(60)"]
+        )
+        started = time.monotonic()
+        try:
+            try:
+                opencode_quota.run_bounded([str(binary)], self.directory, 2.0, 100)
+                self.fail("run_bounded did not time out")
+            except opencode_quota.QuotaError as exc:
+                self.assertIn("command_timeout", str(exc))
+            except PermissionError:
+                # macOS can recycle the process-group id inside the helper's
+                # SIGTERM -> SIGKILL window, which surfaces as EPERM from
+                # killpg. The reaping assertions below are the property this
+                # test exists for.
+                pass
+            self.assertLess(time.monotonic() - started, 6)
+            time.sleep(0.1)
+            self.assertTrue(pid_file.exists(), "the child never recorded its pid")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 0)
+            self.assertIsNone(external.poll())
+        finally:
+            external.terminate(); external.wait()
+
+    def test_key_travels_on_stdin_into_a_curl_header_config(self):
+        curl = self.curl()
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py"),
+             "--curl", str(curl)],
+            input="sk-secret-value\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["fiveHour"]["remainingPercent"], 88
+        )
+        # The key reaches curl only as a stdin config header, never as an
+        # argument: argv must not carry it.
+        argv = json.loads(Path(str(curl) + ".argv").read_text())
+        self.assertIn("--config", argv)
+        self.assertNotIn("sk-secret-value", " ".join(argv))
+        config = Path(str(curl) + ".stdin").read_text()
+        self.assertIn("Authorization: Bearer sk-secret-value", config)
+
+    def test_http_status_maps_to_fixed_reason_codes(self):
+        for status, reason in (("401", "http_401"), ("403", "http_403"),
+                               ("500", "http_error")):
+            curl = self.curl(
+                body={"type": "error"}, status=status, name=f"curl{status}"
+            )
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py"),
+                     "--curl", str(curl)],
+                    input="sk-whatever\n", capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+
+    def test_missing_key_and_missing_curl_fail_closed(self):
+        curl = self.curl()
+        for args, stdin, reason in (
+            (["--curl", str(curl)], "\n", "auth_missing"),
+            (["--curl", str(self.directory / "absent")], "sk-x\n",
+             "curl_unavailable"),
+        ):
+            with self.subTest(reason=reason):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py")]
+                    + args,
+                    input=stdin, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+
+    def test_cli_logs_fixed_reason_not_response_body_secrets(self):
+        curl = self.script(
+            "import sys\nsys.stdout.write('app_secret=TOPSECRET\\n401')\n",
+            "curlLeaky",
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py"),
+             "--curl", str(curl)],
+            input="sk-real-key\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("http_401", result.stderr)
+        self.assertNotIn("TOPSECRET", result.stderr)
+        self.assertNotIn("sk-real-key", result.stderr)
+
+    def test_invalid_json_body_is_rejected(self):
+        curl = self.script("import sys\nsys.stdout.write('not json\\n200')\n",
+                           "curlBadJson")
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py"),
+             "--curl", str(curl)],
+            input="sk-x\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid_report", result.stderr)
+
+    def test_cli_sigterm_cleans_up_owned_quota_process(self):
+        marker = self.directory / "quota.pid"
+        curl = self.script(
+            "import os,pathlib,sys,time\n"
+            "pathlib.Path(" + repr(str(marker)) + ").write_text(str(os.getpid()))\n"
+            "time.sleep(60)\n",
+            "curlSlow",
+        )
+        helper = subprocess.Popen(
+            [sys.executable, "-B", str(REPO_ROOT / "opencode_usage.py"),
+             "--curl", str(curl)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            helper.stdin.write("sk-key\n")
+            helper.stdin.flush()
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            helper.send_signal(signal.SIGTERM)
+            out, err = helper.communicate(timeout=3)
+            self.assertEqual(helper.returncode, 1)
+            self.assertEqual(out, "")
+            self.assertIn("command_cancelled", err)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(marker.read_text()), 0)
+        finally:
+            if helper.poll() is None:
+                helper.terminate(); helper.wait(timeout=3)
+
+    def test_outer_budget_covers_three_providers_and_delivery(self):
+        tree = ast.parse((REPO_ROOT / "feishu_listener.py").read_text())
+        bound = next(
+            node.value.value for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "USAGE_COMMAND_TIMEOUT_SECONDS"
+                    for target in node.targets)
+        )
+        acquisition = 20 + 15 + 2 * (20 + 10) + 20 + 1 + 35 + 10 + 16 + (20 + 10)
+        delivery = 45 + 3 * 45 + 3
+        self.assertGreater(bound, acquisition + delivery)
 
 
 if __name__ == "__main__":

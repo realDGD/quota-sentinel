@@ -3,8 +3,8 @@
 
 This module deliberately owns *when* the scheduler is invoked, not *how*
 provider deadlines are calculated. Deadline policy lives in
-``quota_sentinel.scheduler``; the shell drives model execution and quota
-fetches. SQLite provides durable run history and crash visibility, and the
+``quota_sentinel.scheduler``; the Python CLI drives model execution and
+quota fetches. SQLite provides durable run history and crash visibility, and the
 scheduler's authoritative state is read through ``quota_sentinel.state``'s
 backend router — which is what keeps this module from computing wake times
 off a retired backend after a cutover.
@@ -17,12 +17,13 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, Sequence, TypeVar
 
 from quota_sentinel.state import AuthoritativeStateStore, StateStoreError
 
@@ -36,7 +37,15 @@ DEFAULT_STATE_DIR = Path(
     )
 )
 DEFAULT_DB_PATH = DEFAULT_STATE_DIR / "task-orchestrator.sqlite3"
-DEFAULT_SCRIPT_PATH = Path(__file__).resolve().parent / "quota-sentinel.sh"
+REPO_DIR = Path(__file__).resolve().parent
+# The scheduler is the Python CLI. This process already runs INSIDE the
+# project environment (the LaunchAgent starts the listener through
+# `uv run --frozen --no-sync`), so the cheapest correct invocation is the
+# same interpreter with `-m`: no uv start-up, no lock re-resolution, and no
+# dependence on PATH inside launchd.
+DEFAULT_SCHEDULER_COMMAND: tuple[str, ...] = (
+    sys.executable, "-m", "quota_sentinel", "check",
+)
 
 WATCHDOG_INTERVAL_SECONDS = 900
 DEADLINE_BACKOFF_SECONDS = 60
@@ -438,7 +447,7 @@ class TaskOrchestrator:
     def __init__(
         self,
         *,
-        script_path: Path = DEFAULT_SCRIPT_PATH,
+        scheduler_command: Sequence[str] = DEFAULT_SCHEDULER_COMMAND,
         schedule_state: ScheduleState | None = None,
         store: TaskStore | None = None,
         runner: SubprocessRunner | None = None,
@@ -450,7 +459,7 @@ class TaskOrchestrator:
         check_timeout: float = CHECK_COMMAND_TIMEOUT_SECONDS,
         task_logger: logging.Logger | None = None,
     ) -> None:
-        self.script_path = Path(script_path)
+        self.scheduler_command = tuple(scheduler_command)
         self.schedule_state = schedule_state or ScheduleState()
         self.store = store or TaskStore()
         self.runner = runner or SubprocessRunner()
@@ -480,9 +489,7 @@ class TaskOrchestrator:
             "orchestrator check start trigger=%s scheduled_for=%s", trigger, scheduled_for
         )
         try:
-            result = self.runner.run(
-                ("/bin/zsh", str(self.script_path), "check"), self.check_timeout
-            )
+            result = self.runner.run(self.scheduler_command, self.check_timeout)
             status = "succeeded" if result.exit_code == 0 else "failed"
             self.store.finish_run(
                 run_id,

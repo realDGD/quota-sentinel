@@ -7,14 +7,15 @@ commit. Reading the directory structure is not evidence; these checks read
 the actual source.
 
   AR1  exactly ONE authority → backend mapping exists
-  AR2  legacy slot accessors are guarded, and no production scheduler path
-       reaches one
-  AR3  the shell holds no scheduler deadline arithmetic or policy literal
+  AR2  (retired with the zsh implementation: the guarded legacy accessors
+       and the shell's scheduler path no longer exist to audit)
+  AR3  (retired with the zsh implementation: there is no second copy of the
+       scheduler policy left to audit)
   AR4  authoritative state has exactly one writer family (the store/router)
-  AR5  the class-C bridge import graph stays stdlib-only
+  AR5  the class-C import graph stays stdlib-only
   AR6  no secret, credential or real user path is committed
   AR7  .gitignore covers runtime artifacts and does NOT cover sources
-  AR8  every legacy-accessor guard is present, not merely documented
+  AR8  (retired with the zsh implementation, together with AR2)
 
 Run: PYTHONPATH=. uv run --frozen --no-sync python tests/python-architecture-audit-regression.py
 """
@@ -29,55 +30,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-SHELL = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
-
-LEGACY_ACCESSORS = (
-    "read_provider_next_due",
-    "read_provider_last_task",
-    "read_provider_last_attempt",
-    "read_provider_retry_pending",
-    "read_provider_last_known_reset",
-    "read_provider_reset_candidate",
-    "read_provider_reset_anchor",
-    "read_provider_last_window",
-    "write_provider_next_due",
-    "write_provider_last_task",
-    "write_provider_last_attempt",
-    "write_provider_retry_pending",
-    "write_provider_last_known_reset",
-    "write_provider_reset_candidate",
-    "write_provider_reset_anchor",
-    "write_provider_last_window",
-    "clear_provider_reset_candidate",
-    "clear_provider_reset_anchor",
-)
-
-# Shell functions that ARE the production scheduler path. None of them may
-# reach a legacy slot accessor: they must go through the Python bridge.
-PRODUCTION_SCHEDULER_FUNCTIONS = (
-    "check_schedule",
-    "wait_schedule",
-    "run_retry_burst",
-    "run_selected_providers",
-    "run_and_reschedule_selected",
-    "send_usage_notification",
-    "evaluate_provider",
-    "sync_provider_deadline_from_quota",
-    "read_next_due",
-    "commit_provider_success",
-    "commit_provider_success_batch",
-    "provider_is_pending",
-    "provider_retry_due",
-    "provider_fallback_due",
-    "valid_provider_reset_at",
-    "provider_schedule_block_reason",
-    "run_cutover",
-)
-
-# The one deliberate exception: a DISPLAY fallback that dies loudly rather
-# than serving a retired backend (see ARCHITECTURE.md, "Shell end state").
-DISPLAY_FALLBACK_FUNCTIONS = ("status_next_due",)
-
 
 def python_sources() -> list:
     """Every Python module in the package."""
@@ -91,17 +43,18 @@ def scheduler_state_sources() -> list:
     which are not scheduler state and have their own writer. Keeping the two
     scopes apart is the point: a rule that cannot tell them apart would push
     either package into the wrong shape.
+
+    ``quota_sentinel/runtime`` is the process side of the port: it writes
+    model stdout/stderr into the run workspace, the quota cache documents and
+    the run log. None of those is authoritative scheduler state — the state
+    stores remain the only writer family for that, and AR1/AR4b still pin
+    them — so the runtime modules are excluded from this sweep for the same
+    reason as ``quota_sentinel/quota``.
     """
     return [
         path for path in python_sources()
-        if "/quota/" not in str(path)
+        if "/quota/" not in str(path) and "/runtime/" not in str(path)
     ]
-
-
-def function_body(name: str, text: str = SHELL) -> str:
-    start = text.index(f"{name}() {{")
-    end = text.index("\n}", start)
-    return text[start:end]
 
 
 def tracked_files() -> list:
@@ -160,130 +113,6 @@ class AuthorityRouting(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             with self.subTest(module=str(path.relative_to(REPO))):
                 self.assertIsNone(pattern.search(text))
-
-
-class LegacyAccessGuards(unittest.TestCase):
-    """AR2/AR8: the retired backend's API is guarded everywhere."""
-
-    def test_ar2_every_legacy_accessor_requires_the_legacy_backend(self):
-        for name in LEGACY_ACCESSORS:
-            with self.subTest(function=name):
-                body = function_body(name)
-                self.assertIn(
-                    "require_legacy_backend", body,
-                    f"{name} touches legacy slot files without the guard",
-                )
-
-    def test_ar2b_the_bootstrap_writers_are_guarded_too(self):
-        self.assertIn("require_legacy_backend", function_body("seed_provider_state_file"))
-        self.assertIn("legacy_backend_active || return 0", function_body("migrate_legacy_state"))
-
-    def test_ar2c_atomic_write_state_file_has_no_unguarded_caller(self):
-        """The single most dangerous primitive: it writes a legacy slot file
-        with no guard of its own, so every caller must already be guarded."""
-        raw = SHELL
-        callers = set()
-        for match in re.finditer(r"^([a-z_]+)\(\) \{", raw, re.M):
-            name = match.group(1)
-            body = function_body(name, raw)
-            if re.search(rf"^\s*atomic_write_state_file\s+\S", body, re.M):
-                callers.add(name)
-        self.assertTrue(callers, "atomic_write_state_file lost all callers")
-        for name in sorted(callers):
-            with self.subTest(caller=name):
-                self.assertIn(
-                    "require_legacy_backend", function_body(name, raw),
-                    f"{name} calls atomic_write_state_file unguarded",
-                )
-
-    def test_ar2d_no_production_scheduler_path_reaches_a_legacy_accessor(self):
-        offenders = []
-        for name in PRODUCTION_SCHEDULER_FUNCTIONS:
-            body = function_body(name)
-            for accessor in LEGACY_ACCESSORS:
-                if re.search(rf"(?<![\w-]){accessor}\b", body):
-                    offenders.append(f"{name} -> {accessor}")
-        self.assertEqual(
-            offenders, [],
-            "a production scheduler path still touches the legacy backend "
-            "directly; it must go through the scheduler bridge",
-        )
-
-    def test_ar2e_the_only_display_fallback_is_documented(self):
-        """`status` may fall back to a legacy read — but that read is itself
-        guarded, so under JSON authority it fails loudly instead of showing a
-        retired value."""
-        for name in DISPLAY_FALLBACK_FUNCTIONS:
-            body = function_body(name)
-            self.assertIn("read_provider_next_due", body)
-            guarded = function_body("read_provider_next_due")
-            self.assertIn("require_legacy_backend", guarded)
-
-
-class ShellPolicyOwnership(unittest.TestCase):
-    """AR3: no second scheduler implementation in the shell."""
-
-    POLICY_LITERALS = (
-        "RUN_INTERVAL_SECONDS",
-        "RESET_BUFFER_SECONDS",
-        "RESET_NEAR_MOVEMENT_SECONDS",
-        "RESET_CONFIRM_MIN_AGE_SECONDS",
-        "RESET_CONFIRM_MATCH_SECONDS",
-        "MAX_WINDOW_FUTURE_SECONDS",
-        "RETRY_INTERVAL_SECONDS",
-        "INITIAL_ATTEMPT_LIMIT",
-        "WATCHDOG_ATTEMPT_LIMIT",
-        "WATCHDOG_RETRY_GAP_SECONDS",
-    )
-
-    def test_ar3_no_policy_value_is_assigned_in_the_shell(self):
-        for name in self.POLICY_LITERALS:
-            with self.subTest(name=name):
-                pattern = re.compile(
-                    rf"(^|[^A-Za-z0-9_])(readonly\s+|typeset\s+-\w+\s+)?"
-                    rf"{name}\s*=\s*[0-9]"
-                )
-                match = pattern.search(SHELL)
-                self.assertIsNone(
-                    match,
-                    f"{name} has a literal value in the shell; scheduler "
-                    "policy must have exactly one owner (Python)",
-                )
-
-    def test_ar3b_policy_values_arrive_from_the_domain(self):
-        self.assertIn("scheduler-config", SHELL)
-        self.assertIn("scheduler_policy_config", SHELL)
-
-    def test_ar3c_no_deadline_arithmetic_outside_the_domain(self):
-        """The shell may compute a display string or a sleep duration, but it
-        must not derive a DEADLINE. These are the shapes that would."""
-        arithmetic = re.compile(
-            r"\$\(\(\s*[^)]*\b(?:RESET_BUFFER_SECONDS|RUN_INTERVAL_SECONDS|"
-            r"RESET_NEAR_MOVEMENT_SECONDS|MAX_WINDOW_FUTURE_SECONDS|"
-            r"RESET_CONFIRM_MIN_AGE_SECONDS|RESET_CONFIRM_MATCH_SECONDS)\b"
-        )
-        match = arithmetic.search(SHELL)
-        self.assertIsNone(
-            match,
-            "the shell computes a deadline from a policy constant; read the "
-            "result back from the domain instead",
-        )
-        # The only legacy-state names the shell may mention are the PATH
-        # BUILDERS of the guarded accessors ("provider-<slot>" filenames),
-        # never a value it derives scheduling from.
-        for line in SHELL.splitlines():
-            stripped = line.strip()
-            if "last_known_reset" not in stripped:
-                continue
-            with self.subTest(line=stripped):
-                self.assertTrue(
-                    "provider_last_known_reset_file" in stripped
-                    or stripped.startswith("#")
-                    or re.match(
-                        r"(read|write)_provider_last_known_reset\(\) \{", stripped
-                    ),
-                    f"unexpected use of legacy state in the shell: {stripped}",
-                )
 
 
 class AuthoritativeWriter(unittest.TestCase):
@@ -345,11 +174,6 @@ class BridgeRuntime(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "third=")
 
-    def test_ar5b_bridge_does_not_require_the_project_environment(self):
-        shell = SHELL
-        self.assertIn('PYTHONPATH="$SCRIPT_DIR" "$PYTHON3_BIN"', shell)
-        self.assertNotIn('uv run --project', shell.split("scheduler_bridge()")[1][:400])
-
 
 class SecretsAndPaths(unittest.TestCase):
     """AR6: nothing sensitive or machine-specific is committed."""
@@ -375,6 +199,15 @@ class SecretsAndPaths(unittest.TestCase):
         "test-secret", "TOPSECRET", "REDACTED", "redacted", "example",
         "placeholder", "dummy", "fake", "x",
     }
+    # Values that are the NAME of where a credential lives (a Keychain service
+    # or an environment variable), not the credential itself. Exact strings
+    # only: a real `"app_secret": "<value>"` leak cannot be one of these.
+    IDENTIFIER_VALUES = {
+        "quota-sentinel.feishu-app-id",
+        "quota-sentinel.feishu-app-secret",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+    }
 
     def test_ar6_no_credentials_in_tracked_files(self):
         for rel in tracked_files():
@@ -387,6 +220,8 @@ class SecretsAndPaths(unittest.TestCase):
                 for match in re.finditer(pattern, text):
                     line = text[: match.start()].count("\n") + 1
                     if any(v in match.group(0) for v in self.PLACEHOLDER_VALUES):
+                        continue
+                    if any(v in match.group(0) for v in self.IDENTIFIER_VALUES):
                         continue
                     with self.subTest(file=rel, line=line, pattern=pattern):
                         self.fail(
@@ -445,7 +280,7 @@ class GitignoreCoverage(unittest.TestCase):
     MUST_NOT_BE_IGNORED = (
         "uv.lock",
         "pyproject.toml",
-        "quota-sentinel.sh",
+        "install-launchagents.sh",
         "quota_sentinel/state/store.py",
         "quota_sentinel/scheduler/policy.py",
         "tests/python-scheduler-regression.py",
@@ -483,57 +318,12 @@ class GitignoreCoverage(unittest.TestCase):
                 self.assertIn(rel, tracked, f"{rel} exists but is untracked")
 
 
-class QuotaAdapterAgreement(unittest.TestCase):
-    """AR9: the shell and the Python adapters agree on the quota ladder.
+class QuotaAdapterCapabilities(unittest.TestCase):
+    """AR9 (residual): the adapter facts are declared once, in Python.
 
-    The ladder and the capability facts are declared once, in
-    ``quota_sentinel.quota``. The shell still EXECUTES a tier (vendor probes
-    under the shared timeout) and still renders provider titles, so those two
-    places are checked for agreement rather than trusted.
+    The ladder and the capability facts live in ``quota_sentinel.quota``
+    alone; the shell copy this class used to cross-check is retired.
     """
-
-    def test_ar9_shell_executes_exactly_the_declared_tiers(self):
-        sys.path.insert(0, str(REPO))
-        from quota_sentinel.quota.adapters import PROVIDERS, TIER_LADDER
-
-        body = function_body("quota_tier_command")
-        for tier in TIER_LADDER:
-            with self.subTest(tier=tier.value):
-                self.assertIn(f"{tier.value})", body)
-        # No extra arm the plan does not know about.
-        arms = re.findall(r"^\s{4}([a-z-]+)\)", body, re.M)
-        self.assertEqual(sorted(arms), sorted(t.value for t in TIER_LADDER))
-        # ... and the provider roster is the same one.
-        match = re.search(r"^readonly PROVIDERS=\(([^)]*)\)", SHELL, re.M)
-        self.assertEqual(tuple(match.group(1).split()), tuple(PROVIDERS))
-
-    def test_ar9b_shell_and_adapter_agree_on_provider_titles(self):
-        """Titles are rendering data the shell still owns, so the two copies
-        must at least be mechanically identical."""
-        sys.path.insert(0, str(REPO))
-        from quota_sentinel.quota.adapters import ADAPTERS
-
-        body = function_body("provider_card_title")
-        for provider, adapter in ADAPTERS.items():
-            with self.subTest(provider=provider):
-                self.assertIn(f'{provider}) print -r -- "{adapter.title}"', body)
-
-    def test_ar9c_shell_keeps_no_jq_quota_normaliser(self):
-        """The seven jq programs are gone; normalisation is one Python
-        implementation with golden tests."""
-        for name in (
-            "normalize_pi_codex_quota",
-            "normalize_pi_antigravity_quota",
-            "normalize_pi_opencode_quota",
-            "normalize_codexbar_codex_quota",
-            "normalize_codexbar_antigravity_quota",
-            "normalize_codexbar_opencode_quota",
-            "renormalise_quota_file",
-        ):
-            with self.subTest(function=name):
-                body = function_body(name)
-                self.assertIn("quota_normalize", body)
-                self.assertNotIn("JQ_BIN", body)
 
     def test_ar9d_monthly_is_display_only_where_declared(self):
         sys.path.insert(0, str(REPO))
@@ -548,7 +338,7 @@ class LifecycleLockOwnership(unittest.TestCase):
     A CLI cannot verify that a caller holds a lock it did not take, so the
     safety property cannot be "the verb checks". It has to be structural:
     the OPERATOR surface either acquires the lock itself, or does not exist;
-    the verbs the shell calls while already holding it are labelled
+    the verbs the runtime calls while already holding it are labelled
     INTERNAL so nothing presents them as standalone operator commands.
     """
 
@@ -596,7 +386,7 @@ class LifecycleLockOwnership(unittest.TestCase):
         self.assertIn("def _lifecycle_lock(", main_source)
         self.assertIn("with _lifecycle_lock(", main_source)
         self.assertIn("acquire_run_lock(", main_source)
-        # ... and the underlying primitive is the shell's own binary.
+        # ... and the underlying primitive is the shared shlock binary.
         runlock_source = (
             REPO / "quota_sentinel" / "state" / "runlock.py"
         ).read_text(encoding="utf-8")
@@ -620,26 +410,29 @@ class LifecycleLockOwnership(unittest.TestCase):
                 stripped = line.strip()
                 if "scheduler-" not in stripped:
                     continue
-                # A documented invocation of a bridge verb.
+                # A documented invocation of a bridge verb. Both the
+                # in-repo form and the launchd-style --project form count.
                 looks_like_a_command = (
-                    stripped.startswith("uv run quota-sentinel")
-                    or stripped.startswith("./quota-sentinel.sh scheduler-")
+                    stripped.startswith("uv run")
+                    or stripped.startswith("quota-sentinel ")
+                    or stripped.startswith("python -m quota_sentinel")
                 )
                 if looks_like_a_command:
                     offenders.append(f"{rel}:{lineno}: {stripped}")
         self.assertEqual(
             offenders, [],
             "internal bridge verbs must not be documented as operator "
-            "commands; use ./quota-sentinel.sh <lifecycle verb>",
+            "commands; use the public `quota-sentinel <lifecycle verb>` "
+            "surface",
         )
 
     def test_ar10d_documented_operator_lifecycle_is_the_lock_safe_one(self):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         for verb in ("cutover", "rollback"):
             with self.subTest(verb=verb):
-                self.assertIn(f"./quota-sentinel.sh {verb}", readme)
+                self.assertIn(f"quota-sentinel {verb}", readme)
         self.assertIn(
-            "./quota-sentinel.sh bootstrap-authority --assume-legacy", readme
+            "quota-sentinel bootstrap-authority --assume-legacy", readme
         )
 
 
@@ -775,9 +568,11 @@ class InstallerUpgradeSafety(unittest.TestCase):
             with self.subTest(line=stripped):
                 self.assertNotIn(" cutover", stripped)
                 self.assertNotIn(" rollback", stripped)
-        # The refusal has to tell the operator what ONLY they can decide.
+        # The refusal has to tell the operator what ONLY they can decide, and
+        # it must point at the Python CLI's console script.
         self.assertIn(
-            "quota-sentinel.sh bootstrap-authority --assume-legacy",
+            "uv run --frozen --no-sync quota-sentinel bootstrap-authority "
+            "--assume-legacy",
             self.INSTALLER,
         )
 
@@ -851,10 +646,13 @@ class WholeRosterAuthoritySwitch(unittest.TestCase):
         from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
         prefixes = (
+            "uv run --frozen --no-sync quota-sentinel",
+            "uv run --project",                       # the launchd form
             "uv run quota-sentinel",
+            "uv run --frozen --no-sync python -m quota_sentinel",
             "uv run python -m quota_sentinel",
+            "python -m quota_sentinel",
             "quota-sentinel ",
-            "./quota-sentinel.sh ",
         )
         offenders = []
         for rel in tracked_files():
@@ -927,7 +725,6 @@ class ExplicitBootstrapOnly(unittest.TestCase):
     these tests pin every path that could otherwise do it by accident.
     """
 
-    SHELL = (REPO / "quota-sentinel.sh").read_text(encoding="utf-8")
     INSTALLER = (REPO / "install-launchagents.sh").read_text(encoding="utf-8")
 
     def test_ar15_installer_never_bootstraps_authority(self):
@@ -938,32 +735,6 @@ class ExplicitBootstrapOnly(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertNotIn(token, self.INSTALLER)
-
-    def test_ar16_shell_bootstrap_has_exactly_one_reachable_call_site(self):
-        # Structural, not token-counting: the helper is defined once, the
-        # bridge is defined once and calls it once, and the helper makes
-        # exactly one bridge call. A second call site anywhere would mean a
-        # runtime path had grown a bootstrap.
-        self.assertEqual(self.SHELL.count("_bootstrap_authority_bridge"), 2)
-        self.assertEqual(
-            self.SHELL.count("scheduler_bridge scheduler-bootstrap-authority"), 1
-        )
-        self.assertEqual(
-            self.SHELL.count("authority_bootstrap --assume-legacy"), 1
-        )
-        # The helper refuses to run without the operator's flag in its OWN
-        # argv: it does not synthesize the assertion for its callers.
-        self.assertIn("refusing to bootstrap authority without --assume-legacy",
-                      self.SHELL)
-        self.assertIn("refusing to bootstrap authority: only --assume-legacy "
-                      "is accepted", self.SHELL)
-        # ... and the runtime command paths never mention it at all.
-        dispatch = self.SHELL[self.SHELL.index("main() {"):]
-        for case in ("check)", "wait)", "run)", "usage)", "status)"):
-            block = dispatch[dispatch.index(case):]
-            block = block[:block.index(";;")]
-            with self.subTest(case=case):
-                self.assertNotIn("bootstrap", block)
 
     def test_ar16b_only_the_operator_cli_may_call_the_library_primitive(self):
         import re

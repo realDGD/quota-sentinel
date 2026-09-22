@@ -99,7 +99,7 @@ class TaskOrchestratorTest(unittest.TestCase):
         self.store = TaskStore(self.state_dir / "tasks.sqlite3")
         self.state = ScheduleState(self.state_dir)
         self.engine = TaskOrchestrator(
-            script_path=Path("/example/quota-sentinel.sh"),
+            scheduler_command=("/example/python", "-m", "quota_sentinel", "check"),
             schedule_state=self.state,
             store=self.store,
             runner=self.runner,
@@ -124,7 +124,7 @@ class TaskOrchestratorTest(unittest.TestCase):
         self.assertEqual(len(self.runner.calls), 1)
         self.assertEqual(
             self.runner.calls[0][0],
-            ("/bin/zsh", "/example/quota-sentinel.sh", "check"),
+            ("/example/python", "-m", "quota_sentinel", "check"),
         )
 
         self.clock.value = 899
@@ -298,7 +298,7 @@ class TaskOrchestratorTest(unittest.TestCase):
     def test_background_loop_recovers_instead_of_silently_stopping(self) -> None:
         runner = FailOnceRunner()
         engine = TaskOrchestrator(
-            script_path=Path("/example/quota-sentinel.sh"),
+            scheduler_command=("/example/python", "-m", "quota_sentinel", "check"),
             schedule_state=self.state,
             store=self.store,
             runner=runner,

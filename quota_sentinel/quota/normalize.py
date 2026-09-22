@@ -1,6 +1,6 @@
 """Pure-Python transcription of the shell's jq quota normalisers.
 
-Every function here mirrors one jq program in `quota-sentinel.sh` — and
+Every function here was ported from one jq program in the retired shell — and
 mirrors it literally, including the cases where the jq produces no output at
 all. "No output" (a failed `select(...)`, a `tonumber`/`fromdateiso8601`
 error, an `empty` in an object value) is always surfaced as

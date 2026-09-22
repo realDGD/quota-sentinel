@@ -52,25 +52,28 @@ exactly `1`. Quota collection is reported independently.
 
 ## Architecture at a glance
 
-Python owns the system's decisions; the shell owns processes and the system
-boundary. See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants.
+The Python CLI is the single production entrypoint: it owns the scheduler's
+decisions *and* the process side — model runs, quota probes, notification
+transport and locks. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
+invariants.
 
 ```text
 quota_sentinel/ (Python)
   state/       authoritative scheduler state + the durable backend authority
   scheduler/   due decisions, deadline calibration, retry debt, transitions
   quota/       provider adapters: fallback ladder, capabilities, normalisation
-
-quota-sentinel.sh (zsh)
-  model runner, quota tier execution, Feishu transport, locks, install glue
+  runtime/     model runner, quota probe execution, Feishu cards + transport
+  __main__.py  the single CLI entrypoint (console script `quota-sentinel`)
 ```
 
-The shell asks Python for every scheduler decision and every state
-transition through a small CLI bridge; it holds no scheduler policy of its
-own. Two durable state backends exist — the historical per-slot files and one
-versioned JSON document per provider — and a single durable fact
+Every verb is one command — `uv run --frozen --no-sync quota-sentinel <verb>`
+from the repository root, or the launchd form
+`uv run --project <repo> --frozen --no-sync quota-sentinel <verb>`. Two durable
+state backends exist — the historical per-slot files and one versioned JSON
+document per provider — and a single durable fact
 (`backend-authority.json`) says which one is authoritative. A deployment that
-has never run `cutover` keeps using the slot files exactly as before.
+has never run `cutover` keeps using the slot files exactly as before. No zsh
+runs in normal operation.
 
 ## Quota Data Sources & Architecture
 
@@ -164,8 +167,9 @@ to the bot's 1:1 chat with you (私聊):
      -s quota-sentinel.feishu-app-secret -w '<app_secret>'
    ```
 
-5. Run `./quota-sentinel.sh discover-feishu-user <personal-email-or-mobile>`
-   to look up your user_id and store it in Keychain.
+5. Run `uv run --frozen --no-sync quota-sentinel discover-feishu-user
+   <personal-email-or-mobile>` to look up your user_id and store it in
+   Keychain.
 
 ## Privacy and context controls
 
@@ -184,27 +188,37 @@ tool-free Antigravity `agent_end` quota hook, and a tool-free OpenCode Go
 model-callable tools. Antigravity and OpenCode Go quota metadata requests
 consume no model tokens.
 
-Push credentials never appear in process arguments or URLs: the Feishu app
-secret travels through the request body on stdin, and the tenant token through
-an Authorization header supplied to curl over stdin.
+Push credentials never appear in process arguments or URLs. The app secret
+travels in the token-request JSON body and the tenant token in an
+`Authorization` header, both over an in-process HTTPS connection
+(`quota_sentinel/runtime/feishu.py`); the OpenCode Go API key is piped to its
+quota helper over stdin. Neither is ever passed as an argument or written to a
+log — the model runner masks credential-shaped text in any captured stderr.
 
 ## Commands
 
+The console script `quota-sentinel` is the single production entrypoint.
+From the repository root:
+
 ```bash
-./quota-sentinel.sh check
-./quota-sentinel.sh wait
-./quota-sentinel.sh usage
-./quota-sentinel.sh status
-./quota-sentinel.sh discover-feishu-user <email-or-mobile>
-./quota-sentinel.sh run [codex|antigravity|opencode|all]
-./quota-sentinel.sh card-preview [all|both|codex|antigravity|opencode|usage]
-./quota-sentinel.sh send-test-card [all|both|codex|antigravity|opencode|usage|progress]
+uv run --frozen --no-sync quota-sentinel check
+uv run --frozen --no-sync quota-sentinel wait
+uv run --frozen --no-sync quota-sentinel usage
+uv run --frozen --no-sync quota-sentinel status
+uv run --frozen --no-sync quota-sentinel discover-feishu-user <email-or-mobile>
+uv run --frozen --no-sync quota-sentinel run [codex|antigravity|opencode|all]
+uv run --frozen --no-sync quota-sentinel card-preview [all|both|codex|antigravity|opencode|usage|progress]
+uv run --frozen --no-sync quota-sentinel send-test-card [all|both|codex|antigravity|opencode|usage|progress]
 
 # state-backend lifecycle (each acquires the scheduler's run.lock)
-./quota-sentinel.sh bootstrap-authority --assume-legacy   # ONE-TIME, see below
-./quota-sentinel.sh cutover
-./quota-sentinel.sh rollback
+uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy   # ONE-TIME, see below
+uv run --frozen --no-sync quota-sentinel cutover
+uv run --frozen --no-sync quota-sentinel rollback
 ```
+
+LaunchAgents use the explicit-project form, because launchd's
+`WorkingDirectory` is `/private/tmp`:
+`uv run --project <repo> --frozen --no-sync quota-sentinel <verb>`.
 
 - `check`: 15-minute watchdog probe. Independently evaluates each provider's 5h quota state without model invocations, and triggers only the provider(s) due for execution.
 - `usage`: Instant quota check sent to Feishu for every provider without triggering model tasks.
@@ -223,28 +237,27 @@ an Authorization header supplied to curl over stdin.
   likewise whole-roster).
   See [Upgrading from the legacy state backend](#upgrading-from-the-legacy-state-backend).
 
-The Python side has its own verbs, equivalent under either entry point (parity
-is test-pinned):
+The same CLI also exposes the read-only diagnostics, the per-backend
+inspection verbs and the one-time migration verb:
 
 ```bash
-uv run quota-sentinel --help
-uv run python -m quota_sentinel --help
+uv run --frozen --no-sync quota-sentinel --help
+uv run --frozen --no-sync python -m quota_sentinel --help
 
 # reads (follow the authoritative backend automatically)
-uv run quota-sentinel next-due codex
-uv run quota-sentinel state-dump codex
-uv run quota-sentinel authority
+uv run --frozen --no-sync quota-sentinel next-due codex
+uv run --frozen --no-sync quota-sentinel state-dump codex
+uv run --frozen --no-sync quota-sentinel authority
 
 # per-backend diagnostics, for inspecting one side explicitly
-uv run quota-sentinel dump codex          # legacy slot files
-uv run quota-sentinel json-dump codex     # v1 JSON document
+uv run --frozen --no-sync quota-sentinel dump codex          # legacy slot files
+uv run --frozen --no-sync quota-sentinel json-dump codex     # v1 JSON document
 
-# lifecycle — these acquire run.lock themselves, so they are safe to run
-# directly; ./quota-sentinel.sh <verb> is the equivalent shell entry point
-uv run quota-sentinel bootstrap-authority --assume-legacy   # one-time, explicit
-uv run quota-sentinel cutover
-uv run quota-sentinel rollback
-uv run quota-sentinel migrate             # legacy deployments only
+# lifecycle — these acquire run.lock themselves, so they are safe to run directly
+uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy   # one-time, explicit
+uv run --frozen --no-sync quota-sentinel cutover
+uv run --frozen --no-sync quota-sentinel rollback
+uv run --frozen --no-sync quota-sentinel migrate             # legacy deployments only
 ```
 
 `next-due` and `state-dump` read through whichever backend the durable
@@ -257,12 +270,12 @@ knowing which backend that is. `authority` prints the manifest itself.
 > backend. Naming a provider after either verb is an argparse usage error,
 > refused before any state is touched.
 
-> **The `scheduler-*` verbs are an INTERNAL BRIDGE API.** They are what
-> `quota-sentinel.sh` calls *while it already holds `run.lock`*, and they do
-> not acquire it themselves — a second acquisition from a different process
-> would deadlock against its own caller. Their `--help` says so. Use the
-> lifecycle verbs above (or the shell) instead; the repo-wide audit fails if
-> any document presents a bridge verb as an operator command.
+> **The `scheduler-*` verbs are an INTERNAL BRIDGE API.** They are what the
+> runtime calls *while it already holds `run.lock`*, and they do not acquire
+> it themselves — a second acquisition from a different process would
+> deadlock against its own caller. Their `--help` says so. Use the lifecycle
+> verbs above instead; the repo-wide audit fails if any document presents a
+> bridge verb as an operator command.
 
 ### Upgrading from the legacy state backend
 
@@ -273,9 +286,9 @@ state is unknown, not that it is legacy — so a pre-protocol deployment
 asserts it once, explicitly:
 
 ```bash
-./quota-sentinel.sh bootstrap-authority --assume-legacy  # ONE-TIME assertion
+uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy  # ONE-TIME assertion
 ./install-launchagents.sh --load   # sync, retire old agents, restart listener
-./quota-sentinel.sh cutover        # one-time ownership switch (run.lock held)
+uv run --frozen --no-sync quota-sentinel cutover   # one-time ownership switch (run.lock held)
 ```
 
 All three steps are separate on purpose:
@@ -329,7 +342,7 @@ Recover it the way you would any lost durable fact:
 3. restore `backend-authority.json` from a backup if you have one;
 4. only if you have confirmed the deployment **never cut over**, record that
    assertion instead:
-   `./quota-sentinel.sh bootstrap-authority --assume-legacy`;
+   `uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy`;
 5. restart the agent.
 
 #### Deleting the legacy files
@@ -376,8 +389,8 @@ waking on deadlines the scheduler has already moved past:
 The orchestrator decides only **when to invoke `check`**. Fresh/stale quota
 authority, reset+4 calibration, provider-specific scheduler-write blocking,
 5h01 fallback, pending debt, retries, and successful-task state commits are
-implemented exclusively by `quota_sentinel.scheduler`; the shell only drives
-the process side of a run and hands each outcome back to Python.
+implemented exclusively by `quota_sentinel.scheduler`; the CLI drives the
+process side of a run and hands each outcome back to the same domain.
 
 Task executions and post-run deadline snapshots are stored in
 `~/Library/Application Support/Quota-Sentinel/task-orchestrator.sqlite3`
@@ -399,7 +412,7 @@ Every external process is bounded so a hang can never hold the scheduler:
 | OpenCode Go Native `/usage` API | `QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Tier ① failed → CodexBar Live; fixed reason code logged, never a response body |
 | CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); OpenCode: `QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT` (20s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
 | Feishu WebSocket listener outer bound | 480s | Subprocess group terminated (default quota acquisition ≈ 207s + existing Feishu auth/send retries ≈ 183s + margin) |
-| Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The shell and every nested detached process group are terminated |
+| Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The `check` process and every nested detached process group are terminated |
 
 Model and CodexBar timeouts run through `run_with_timeout.py`: the child gets its own session,
 SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
@@ -561,7 +574,7 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
 
 Only the listener/orchestrator LaunchAgent may be loaded during normal
 operation. Loading either legacy scheduler at the same time would create a
-second scheduling entry point, even though the shell run lock still prevents
+second scheduling entry point, even though the shared run lock still prevents
 duplicate model execution.
 
 ### Installing
@@ -596,36 +609,39 @@ after dependency changes.
 ## Tests
 
 The suites under `tests/` are standalone scripts with no test runner to
-install. The Python side lives in the project's uv environment
+install. They live in the project's uv environment
 (`pyproject.toml` + `uv.lock`; the only third-party dependency is
 `lark-oapi`, needed by the Feishu listener suite). After the installer (or
-a manual `uv sync --locked`), the canonical runs from the repository root
-are:
+a manual `uv sync --locked`), the canonical run from the repository root is:
 
 ```bash
-for t in tests/*.zsh; do zsh "$t" || echo "FAIL $t"; done
 for t in tests/*.py; do PYTHONPATH=. uv run --frozen --no-sync python "$t" || echo "FAIL $t"; done
 ```
 
-The stdlib-only Python suites also pass under plain system `python3`
+The stdlib-only suites also pass under plain system `python3`
 (`PYTHONPATH=. python3 tests/...`); `tests/feishu-listener-regression.py`
 must run in the project environment so it exercises the real `lark_oapi`
 imports instead of any globally installed copy. `tests/uv-project-
-regression.py` is the environment guard itself: lock check, CLI/module
-entry-point parity, LaunchAgent-style `--project --frozen --no-sync`
-startup from a foreign working directory, an offline runtime proof, and the
-rule that the shell's scheduler bridge stays stdlib-only on system Python.
+regression.py` is the environment guard itself: lock check, console-script
+vs `python -m` entry-point parity, LaunchAgent-style
+`--project --frozen --no-sync` startup from a foreign working directory, an
+offline runtime proof, and the rule that the class-C runtime graph stays
+stdlib-only on system Python.
 
 Suites worth knowing by name:
 
 | Suite | What it pins |
 | --- | --- |
-| `tests/state-store-parity-regression.zsh` | shell getters vs the Python store, value for value |
-| `tests/python-authority-regression.py` | the durable authority protocol, the router's read guard, and the cutover crash matrix |
-| `tests/state-authority-regression.zsh` | the operator-visible cutover lifecycle through the real shell |
-| `tests/python-scheduler-regression.py` | every scheduler transition, the observation reader, and that the shell holds no policy value of its own |
-| `tests/retry-regression.zsh`, `tests/p1-deadline-regression.zsh`, `tests/dynamic-schedule-regression.zsh` | the black-box scheduler contract: retry debt, matured-debt protection, dynamic reset calibration |
-| `tests/state-concurrency-regression.zsh` | write/read interleavings across processes |
+| `tests/python-entrypoint-regression.py` | the end-to-end CLI verbs, and that the shell implementation, daemons, templates and installer are shell-free |
+| `tests/python-authority-regression.py` | the durable authority protocol, the router's read guard, the cutover crash matrix, and the lock-safe public lifecycle |
+| `tests/python-scheduler-regression.py` | every scheduler transition, the observation reader, deadline calibration, and the service-level burst sequence |
+| `tests/python-app-regression.py` | the `check`/`run` orchestration: retry bursts and limits, debt, recovery, notifications |
+| `tests/python-quota-adapter-regression.py` | jq parity for the normalisers, the golden fixtures, and both live native-tier helpers |
+| `tests/python-state-store-regression.py`, `tests/python-json-store-regression.py`, `tests/python-state-cutover-regression.py` | the two backends' value contracts, atomicity, migration and backend agreement |
+| `tests/python-model-runner-regression.py` | model process bounds, redaction and process-group kill |
+| `tests/python-quota-probe-regression.py` | the four-tier fallback ladder and its cache/loopback-free cache handling |
+| `tests/python-feishu-regression.py` | card JSON, envelopes, lookup and delivery |
+| `tests/python-architecture-audit-regression.py` | the repo-wide mechanical invariants (one authority mapping, one writer family, class-C imports, installer/authority safety) |
 
 A new test may be added freely; an existing assertion is only changed when
 the contract itself changed, and the reason is recorded in the commit.

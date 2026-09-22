@@ -6,30 +6,42 @@ behavioral parts; this file names the boundaries so future changes keep them.
 ## Ownership
 
 ```text
-quota_sentinel/                = the system's brain (Python)
+quota_sentinel/                = the system's brain AND its hands (Python)
   state/                       authoritative scheduler state + backend authority
   scheduler/                   scheduler policy, transitions, decisions
   quota/                       provider quota adapters and normalisation
-  __main__.py                  the CLI the shell and operators call
-
-quota-sentinel.sh              = thin compatibility + system boundary (zsh)
-  model runner                 provider CLI invocation, process groups, timeouts
-  quota tier execution         the vendor probes, under the shared timeout helper
-  Feishu transport, cards      rendering and delivery
-  locks, install glue          run.lock / quota.lock, launchd-facing bootstrap
+  runtime/                     model runner, quota probes, Feishu cards +
+                               transport, locks, run log (class C: stdlib-only)
+  __main__.py                  the CLI, and the single production entrypoint
+                               (console script `quota-sentinel`)
 
 task_orchestrator.py           = when (wake scheduling + durable run history)
   task-orchestrator.sqlite3    = history / observability, NEVER authoritative
+```
+
+No zsh runs in normal operation. The retired `quota-sentinel.sh` is preserved
+in git history for reference only; every verb it used to dispatch now lives in
+`quota_sentinel` and is reached through the console script:
+
+```text
+uv run --frozen --no-sync quota-sentinel <verb>            (from the repo root)
+uv run --project <repo> --frozen --no-sync quota-sentinel  (launchd form)
 ```
 
 Authoritative scheduler state must never move into the SQLite history DB, and
 must never exist in two places: exactly one backend owns it at any instant,
 and a single durable fact says which one (see *State backend authority*).
 
-The shell no longer holds scheduler policy. It owns processes, locks, model
-execution, quota probing and notifications, and asks Python for every decision
-and every transition. `tests/python-scheduler-regression.py` fails if a policy
-value or a deadline algorithm reappears in the shell.
+The Python CLI owns the process side too — model execution, quota probing,
+notification transport, locks and temp dirs — and every scheduler decision and
+state transition is a function call inside the same package; there is no
+second implementation to drift against. The class-C boundary is what keeps
+that safe for the hot paths: `quota_sentinel/runtime/*` (and the
+scheduler/state graph it sits on) stays stdlib-only, so it is importable by
+`/usr/bin/python3 -S` without the project environment.
+`tests/python-architecture-audit-regression.py` (AR5) and
+`tests/uv-project-regression.py` (UV11) fail if a third-party import enters
+that graph.
 
 ## Provider capability vs scheduler policy
 
@@ -132,7 +144,7 @@ json backend     <state_dir>/<provider>-state.json   one v1 document per provide
 * **REQUIRED once the deployment has an owner, and absence means UNKNOWN —
   never `legacy`.** The only thing that materializes it is an operator
   asserting, explicitly, that the deployment predates the protocol:
-  `quota-sentinel.sh bootstrap-authority --assume-legacy` (library primitive
+  `quota-sentinel bootstrap-authority --assume-legacy` (library primitive
   `bootstrap_legacy_authority`). The earlier protocol let the installer
   create it as `legacy epoch 0` when absent, and read absence as "never cut
   over"; that made a deleted manifest silently resurrect stale legacy state
@@ -221,20 +233,21 @@ parameter, no positional in either CLI surface) and behaviorally
 verified, and a divergence or failure in the LAST provider still blocks the
 global flip).
 
-The shell entry points (`./quota-sentinel.sh cutover|rollback`) take the
-lock and then call the internal bridge verbs; the Python entry points
-(`uv run quota-sentinel cutover|rollback`) take it
-through `quota_sentinel.state.runlock`, which executes **the same
-`/usr/bin/shlock` with the same arguments on the same file** as the shell.
-That is not a second lock: a Python holder and a shell holder exclude each
-other exactly as two shell holders do, which is why these verbs are safe to
-run standalone.
+The public entry points (`quota-sentinel cutover` / `quota-sentinel
+rollback`, and the same verbs through `python -m quota_sentinel`) take the
+lock through `quota_sentinel.state.runlock`, which executes
+**`/usr/bin/shlock` with the same arguments on the same `run.lock` file** as
+the retired shell implementation did. That matters for exactly one reason
+now: an upgraded deployment may still have a process from the previous
+version running, and the two implementations must exclude each other through
+the same durable protocol while it drains.
 
 The `scheduler-*` bridge verbs deliberately do NOT acquire the lock — the
-shell already holds it, and acquiring it again from a different process would
-deadlock against its own caller. They are labelled `INTERNAL BRIDGE API` in
-`--help`, are not documented as operator commands, and
-`tests/python-architecture-audit-regression.py` (AR10) fails if that changes.
+runtime calls them while it already holds it, and acquiring it again from a
+different process would deadlock against its own caller. They are labelled
+`INTERNAL BRIDGE API` in `--help`, are not documented as operator commands,
+and `tests/python-architecture-audit-regression.py` (AR10) fails if that
+changes.
 A CLI cannot verify a lock it did not take, so no such check is faked: the
 safety comes from the public surface not needing one.
 
@@ -262,13 +275,16 @@ to switch backends.
 `tests/python-authority-regression.py` injects a crash at every checkpoint,
 including inside the manifest publish, and asserts that ownership is always
 determinable, that no legacy byte ever changes, and that no torn document or
-temp file survives. `tests/state-authority-regression.zsh` proves the
-operator-visible lifecycle through the real shell.
+temp file survives. The operator-visible lifecycle — including the refusal to
+start while another writer holds `run.lock` — is pinned end-to-end through
+the real CLI in the same suite.
 
 Legacy files are **never deleted, moved or rewritten by the cutover**; after
 the flip they are a rollback artifact and no production path reads or writes
-them. The shell's legacy accessors are guarded: they `die` rather than touch
-the retired backend once JSON owns the state.
+them. The retired backend's slot accessors were guarded in the shell (`die`
+rather than touch a retired backend); in the port that guard is structural:
+`FileStateStore` is reachable only through the router when the manifest says
+`legacy`.
 
 `rollback` is the inverse switch and refuses unless it is a PURE UNDO (every
 document still equal to its legacy file). Once JSON has advanced, "roll back"
@@ -392,7 +408,7 @@ All entries funnel through `quota_sentinel.scheduler.service` →
 | 4 | `run` → initial `run_retry_burst` | as #1 | run |
 | 5 | `run` → post-run sync (`scheduler-last-window` + `scheduler-sync`) | last_window + as #3 | run + quota (quota busy → sync skipped, fallback stands) |
 | 6 | `usage` → opportunistic sync after collection | as #3 | quota (collect) → **released** → run (non-blocking; busy → skip) |
-| 7 | `cutover` → `scheduler-cutover` | the authority manifest, after refreshing every document | run (the shell entry point acquires it; the public CLI acquires it through `runlock`) |
+| 7 | `cutover` → `scheduler-cutover` | the authority manifest, after refreshing every document | run (the public verb acquires it through `runlock`; the internal bridge verb relies on its caller) |
 | 7b | `rollback` → `scheduler-rollback` | the authority manifest, after proving a pure undo | run (same) |
 | 7c | `bootstrap-authority --assume-legacy` → `scheduler-bootstrap-authority` | the authority manifest, ONLY for an operator-asserted pre-protocol deployment | run (same); unknown ownership is never resolved automatically |
 | 8 | bootstrap `migrate_legacy_state` (state-touching commands only) | seeds absent per-provider legacy files | none — `seed_provider_state_file` publishes by `link(2)` EEXIST, so creation is atomic and non-destructive; skipped entirely once JSON is authoritative |
@@ -409,14 +425,14 @@ quota_sentinel/scheduler/models.py        Decision, SyncAction, QuotaObservation
                                           Transition, RunOutcome
 quota_sentinel/scheduler/observation.py   one normalised quota probe -> evidence
 quota_sentinel/scheduler/service.py       the ONLY place policy meets a store
-quota_sentinel/scheduler/cli.py           the bridge the shell calls
+quota_sentinel/scheduler/cli.py           the internal bridge verbs the runtime calls
 ```
 
 `policy` is `new_state = f(old_state, inputs, now)`. It performs no network
 call, runs no model, takes no lock, touches no filesystem and never mutates a
 second provider. It is a transcription of the shell policy that preceded it —
-constants, branch order and tie-breaking are unchanged, and the zsh suites
-remain the black-box compatibility proof.
+constants, branch order and tie-breaking are unchanged, and
+`tests/python-scheduler-regression.py` is the compatibility proof.
 
 Branch order is load-bearing and pinned by tests:
 
@@ -440,7 +456,7 @@ Transitions exist as first-class values, each individually proven:
 
 `Transition.publish` names slots a transition must MATERIALIZE even when the
 value is unchanged. The success commit uses it for `retry_pending=0`: the
-pre-migration shell always left an explicit "no debt" file behind, and
+pre-migration implementation always left an explicit "no debt" file behind, and
 "absent" and "0" being equal to every reader does not make changing the
 on-disk contract acceptable.
 
@@ -449,18 +465,26 @@ touched at all, so a no-op branch — Stale quota, reset-buffer blocking, an
 unpaid debt — is provably non-writing rather than accidentally writing
 identical bytes.
 
-### Shell ↔ Python boundary
+### Scheduler domain and the internal bridge verbs
 
-The shell calls the domain through `scheduler_bridge`
-(`python3 -S -m quota_sentinel --state-dir …`), on the system interpreter
-because the bridge's import graph is stdlib-only (pinned by
-`tests/uv-project-regression.py`). `-S` skips site processing; nothing on this
-path needs it.
+The runtime calls the domain **in-process**: `quota_sentinel.app` imports
+`quota_sentinel.scheduler.policy` / `service` and `quota_sentinel.state`
+directly. There is no subprocess boundary, no serialized machine protocol and
+no second implementation left to drift; one `check`/`run` tick is a sequence
+of function calls that each take the store's atomic publish.
 
-Decisions are batched per phase — one interpreter start per roster phase, not
-one per provider — because the precision timer walks this path every minute.
-Batching shares the PROCESS; it never shares a transaction: each provider
-still gets its own transition and its own commit.
+The `scheduler-*` verbs registered by `quota_sentinel/scheduler/cli.py` are
+retained as an INTERNAL BRIDGE API surface: they expose the same transitions
+to the test suites and to operators diagnosing a deployment, and they are what
+a not-yet-upgraded process from the previous (shell) version called. They run
+on any interpreter — including `/usr/bin/python3 -S` — because the domain's
+import graph is stdlib-only (pinned by `tests/uv-project-regression.py` UV11
+and `tests/python-architecture-audit-regression.py` AR5). `-S` skips site
+processing; nothing on this path needs it.
+
+The bridge verbs can batch a phase — one process per roster phase, not one per
+provider. Batching shares the PROCESS; it never shares a transaction: each
+provider still gets its own transition and its own commit.
 
 The bridge prints machine records, not prose:
 
@@ -471,12 +495,11 @@ log=info|warn<TAB>text                   what to log, at which level
 end=<name>                               the provider's records are complete
 ```
 
-The Python side emits explicit change records precisely so the run log keeps
-the shape it had when the shell diffed values itself. Verbs whose shell
-predecessors logged nothing but the value diff emit no `log=` record.
+The change records preserve the shape of the run log the retired shell
+produced when it diffed values itself. Verbs whose shell predecessors logged
+nothing but the value diff emit no `log=` record.
 
-Exit codes are part of the contract, because the shell decides with `if` and
-`case`:
+Exit codes are part of the contract:
 
 ```text
 scheduler-decide      0 due | 1 wait | 2 unpaid debt (skipped) | 4 error
@@ -485,9 +508,9 @@ scheduler-valid-reset 0 found | 1 none
 ```
 
 Policy constants (run interval, reset buffer, tolerances, retry limits and
-backoff) have exactly ONE owner: `scheduler-config` prints them and the shell
-assigns them at start-up, validating them there. A shell literal would be a
-second source of truth for the scheduler's behavior.
+backoff) have exactly ONE owner: `quota_sentinel.scheduler.policy`.
+`scheduler-config` prints them for callers that need the values; no caller
+keeps its own copy.
 
 ## Quota adapters
 
@@ -507,17 +530,18 @@ OpenCode's monthly window is `monthly_display_only=True` on its adapter, and
 the scheduler's observation reader cannot even see it — a stronger guarantee
 than a comment telling callers not to look.
 
-Vendor probes still execute in the shell, under the shared process-group
-timeout helper, because that is where the kill-group and orphan-reaping
-semantics are already proven. Adding a fourth provider should mean: an
-adapter, a roster entry, and tests — not a new arm in a dozen
-`case "$provider"` statements.
+Vendor probes execute in `quota_sentinel.runtime.quota_probe`, which runs the
+isolated helper scripts (`antigravity_usage.py`, `opencode_usage.py`) and the
+CodexBar/Pi adapters under the shared process-group timeout helper, because
+that is where the kill-group and orphan-reaping semantics are proven. Adding a
+fourth provider means: an adapter, a roster entry, and tests — not a new arm
+in a dozen `case "$provider"` statements.
 
 ## Notification boundary
 
-The shell renders and delivers Feishu cards; the *decision* to notify is a
-consequence of scheduler transitions. `/usage` semantics are fixed and must
-not drift:
+`quota_sentinel.runtime.cards` renders and `quota_sentinel.runtime.feishu`
+delivers Feishu cards; the *decision* to notify is a consequence of scheduler
+transitions. `/usage` semantics are fixed and must not drift:
 
 ```text
 /usage = quota fetch + card response, never a model run
@@ -551,12 +575,17 @@ Interpreter strategy — three deliberate classes, not one uniform rule:
 | Class | Runner | Members | Why |
 |---|---|---|---|
 | A. project | `uv run --frozen --no-sync` | `feishu_listener.py` (+ in-process `task_orchestrator`), `quota-sentinel` console script / `python -m quota_sentinel`, Python test suites | the only third-party dependency (`lark-oapi`) lives here; daemon must never resolve/sync/network at start |
-| B. isolated | `uv run --offline --no-project --no-config python -B …` | `antigravity_usage.py` | deliberate supply-chain boundary: must stay outside the project even now that a root pyproject exists — `--no-project` is load-bearing and pinned by tests/antigravity-native-regression.py |
-| C. system | `/usr/bin/python3` (`PYTHON3_BIN`, retained) | `run_with_timeout.py`, `opencode_usage.py`, native-probe python check, the scheduler bridge, the `status` next-due seam | stdlib-only, invoked on shell/scheduler hot paths; must not gain uv startup latency, cache, or environment coupling; the >=3.9 floor keeps class C and the uv project env behaviorally identical for this code |
+| B. isolated | `uv run --offline --no-project --no-config python -B …` | `antigravity_usage.py` | deliberate supply-chain boundary: must stay outside the project even now that a root pyproject exists — `--no-project` is load-bearing and pinned by tests/python-quota-adapter-regression.py |
+| C. system | `/usr/bin/python3` | `run_with_timeout.py`, `opencode_usage.py`, native-probe python check, the internal `scheduler-*` bridge verbs, the `status` next-due seam | stdlib-only, invoked on hot paths and importable with `-S`; must not gain uv startup latency, cache, or environment coupling; the >=3.9 floor keeps class C and the uv project env behaviorally identical for this code |
 
-The scheduler bridge belongs in class C by the same argument that created the
-class: the precision timer tick must not pay a project start-up, and a
-decision must keep working while the project environment is being rebuilt.
+Class C is a property of the import graph, not of a shell caller: the
+`scheduler-*` bridge verbs and the runtime modules they reach must stay
+stdlib-only so a decision keeps working while the project environment is
+being rebuilt, and so `/usr/bin/python3 -S` can always import them.
+`tests/uv-project-regression.py` UV11 and
+`tests/python-architecture-audit-regression.py` AR5 pin that graph;
+`tests/python-entrypoint-regression.py` E11 does the same for the runtime
+package.
 
 LaunchAgent lifecycle: setup phase (`install-launchagents.sh`) verifies uv
 and runs `uv sync --locked` — the ONLY network-capable step; the agent
@@ -598,42 +627,41 @@ re-run `./install-launchagents.sh` (which does `uv sync --locked`);
 runtime failing on a broken env is the designed fail-loud behavior, not a
 bug to self-heal around.
 
-## Shell end state
+## Shell retirement
 
-`quota-sentinel.sh` keeps exactly four responsibilities:
+The zsh implementation is **deleted**. Its responsibilities moved into
+`quota_sentinel` one surface at a time, and the move is complete:
 
-1. **CLI compatibility layer** — `check|wait|run|usage|status` plus the
-   authority lifecycle verbs (`bootstrap-authority --assume-legacy`,
-   `cutover`, `rollback`), which it runs while holding `run.lock`.
-2. **Model runner adapter** — provider CLI invocation, `auth.json`/settings
-   handling, provider environment, process groups, timeouts, and the retry
-   burst's process management. Python decides *whether* to run and *what the
-   outcome means*; the shell decides *how* to run it.
-3. **Quota tier execution** — invoking the vendor probes under the shared
-   timeout helper.
-4. **System glue** — locks, temp dirs, launchd bootstrap, install.
+1. **CLI** — `check|wait|run|usage|status`, the diagnostics
+   (`next-due|state-dump|dump|json-dump|authority|migrate`), the notification
+   verbs (`card-preview|send-test-card|discover-feishu-user`) and the
+   authority lifecycle (`bootstrap-authority --assume-legacy`, `cutover`,
+   `rollback`) are all `quota_sentinel.__main__` verbs reached through the
+   `quota-sentinel` console script.
+2. **Model runner** — `quota_sentinel.runtime.models` invokes the provider
+   CLIs with the same environment, process groups, timeouts and kill grace.
+3. **Quota tier execution** — `quota_sentinel.runtime.quota_probe` runs the
+   vendor probes under the shared timeout helper.
+4. **System glue** — `quota_sentinel.runtime.locks` owns `run.lock` /
+   `quota.lock`; the rendered LaunchAgents invoke the console script
+   (`--frozen --no-sync quota-sentinel check|wait`) or the Python listener
+   through the locked uv environment, never a shell.
 
-It no longer contains: scheduler policy, state transition policy, deadline
-algorithms, retry policy values, authoritative state persistence, or quota
-normalisation policy.
+There is no zsh in normal operation, and no compatibility shim to keep one
+alive. `tests/python-entrypoint-regression.py` asserts the shell file is gone
+and that the daemons, templates and installer never mention it.
 
-The model runner staying in shell is a deliberate boundary, not a to-do. Its
-interface is explicit: the scheduler asks for one attempt per provider and
-receives an exit status; the Python side never reads a shell global to make a
-decision.
-
-Shell freeze (still in force): bug fixes, compatibility fixes,
-provider-specific model-runner adjustments, and thin call-through layers to
-Python are allowed. New long-lived subsystems, new scheduler state files,
-large new quota-parsing blocks, per-provider copies of the quota pipeline, and
-new scheduler policy branches are not.
+The class-C boundary is what survived the retirement, in its stronger form:
+the runtime import graph is stdlib-only and importable by the system
+interpreter (see *Python runtime / dependency ownership* above). That is a
+property of the code, not of a caller, and the tests pin it directly.
 
 ## Migration and rollback
 
 Upgrading an existing deployment:
 
 ```text
-0. ./quota-sentinel.sh bootstrap-authority --assume-legacy
+0. uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy
                                       ONE-TIME, and only for a deployment the
                                       operator has confirmed predates the
                                       protocol; nothing automatic does this
@@ -642,10 +670,18 @@ Upgrading an existing deployment:
                                       VALIDATE the authority manifest (and
                                       fail if it is missing/unreadable),
                                       restart the listener
-2. ./quota-sentinel.sh cutover        under run.lock, verified, atomic,
+2. uv run --frozen --no-sync quota-sentinel cutover
+                                      under run.lock, verified, atomic,
                                       whole roster
 3. legacy slot files remain on disk, untouched, as the rollback artifact
 ```
+
+A deployment still on the pre-per-provider (monolithic) slot layout must run
+the retired shell implementation **once**, from the branch point in git
+history, before using the port: the port has no reader for unprefixed
+`last-task-at` / `next-due-at` / `last-triggered-window` files. That
+bootstrap was deliberately not ported; it is unreachable for any deployment
+already on per-provider files.
 
 The installer retires the legacy schedulers BEFORE it starts the listener, so
 the post-condition is "only the listener/orchestrator is loaded" rather than
@@ -681,12 +717,14 @@ user's state is their decision, and the files are harmless once retired.
 
 ## Testing doctrine
 
-* The zsh suites are the BLACK-BOX compatibility contract for behavior the
-  user sees: CLI parity, scheduler decisions, retry semantics, `/usage`,
-  cards. Migrating logic into Python does not retire them — a new Python suite
-  is an *additional* white-box proof.
-* Python suites are the white-box proof for transitions, the authority
-  protocol, the schema and the store contracts.
+* The Python suites are the contract: `tests/python-*-regression.py` pin the
+  operator-visible behaviour (CLI verbs, scheduler decisions, retry
+  semantics, `/usage`, cards) and the white-box proofs (transitions, the
+  authority protocol, the schema and the store contracts). The zsh suites
+  that once provided the black-box half were retired with the implementation
+  they drove; `docs/superpowers/plans/2026-09-22-full-python-port.md` records,
+  behaviour by behaviour, what replaced each of them and what did not carry
+  over.
 * A test may only be changed when the CONTRACT changed, and the change must be
   explained. Timeouts and thresholds are not relaxed to reach green.
 * Persistence and scheduler suites run under `python -O` too: no security or

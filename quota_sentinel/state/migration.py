@@ -31,7 +31,7 @@ from .json_store import JsonStateStore
 from .schema import serialize_state
 from .store import FileStateStore, StateStoreError
 
-# Must match the shell's readonly PROVIDERS in quota-sentinel.sh; the
+# The provider roster the retired shell also declared; the
 # parity regression asserts this roster against the real shell array.
 DEFAULT_PROVIDERS: Tuple[str, ...] = ("codex", "antigravity", "opencode")
 
