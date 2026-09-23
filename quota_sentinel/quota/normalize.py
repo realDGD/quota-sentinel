@@ -61,9 +61,11 @@ __all__ = [
     "PI_SNAPSHOT_SOURCE",
     "demote_to_cached",
     "normalize_codexbar_antigravity",
+    "normalize_codexbar_clinepass",
     "normalize_codexbar_codex",
     "normalize_codexbar_opencode",
     "normalize_pi_antigravity",
+    "normalize_pi_clinepass",
     "normalize_pi_codex",
     "normalize_pi_opencode",
     "read_document",
@@ -733,6 +735,136 @@ def normalize_codexbar_opencode(raw: list) -> ProviderQuota:
             reset_at=_epoch_opencode(
                 weekly.get("resetsAt"), "codexbar opencode weekly.resetsAt"
             ),
+        ),
+        monthly=monthly,
+    )
+
+
+def normalize_codexbar_clinepass(raw: list) -> ProviderQuota:
+    """CodexBar's ClinePass row: 300 / 10080 / 43200-minute windows.
+
+    CodexBar reports `five_hour`, `weekly` and `monthly` as the primary,
+    secondary and tertiary windows and, unlike every other provider here,
+    omits `resetsAt` entirely while the account has no open window. A window
+    without a reset cannot become a deadline, so such a reading is rejected and
+    the ladder falls through to the cache and the snapshot — the honest
+    outcome for "this account has not started a window yet".
+
+    The monthly cap is display-only, so its absence is tolerated rather than
+    failing the reading (the same rule `normalize_pi_opencode` states for the
+    OpenCode monthly window).
+    """
+    row = _codexbar_row(raw, "clinepass")
+    usage = row["usage"]
+    windows = [
+        window
+        for window in (
+            usage.get("primary"),
+            usage.get("secondary"),
+            usage.get("tertiary"),
+        )
+        if window is not None
+    ]
+    five = _first_window(windows, 300, True, "codexbar clinepass")
+    weekly = _first_window(windows, 10080, True, "codexbar clinepass")
+    if five is None or weekly is None:
+        _reject("codexbar clinepass: no 300/10080 window pair")
+
+    monthly_raw = _first_window(windows, 43200, True, "codexbar clinepass")
+    monthly: Optional[QuotaWindow] = None
+    if monthly_raw is not None:
+        monthly = QuotaWindow(
+            remaining_percent=_remaining_percent(
+                monthly_raw.get("usedPercent"),
+                "codexbar clinepass monthly.usedPercent",
+            ),
+            reset_at=_epoch_opencode(
+                monthly_raw.get("resetsAt"), "codexbar clinepass monthly.resetsAt"
+            ),
+        )
+
+    return ProviderQuota(
+        source=CODEXBAR_SOURCE_PREFIX
+        + _or_default(row.get("source"), "api", "codexbar clinepass source"),
+        fresh=True,
+        cached=False,
+        captured_at=_now_epoch(),
+        five_hour=QuotaWindow(
+            remaining_percent=_remaining_percent(
+                five.get("usedPercent"),
+                "codexbar clinepass fiveHour.usedPercent",
+            ),
+            reset_at=_epoch_opencode(
+                five.get("resetsAt"), "codexbar clinepass fiveHour.resetsAt"
+            ),
+        ),
+        weekly=QuotaWindow(
+            remaining_percent=_remaining_percent(
+                weekly.get("usedPercent"),
+                "codexbar clinepass weekly.usedPercent",
+            ),
+            reset_at=_epoch_opencode(
+                weekly.get("resetsAt"), "codexbar clinepass weekly.resetsAt"
+            ),
+        ),
+        monthly=monthly,
+    )
+
+
+def normalize_pi_clinepass(raw: dict) -> ProviderQuota:
+    """The direct transport's snapshot, in the retired capture's shape.
+
+    ``runtime/direct.py`` writes this document from the vendor's own
+    ``/plan/usage-limits`` answer, so the keys are ``fiveHour`` / ``weekly`` /
+    ``monthly`` with ``{remainingPercent, resetAt}`` — byte-compatible with what
+    ``capture-opencode-quota.ts`` used to write for OpenCode. monthly stays
+    optional for the same display-only reason.
+    """
+    if not isinstance(raw, dict):
+        _reject(
+            "pi clinepass: expected a JSON object, got %s" % type(raw).__name__
+        )
+    five_hour = _field(raw, "fiveHour", "pi clinepass")
+    weekly = _field(raw, "weekly", "pi clinepass")
+    if not isinstance(five_hour, dict) or not isinstance(weekly, dict):
+        _reject("pi clinepass: fiveHour/weekly object select failed")
+
+    five_remaining, five_reset = _tonumber_window(five_hour, "fiveHour")
+    weekly_remaining, weekly_reset = _tonumber_window(weekly, "weekly")
+    if not (0 <= five_remaining <= 100 and 0 <= weekly_remaining <= 100):
+        _reject("pi clinepass: remaining-percent select failed")
+
+    monthly: Optional[QuotaWindow] = None
+    try:
+        monthly_remaining, monthly_reset = _tonumber_window(
+            _field(raw, "monthly", "pi clinepass"), "monthly"
+        )
+    except QuotaNormalizationError:
+        monthly = None
+    else:
+        monthly = QuotaWindow(
+            remaining_percent=_jq_int(
+                monthly_remaining, "pi clinepass monthly.remainingPercent"
+            ),
+            reset_at=_jq_int(monthly_reset, "pi clinepass monthly.resetAt"),
+        )
+
+    return ProviderQuota(
+        source=PI_SNAPSHOT_SOURCE,
+        fresh=False,
+        cached=True,
+        captured_at=_epoch_ts(_field(raw, "capturedAt", "pi clinepass")),
+        five_hour=QuotaWindow(
+            remaining_percent=_jq_int(
+                five_remaining, "pi clinepass fiveHour.remainingPercent"
+            ),
+            reset_at=_jq_int(five_reset, "pi clinepass fiveHour.resetAt"),
+        ),
+        weekly=QuotaWindow(
+            remaining_percent=_jq_int(
+                weekly_remaining, "pi clinepass weekly.remainingPercent"
+            ),
+            reset_at=_jq_int(weekly_reset, "pi clinepass weekly.resetAt"),
         ),
         monthly=monthly,
     )

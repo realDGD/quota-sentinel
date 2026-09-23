@@ -102,7 +102,8 @@ class CardTests(unittest.TestCase):
                 body = card(payload)
                 text = json.dumps(body["body"], ensure_ascii=False)
                 self.assertEqual(text.count("本月度"), 1)
-                self.assertEqual(text.count("DeepSeek V4 Flash · Off"), 1)
+                self.assertEqual(
+                    text.count("DeepSeek V4.1 Flash · OpenCode Go"), 1)
                 self.assertEqual(len([e for e in body["body"]["elements"] if e.get("tag") == "column_set" and e.get("flex_mode") == "none"]), len(providers))
 
     def test_usage_covers_full_roster_without_status_and_handles_missing_quota(self):
@@ -296,11 +297,11 @@ class TransportTests(unittest.TestCase):
         notifier.busy(NOW)
         self.assertEqual(len(client.sent), 3)
         self.assertEqual(client.sent[0]["receive_id"], "u")
-        self.assertIn("DeepSeek V4 Flash · Off", client.sent[0]["content"])
+        self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", client.sent[0]["content"])
         usage_text = json.dumps(card(client.sent[1]), ensure_ascii=False)
         self.assertIn("GPT-5.6 Luna", usage_text)
         self.assertIn("Gemini 3.7 Flash · Low", usage_text)
-        self.assertIn("DeepSeek V4 Flash · Off", usage_text)
+        self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", usage_text)
         self.assertIn("配额正在刷新", client.sent[2]["content"])
 
 

@@ -31,9 +31,11 @@ from .json_store import JsonStateStore
 from .schema import serialize_state
 from .store import FileStateStore, StateStoreError
 
-# The provider roster the retired shell also declared; the
-# parity regression asserts this roster against the real shell array.
-DEFAULT_PROVIDERS: Tuple[str, ...] = ("codex", "antigravity", "opencode")
+# The provider roster the retired shell also declared, extended with ClinePass
+# (which the shell never knew). The parity regression asserts this roster
+# against the real shell array plus the providers the port added; it must stay
+# equal to `quota.adapters.PROVIDERS`.
+DEFAULT_PROVIDERS: Tuple[str, ...] = ("codex", "antigravity", "opencode", "clinepass")
 
 ACTION_SEEDED = "seeded"
 ACTION_EXISTS = "json-exists"

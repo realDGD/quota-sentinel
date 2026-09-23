@@ -214,7 +214,7 @@ class ApplicationTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=0),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(
                 provider, ProviderState(), ProviderState(next_due_at=3000)
             )
@@ -230,7 +230,7 @@ class ApplicationTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=0),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(
                 provider, ProviderState(), ProviderState(next_due_at=3000)
             )
@@ -256,7 +256,7 @@ class ApplicationTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=900, next_due_at=500),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(
                 provider, ProviderState(), ProviderState(next_due_at=3000)
             )
@@ -271,7 +271,7 @@ class ApplicationTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=0, next_due_at=500),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(
                 provider, ProviderState(), ProviderState(next_due_at=3000)
             )
@@ -290,7 +290,7 @@ class ApplicationTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=0, next_due_at=500),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(
                 provider, ProviderState(), ProviderState(next_due_at=3000)
             )
@@ -437,7 +437,7 @@ class BurstEngineTests(unittest.TestCase):
             "codex", ProviderState(),
             ProviderState(retry_pending=True, last_attempt_at=0),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(provider, ProviderState(), ProviderState(next_due_at=4000000000))
         app, calls, notifier = self.build([False, True], watchdog=2)
         app.check()
@@ -453,7 +453,8 @@ class BurstEngineTests(unittest.TestCase):
                 provider, ProviderState(),
                 ProviderState(retry_pending=True, last_attempt_at=0),
             )
-        store.commit("opencode", ProviderState(), ProviderState(next_due_at=4000000000))
+        for provider in (p for p in PROVIDERS if p not in ("codex", "antigravity")):
+            store.commit(provider, ProviderState(), ProviderState(next_due_at=4000000000))
         app, calls, _ = self.build([True, True], watchdog=2)
         app.check()
         self.assertEqual(sorted(c[0] for c in calls), ["antigravity", "codex"])
@@ -498,7 +499,7 @@ class BurstEngineTests(unittest.TestCase):
             ProviderState(retry_pending=True, last_attempt_at=900,
                           next_due_at=500, last_known_reset=400),
         )
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(provider, ProviderState(), ProviderState(next_due_at=4000000000))
         app, calls, _ = self.build([], readings={"codex": fresh_reading(2000)})
         app.check()
@@ -545,7 +546,7 @@ class BurstEngineTests(unittest.TestCase):
         store = FileStateStore(self.state_dir)
         store.commit("codex", ProviderState(),
                      ProviderState(retry_pending=True, last_attempt_at=900))
-        for provider in ("antigravity", "opencode"):
+        for provider in (p for p in PROVIDERS if p != "codex"):
             store.commit(provider, ProviderState(),
                          ProviderState(next_due_at=4000000000))
         app, calls, _ = self.build([])

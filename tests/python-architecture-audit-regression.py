@@ -329,7 +329,7 @@ class QuotaAdapterCapabilities(unittest.TestCase):
         sys.path.insert(0, str(REPO))
         from quota_sentinel.quota.adapters import ADAPTERS
         monthly = sorted(p for p, a in ADAPTERS.items() if a.monthly_display_only)
-        self.assertEqual(monthly, ["opencode"])
+        self.assertEqual(monthly, ["clinepass", "opencode"])
 
 
 class LifecycleLockOwnership(unittest.TestCase):

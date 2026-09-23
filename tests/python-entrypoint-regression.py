@@ -36,7 +36,7 @@ sys.path.insert(0, str(REPO))
 
 from quota_sentinel.state import bootstrap_legacy_authority
 
-PROVIDERS = ("codex", "antigravity", "opencode")
+PROVIDERS = ("codex", "antigravity", "opencode", "clinepass")
 TEMPLATES = (
     "quota-sentinel.feishu-listener.plist.template",
     "quota-sentinel.plist.template",
@@ -215,7 +215,9 @@ class EntrypointCase(unittest.TestCase):
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         content = json.loads(payload["content"])
         text = json.dumps(content, ensure_ascii=False)
-        for title in ("GPT-5.6 Luna", "Gemini 3.7 Flash · Low", "DeepSeek V4 Flash · Off"):
+        for title in ("GPT-5.6 Luna", "Gemini 3.7 Flash · Low",
+                      "DeepSeek V4.1 Flash · OpenCode Go",
+                      "DeepSeek V4.1 Flash · ClinePass"):
             self.assertIn(title, text)
 
         from quota_sentinel.runtime.locks import acquire_quota_lock
@@ -235,7 +237,7 @@ class EntrypointCase(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["receive_id"], "mock-user-id")
         self.assertEqual(payload["msg_type"], "interactive")
-        self.assertIn("DeepSeek V4 Flash · Off", payload["content"])
+        self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", payload["content"])
 
     # ---- E9: deployment invokes Python only ------------------------------
     def test_e9_launch_agent_templates_never_invoke_a_shell(self):

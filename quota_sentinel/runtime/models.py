@@ -82,7 +82,10 @@ class AttemptResult:
 _PI_PROVIDER = {
     "codex": ("openai-codex", "gpt-5.6-luna", "off", "PI_CODEX_QUOTA_FILE"),
     "antigravity": ("antigravity", "gemini-3.7-flash", "low", "PI_ANTIGRAVITY_QUOTA_FILE"),
-    "opencode": ("opencode-go", "deepseek-v4-flash", "off", "PI_OPENCODE_QUOTA_FILE"),
+    # OpenCode Go is delivered by runtime/direct.py in production; this row
+    # stays because the Pi transport remains selectable, and the model is kept
+    # identical to the direct one so a transport A/B compares transports only.
+    "opencode": ("opencode-go", "deepseek-v4.1-flash", "off", "PI_OPENCODE_QUOTA_FILE"),
 }
 _QUOTA_ENV_KEYS = tuple(item[3] for item in _PI_PROVIDER.values())
 _PROMPT = "不用思考，只回复我 1"

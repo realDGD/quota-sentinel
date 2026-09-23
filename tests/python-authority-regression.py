@@ -80,7 +80,7 @@ from quota_sentinel.scheduler.models import QuotaObservation
 from quota_sentinel.state import cutover as cutover_module
 from quota_sentinel.state import store as store_module
 
-PROVIDERS = ("codex", "antigravity", "opencode")
+PROVIDERS = ("codex", "antigravity", "opencode", "clinepass")
 REAL_PUBLISH_ATOMIC = store_module._publish_atomic
 
 

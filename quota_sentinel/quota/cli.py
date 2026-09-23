@@ -36,9 +36,11 @@ NORMALIZERS: Dict[str, Callable] = {
     "pi-codex": normalize.normalize_pi_codex,
     "pi-antigravity": normalize.normalize_pi_antigravity,
     "pi-opencode": normalize.normalize_pi_opencode,
+    "pi-clinepass": normalize.normalize_pi_clinepass,
     "codexbar-codex": normalize.normalize_codexbar_codex,
     "codexbar-antigravity": normalize.normalize_codexbar_antigravity,
     "codexbar-opencode": normalize.normalize_codexbar_opencode,
+    "codexbar-clinepass": normalize.normalize_codexbar_clinepass,
 }
 
 RENORMALIZE = "renormalize"

@@ -13,16 +13,21 @@ from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from quota_sentinel.notifications.plan import Layout, plan_task
+from quota_sentinel.quota.adapters import ADAPTERS
 
 
 TITLE = "AI 模型运行与配额"
 FOOTER = '<font color="grey">Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底</font>'
 V1_FOOTER = "Pi 自动任务 · Fresh 重置后 4 分钟 · 无数据时 5 小时 01 分兜底"
 PROVIDER_TITLES = {
-    "codex": "GPT-5.6 Luna",
-    "antigravity": "Gemini 3.7 Flash · Low",
-    "opencode": "DeepSeek V4 Flash · Off",
+    provider: adapter.title for provider, adapter in ADAPTERS.items()
 }
+# A provider carries a third (monthly) window when its adapter says so; no
+# name is special-cased here any more, so adding a monthly plan cannot forget
+# to add its card line.
+MONTHLY_PROVIDERS = frozenset(
+    provider for provider, adapter in ADAPTERS.items() if adapter.monthly_display_only
+)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -182,7 +187,7 @@ def _provider_elements(provider: str, result: str, reading: Any, mode: str, now:
         elements.append(_column_set([_column(five), _column(weekly)], flex="stretch", spacing="medium"))
     else:
         elements.extend(five + weekly)
-    if provider == "opencode":
+    if provider in MONTHLY_PROVIDERS:
         monthly = _document(reading).get("monthly")
         if isinstance(monthly, Mapping):
             pct = _number(monthly.get("remainingPercent"))

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Sequence, Tuple
 
+from quota_sentinel.quota.adapters import ADAPTERS
+
 
 class NotificationEvent(Enum):
     """One reason to talk to the user."""
@@ -41,8 +43,16 @@ class Layout(Enum):
     TEXT = "text"            # no card at all (busy/plain payload)
 
 
-# The provider whose third (monthly) window forces the stacked layout: no
-# other provider's blocks fit beside a three-window column.
+# The providers whose third (monthly) window forces the stacked layout: no
+# other provider's blocks fit beside a three-window column. This is a
+# capability read off the adapters, not a name: ClinePass joined OpenCode as a
+# three-window plan, and a name-shaped rule would have silently mis-laid-out
+# every card that included it.
+WIDE_PROVIDERS = frozenset(
+    provider for provider, adapter in ADAPTERS.items()
+    if adapter.monthly_display_only
+)
+# The single provider the shell's rule named, kept for callers that asked.
 WIDE_PROVIDER = "opencode"
 
 
@@ -78,7 +88,7 @@ def layout_for(providers: Sequence[str]) -> Layout:
         return Layout.TEXT
     if len(members) == 1:
         return Layout.SINGLE
-    if len(members) > 2 or WIDE_PROVIDER in members:
+    if len(members) > 2 or WIDE_PROVIDERS.intersection(members):
         return Layout.STACKED
     return Layout.TWO_COLUMN
 
@@ -135,6 +145,7 @@ __all__ = [
     "Layout",
     "NotificationPlan",
     "WIDE_PROVIDER",
+    "WIDE_PROVIDERS",
     "layout_for",
     "plan_task",
     "plan_usage",

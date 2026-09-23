@@ -21,12 +21,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from quota_sentinel.app import AppConfig, Application
-from quota_sentinel.quota.adapters import PROVIDERS
+from quota_sentinel.quota.adapters import PROVIDERS, adapter_for
 from quota_sentinel.runtime import keychain, runlog
 from quota_sentinel.runtime.cards import (
     format_reset_time, render_progress_test_card, render_task_card,
     render_usage_card,
 )
+from quota_sentinel.runtime.direct import (
+    DIRECT_PROVIDERS, DIRECT_TIMEOUT_SECONDS, DirectRunner,
+)
+from quota_sentinel.runtime.dispatch import TransportRouter
 from quota_sentinel.runtime.feishu import (
     FeishuClient, FeishuError, FeishuNotifier, KeychainCredentials,
 )
@@ -37,8 +41,11 @@ from quota_sentinel.state.runlock import SHLOCK_BIN
 
 REPO_DIR = Path(__file__).resolve().parents[2]
 OPENCODE_API_KEY_SERVICE = "quota-sentinel.opencode-go-api-key"
+CLINEPASS_API_KEY_SERVICE = "quota-sentinel.clinepass-api-key"
 DRY_RUN_ENV = "FEISHU_DRY_RUN"
+TRANSPORT_ENV = "QUOTA_SENTINEL_TRANSPORT"
 DEFAULT_CURL_BIN = Path("/usr/bin/curl")
+TRANSPORTS = ("pi", "direct")
 
 
 class NotReadyError(RuntimeError):
@@ -110,6 +117,9 @@ def quota_probe_options(environment: Optional[Mapping[str, str]] = None) -> Dict
         "opencode_codexbar_timeout": _seconds_override(
             env, "QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT", 20
         ),
+        "clinepass_codexbar_timeout": _seconds_override(
+            env, "QUOTA_SENTINEL_CLINEPASS_CODEXBAR_TIMEOUT", 20
+        ),
         "antigravity_native_timeout": _seconds_override(
             env, "QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT", 20
         ),
@@ -140,6 +150,30 @@ def require_ready(
         raise NotReadyError("not ready: " + "; ".join(problems))
 
 
+def transport_for(provider: str) -> str:
+    """How one provider's task is delivered: "pi" or "direct" (the default)."""
+    return adapter_for(provider).transport
+
+
+def provider_transports(environment: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The declared transports, with an operator override for A/B runs.
+
+    ``QUOTA_SENTINEL_TRANSPORT="opencode=pi"`` (comma-separated) moves one
+    provider back onto the Pi agent without editing code, so a transport change
+    can be compared against the path it replaced and reverted by unsetting one
+    variable. Unknown providers and unknown transports are ignored rather than
+    fatal: this is a diagnostic seam, not a configuration file.
+    """
+    env = _env(environment)
+    mapping = {provider: transport_for(provider) for provider in PROVIDERS}
+    for item in env.get(TRANSPORT_ENV, "").split(","):
+        provider, separator, transport = item.partition("=")
+        provider, transport = provider.strip(), transport.strip()
+        if separator and provider in mapping and transport in TRANSPORTS:
+            mapping[provider] = transport
+    return mapping
+
+
 def create_application(
     state_dir: Path, *, environment: Optional[Mapping[str, str]] = None,
     dry_run_flag: Optional[bool] = None,
@@ -149,15 +183,26 @@ def create_application(
 ) -> Application:
     env = _env(environment)
     state_dir = Path(state_dir)
-    # The runner's per-attempt lines carry phase/attempt/result/elapsed and a
-    # REDACTED stderr summary; without this seam a failed attempt would leave
-    # no trace at all in the operator's run log.
-    runner = ModelRunner(
-        ModelRunnerConfig.from_env(env),
-        logger=logging.getLogger("quota_sentinel.model").info,
+    options = quota_probe_options(env)
+    logger = logging.getLogger("quota_sentinel.model").info
+    # Two transports, one surface. The Pi runner's per-attempt lines carry
+    # phase/attempt/result/elapsed and a REDACTED stderr summary; without this
+    # seam a failed attempt would leave no trace at all in the operator's run
+    # log. The direct runner speaks the same lines, so one log covers both.
+    pi_runner = ModelRunner(ModelRunnerConfig.from_env(env), logger=logger)
+    direct_runner = DirectRunner(
+        curl_bin=options["curl_bin"],
+        timeout=_seconds_override(
+            env, "QUOTA_SENTINEL_DIRECT_TIMEOUT", DIRECT_TIMEOUT_SECONDS
+        ),
+        logger=logging.getLogger("quota_sentinel.direct").info,
+        environment=env,
+    )
+    runner = TransportRouter(
+        {"pi": pi_runner, "direct": direct_runner},
+        provider_transports(env),
     )
     notifier = create_notifier(environment=env, dry_run_flag=dry_run_flag)
-    options = quota_probe_options(env)
 
     def collector_factory(workspace: Path) -> QuotaCollector:
         # The same seam the model runner already has. Without it every tier
@@ -186,7 +231,12 @@ def create_application(
 # Readiness and status
 # ---------------------------------------------------------------------------
 
-def _provider_hooks(provider: str, config: ModelRunnerConfig) -> List[Path]:
+def _provider_hooks(provider: str, config: ModelRunnerConfig, transport: str) -> List[Path]:
+    if transport != "pi":
+        # A direct provider never starts Pi, so neither the capture extension
+        # nor Pi's provider extension is part of its delivery path; requiring
+        # a file this deployment does not use would refuse runs that work.
+        return []
     hooks = [REPO_DIR / ("capture-%s-quota.ts" % provider)]
     if provider == "antigravity":
         # Pi loads this provider extension for antigravity runs; a model
@@ -197,7 +247,7 @@ def _provider_hooks(provider: str, config: ModelRunnerConfig) -> List[Path]:
 
 def _auth_has_provider(path: Path, provider: str) -> bool:
     key = {"codex": "openai-codex", "antigravity": "antigravity",
-           "opencode": "opencode-go"}[provider]
+           "opencode": "opencode-go", "clinepass": "clinepass"}[provider]
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -205,13 +255,32 @@ def _auth_has_provider(path: Path, provider: str) -> bool:
     return isinstance(document, dict) and key in document
 
 
+def direct_api_key_available(
+    provider: str, *, environment: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Whether a direct provider's key is reachable, env var or Keychain.
+
+    A missing key is reported by `status` and fails the provider's own attempt
+    in milliseconds; it deliberately does not refuse the whole roster, which is
+    how the port treated the OpenCode key before the direct transport existed.
+    """
+    env = _env(environment)
+    spec = DIRECT_PROVIDERS[provider]
+    if spec.env_key and env.get(spec.env_key):
+        return True
+    return keychain.present(spec.key_service, environment=env)
+
+
 def opencode_api_key_available(
     *, environment: Optional[Mapping[str, str]] = None
 ) -> bool:
-    env = _env(environment)
-    if env.get("OPENCODE_API_KEY"):
-        return True
-    return keychain.present(OPENCODE_API_KEY_SERVICE, environment=env)
+    return direct_api_key_available("opencode", environment=environment)
+
+
+def clinepass_api_key_available(
+    *, environment: Optional[Mapping[str, str]] = None
+) -> bool:
+    return direct_api_key_available("clinepass", environment=environment)
 
 
 def readiness_problems(
@@ -221,30 +290,45 @@ def readiness_problems(
     env = _env(environment)
     problems: List[str] = []
     config = ModelRunnerConfig.from_env(env)
+    transports = provider_transports(env)
+
+    # Only a provider that actually runs through Pi may demand the Pi binary,
+    # Pi's credential store or a capture extension. A direct provider whose key
+    # is missing fails in milliseconds inside its own attempt instead, without
+    # spending a single token, so it is reported by `status` rather than
+    # refusing the whole roster.
+    pi_providers = [
+        provider for provider in providers
+        if provider in PROVIDERS and transports.get(provider) == "pi"
+    ]
 
     executables = {
-        "pi": config.pi_bin,
         "curl": quota_probe_options(env)["curl_bin"],
         "security": Path(keychain.SECURITY_BIN),
         "shlock": Path(SHLOCK_BIN),
     }
+    if pi_providers:
+        executables["pi"] = config.pi_bin
     for name, path in executables.items():
         if not os.access(path, os.X_OK):
             problems.append("%s is not executable: %s" % (name, path))
 
-    if not os.access(config.auth_file, os.R_OK):
-        problems.append("Pi OAuth credential is not readable: %s" % config.auth_file)
-    else:
-        for provider in providers:
-            if provider not in PROVIDERS:
-                problems.append("unknown provider: %s" % provider)
-            elif not _auth_has_provider(config.auth_file, provider):
-                problems.append("Pi credential for %s is missing" % provider)
+    for provider in providers:
+        if provider not in PROVIDERS:
+            problems.append("unknown provider: %s" % provider)
+
+    if pi_providers:
+        if not os.access(config.auth_file, os.R_OK):
+            problems.append("Pi OAuth credential is not readable: %s" % config.auth_file)
+        else:
+            for provider in pi_providers:
+                if not _auth_has_provider(config.auth_file, provider):
+                    problems.append("Pi credential for %s is missing" % provider)
 
     for provider in providers:
         if provider not in PROVIDERS:
             continue
-        for hook in _provider_hooks(provider, config):
+        for hook in _provider_hooks(provider, config, transports.get(provider, "pi")):
             if not os.access(hook, os.R_OK):
                 problems.append("%s quota hook is not readable: %s" % (provider, hook))
 
@@ -281,6 +365,7 @@ def status_lines(
         )
     else:
         lines.append("quota primary: unavailable; last Pi snapshots may be used")
+    transports = provider_transports(env)
     if opencode_api_key_available(environment=env):
         lines.append("opencode api key: configured")
     else:
@@ -288,6 +373,15 @@ def status_lines(
             "opencode api key: missing (%s); Native tier disabled"
             % OPENCODE_API_KEY_SERVICE
         )
+    if clinepass_api_key_available(environment=env):
+        lines.append("clinepass api key: configured")
+    else:
+        lines.append(
+            "clinepass api key: missing (%s); CodexBar tier only"
+            % CLINEPASS_API_KEY_SERVICE
+        )
+    for provider in PROVIDERS:
+        lines.append("transport %s: %s" % (provider, transports.get(provider, "pi")))
 
     states = service.load_roster(Path(state_dir), PROVIDERS)
     for provider in PROVIDERS:
@@ -328,6 +422,13 @@ def preview_readings(now: int) -> Dict[str, Dict[str, Any]]:
             "weekly": window(95, now + 317340),
             "monthly": window(98, now + 2574000),
         },
+        "clinepass": {
+            "source": "CodexBar · api", "fresh": True,
+            "capturedAt": now,
+            "fiveHour": window(91, now + 17280),
+            "weekly": window(97, now + 590400),
+            "monthly": window(99, now + 2566800),
+        },
     }
 
 
@@ -347,6 +448,8 @@ def preview_payload(
         members = ("antigravity",)
     elif mode == "opencode":
         members = ("opencode",)
+    elif mode == "clinepass":
+        members = ("clinepass",)
     elif mode == "both":
         # "both" keeps its historical meaning: the original pair.
         members = ("codex", "antigravity")
@@ -376,8 +479,9 @@ def run_log_dir() -> Path:
 
 
 __all__ = [
-    "REPO_DIR", "create_application", "create_notifier", "dry_run",
-    "opencode_api_key_available", "preview_payload", "preview_readings",
+    "REPO_DIR", "create_application", "create_notifier", "direct_api_key_available",
+    "dry_run", "clinepass_api_key_available", "opencode_api_key_available",
+    "preview_payload", "preview_readings", "provider_transports",
     "quota_probe_options", "readiness_problems", "require_ready", "run_log_dir",
-    "send_payload", "status_lines",
+    "send_payload", "status_lines", "transport_for",
 ]

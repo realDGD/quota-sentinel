@@ -221,7 +221,7 @@ class ModelRunnerTests(unittest.TestCase):
                             [str(self.root / "antigravity-provider.ts"),
                              str(REPO / "capture-antigravity-quota.ts")],
                             "PI_ANTIGRAVITY_QUOTA_FILE"),
-            "opencode": ("opencode-go", "deepseek-v4-flash", "off",
+            "opencode": ("opencode-go", "deepseek-v4.1-flash", "off",
                          [str(REPO / "capture-opencode-quota.ts")], "PI_OPENCODE_QUOTA_FILE"),
         }
         for provider, (pi_provider, model, thinking, extensions, quota_key) in cases.items():

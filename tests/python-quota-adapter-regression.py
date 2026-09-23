@@ -196,8 +196,10 @@ CODEXBAR_OPENCODE = [
 
 
 class AdapterTests(unittest.TestCase):
-    def test_roster_order_is_codex_antigravity_opencode(self):
-        self.assertEqual(PROVIDERS, ("codex", "antigravity", "opencode"))
+    def test_roster_order_is_codex_antigravity_opencode_clinepass(self):
+        self.assertEqual(
+            PROVIDERS, ("codex", "antigravity", "opencode", "clinepass")
+        )
         self.assertEqual(tuple(ADAPTERS), PROVIDERS)
         self.assertEqual(
             tuple(adapter.provider for adapter in ADAPTERS.values()), PROVIDERS
@@ -218,8 +220,22 @@ class AdapterTests(unittest.TestCase):
             ["native", "codexbar-live", "codexbar-cache", "pi-snapshot"],
         )
         for provider in PROVIDERS:
+            if provider == "clinepass":
+                # ClinePass has no native helper yet; its ladder starts at the
+                # bundled CodexBar provider and keeps the snapshot fallback.
+                self.assertEqual(
+                    tier_plan(provider),
+                    (Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT),
+                )
+                continue
             self.assertEqual(tier_plan(provider), TIER_LADDER)
             self.assertEqual(adapter_for(provider).tiers, TIER_LADDER)
+
+    def test_transport_names_who_delivers_the_task(self):
+        self.assertEqual(adapter_for("codex").transport, "pi")
+        self.assertEqual(adapter_for("antigravity").transport, "pi")
+        self.assertEqual(adapter_for("opencode").transport, "direct")
+        self.assertEqual(adapter_for("clinepass").transport, "direct")
 
     def test_tier_is_fresh_only_for_the_two_live_tiers(self):
         adapter = adapter_for("codex")
@@ -228,18 +244,20 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(adapter.tier_is_fresh(Tier.CODEXBAR_CACHE))
         self.assertFalse(adapter.tier_is_fresh(Tier.PI_SNAPSHOT))
         for provider in PROVIDERS:
-            self.assertTrue(adapter_for(provider).tier_is_fresh(Tier.NATIVE))
+            self.assertTrue(adapter_for(provider).tier_is_fresh(Tier.CODEXBAR_LIVE))
             self.assertFalse(adapter_for(provider).tier_is_fresh(Tier.PI_SNAPSHOT))
 
-    def test_monthly_display_only_is_true_only_for_opencode(self):
+    def test_monthly_display_only_marks_the_three_window_plans(self):
         self.assertTrue(ADAPTERS["opencode"].monthly_display_only)
+        self.assertTrue(ADAPTERS["clinepass"].monthly_display_only)
         self.assertFalse(ADAPTERS["codex"].monthly_display_only)
         self.assertFalse(ADAPTERS["antigravity"].monthly_display_only)
 
-    def test_card_titles_match_the_shell(self):
+    def test_card_titles_name_the_plan_and_model(self):
         self.assertEqual(ADAPTERS["codex"].title, "GPT-5.6 Luna")
         self.assertEqual(ADAPTERS["antigravity"].title, "Gemini 3.7 Flash · Low")
-        self.assertEqual(ADAPTERS["opencode"].title, "DeepSeek V4 Flash · Off")
+        self.assertEqual(ADAPTERS["opencode"].title, "DeepSeek V4.1 Flash · OpenCode Go")
+        self.assertEqual(ADAPTERS["clinepass"].title, "DeepSeek V4.1 Flash · ClinePass")
 
     def test_unknown_provider_raises_key_error(self):
         for unknown in ("backend", "", "Codex"):

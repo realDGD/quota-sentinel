@@ -78,7 +78,7 @@ class QuotaProbeTests(unittest.TestCase):
                 # Codex degrades to its cache instead of aborting the roster…
                 self.assertEqual(readings["codex"].tier, Tier.CODEXBAR_CACHE)
                 # …and the other providers are still collected independently.
-                self.assertEqual(sorted(readings), ["antigravity", "codex", "opencode"])
+                self.assertEqual(sorted(readings), ["antigravity", "clinepass", "codex", "opencode"])
 
     def test_a_codex_app_server_that_dies_immediately_does_not_escape_collect(self):
         codex = self.binary("codex", """
@@ -86,7 +86,7 @@ import sys
 sys.stdin.close()
 """)
         readings = self.collector(codex_bin=codex).collect()
-        self.assertEqual(sorted(readings), ["antigravity", "codex", "opencode"])
+        self.assertEqual(sorted(readings), ["antigravity", "clinepass", "codex", "opencode"])
 
     def test_out_of_range_captured_at_in_a_persisted_file_fails_only_that_tier(self):
         # A zero year is a plain ValueError out of the timestamp parser, not a

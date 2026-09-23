@@ -90,9 +90,18 @@ runs in normal operation.
    - **Primary**: Native `GET https://opencode.ai/zen/go/v1/usage` with the
      API key (`opencode_usage.py`, metadata only; no model prompt).
    - **Fallbacks**: CodexBar Live (`--provider opencodego --source api`),
-     CodexBar cached result, then the Pi session snapshot. The 5-hour rolling
-     window drives the schedule exactly like the other providers; the monthly
-     cap is carried for display only and never participates in scheduling.
+     CodexBar cached result, then the direct-transport snapshot. The 5-hour
+     rolling window drives the schedule exactly like the other providers; the
+     monthly cap is carried for display only and never participates in
+     scheduling.
+4. **ClinePass Quota**:
+   - **Primary**: none yet — the ladder starts at CodexBar Live.
+   - **Fallbacks**: CodexBar Live (`--provider clinepass --source api`),
+     CodexBar cached result, then the direct-transport snapshot.
+     ClinePass reports three limits (5-hour, weekly, monthly) that all share
+     one anchor; the monthly cap is display only. CodexBar omits `resetsAt`
+     entirely while the account has no open window, and such a reading is
+     rejected — an idle plan has no boundary to schedule from.
 
 All live quota calls are metadata-only: they consume no prompt tokens and no
 inference turns.
@@ -127,22 +136,30 @@ variable first, then from these macOS Keychain services under account
 
 `FEISHU_DRY_RUN=1` prints the message instead of calling the API.
 
-The OpenCode Go quota credential is separate from the push credentials and is
-read only by the Native quota tier:
+The two API-key providers keep their own credential, used both by the quota
+ladder and by the direct model transport:
 
 | Credential | Environment override | Keychain service |
 | --- | --- | --- |
 | OpenCode Go API key | `OPENCODE_API_KEY` | `quota-sentinel.opencode-go-api-key` |
+| ClinePass API key | `CLINE_API_KEY` | `quota-sentinel.clinepass-api-key` |
 
 ```bash
 security add-generic-password -U -a quota-sentinel \
   -s quota-sentinel.opencode-go-api-key -w '<OpenCode Go API key>'
+security add-generic-password -U -a quota-sentinel \
+  -s quota-sentinel.clinepass-api-key -w '<ClinePass API key>'
 ```
 
-Without it the provider still runs and still reports quota: the Native tier is
-skipped and CodexBar's `opencodego` provider (which keeps its own copy of the
-key) takes over. A **model** run needs no key here at all — it authenticates
-from Pi's own `opencode-go` entry in `auth.json`.
+Without the OpenCode key the Native tier is skipped and CodexBar's `opencodego`
+provider (which keeps its own copy of the key) takes over; without a key the
+direct attempt itself fails in milliseconds with `credential missing`, before
+spending a token, and `status` reports which key is missing. ClinePass has no
+Native helper yet, so its fresh reading always comes from CodexBar's bundled
+`clinepass` provider.
+
+Codex and Antigravity are delivered by the Pi agent and authenticated from
+Pi's own entries in `auth.json`; they never read these Keychain items.
 
 ### Feishu setup
 
@@ -206,9 +223,9 @@ uv run --frozen --no-sync quota-sentinel wait
 uv run --frozen --no-sync quota-sentinel usage
 uv run --frozen --no-sync quota-sentinel status
 uv run --frozen --no-sync quota-sentinel discover-feishu-user <email-or-mobile>
-uv run --frozen --no-sync quota-sentinel run [codex|antigravity|opencode|all]
-uv run --frozen --no-sync quota-sentinel card-preview [all|both|codex|antigravity|opencode|usage|progress]
-uv run --frozen --no-sync quota-sentinel send-test-card [all|both|codex|antigravity|opencode|usage|progress]
+uv run --frozen --no-sync quota-sentinel run [codex|antigravity|opencode|clinepass|all]
+uv run --frozen --no-sync quota-sentinel card-preview [all|both|codex|antigravity|opencode|clinepass|usage|progress]
+uv run --frozen --no-sync quota-sentinel send-test-card [all|both|codex|antigravity|opencode|clinepass|usage|progress]
 
 # state-backend lifecycle (each acquires the scheduler's run.lock)
 uv run --frozen --no-sync quota-sentinel bootstrap-authority --assume-legacy   # ONE-TIME, see below
@@ -222,7 +239,7 @@ LaunchAgents use the explicit-project form, because launchd's
 
 - `check`: 15-minute watchdog probe. Independently evaluates each provider's 5h quota state without model invocations, and triggers only the provider(s) due for execution.
 - `usage`: Instant quota check sent to Feishu for every provider without triggering model tasks.
-- `run [codex|antigravity|opencode|all]`: Runs specified provider (or all three) and updates its schedule.
+- `run [codex|antigravity|opencode|clinepass|all]`: Runs the specified provider (or the whole roster) and updates its schedule.
 - `wait`: Legacy standalone precision timer, retained for manual rollback. The
   normal installation uses the local task orchestrator instead.
 - `bootstrap-authority --assume-legacy`: the **only** way the ownership
@@ -407,7 +424,9 @@ Every external process is bounded so a hang can never hold the scheduler:
 
 | Operation | Bound | After the bound |
 | --- | --- | --- |
-| Model task (`run_codex` / `run_antigravity` / `run_opencode`) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
+| Model task, Pi transport (codex / antigravity) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
+| Model task, direct transport (opencode / clinepass) | `QUOTA_SENTINEL_DIRECT_TIMEOUT` (default 120s) | Same; a missing Keychain key fails in milliseconds with `credential missing` before any token is spent |
+| Transport A/B override | `QUOTA_SENTINEL_TRANSPORT="opencode=pi"` | Moves one provider back onto the Pi agent for comparison |
 | Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
 | OpenCode Go Native `/usage` API | `QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Tier ① failed → CodexBar Live; fixed reason code logged, never a response body |
 | CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); OpenCode: `QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT` (20s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
@@ -449,10 +468,12 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
    Codex: codex app-server JSON-RPC (account/rateLimits/read)
    Antigravity: built-in agy -p /usage --output-format json (via uv)
    OpenCode Go: GET opencode.ai/zen/go/v1/usage with the API key (via python3)
+   ClinePass: (no native helper yet; starts at tier ②)
    ↓ (fail)
 ② CodexBar Live (FRESH)
    codexbar usage --provider <codex|antigravity> --source cli
    codexbar usage --provider opencodego --source api
+   codexbar usage --provider clinepass --source api
    (On success: updates local CodexBar cache snapshot)
    ↓ (fail)
 ③ CodexBar Cached (STALE / DISPLAY ONLY)

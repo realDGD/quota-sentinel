@@ -526,9 +526,11 @@ native ──▶ codexbar-live ──▶ codexbar-cache ──▶ pi-snapshot
 
 Freshness is a property of the tier, not of a caller's memory: only the two
 live tiers are Fresh, and only a Fresh observation can move a deadline.
-OpenCode's monthly window is `monthly_display_only=True` on its adapter, and
-the scheduler's observation reader cannot even see it — a stronger guarantee
-than a comment telling callers not to look.
+OpenCode's and ClinePass's monthly windows are `monthly_display_only=True` on
+their adapters, and the scheduler's observation reader cannot even see them — a
+stronger guarantee than a comment telling callers not to look. ClinePass has no
+native helper yet, so its ladder is declared without the first rung rather than
+pretending a rung exists.
 
 Vendor probes execute in `quota_sentinel.runtime.quota_probe`, which runs the
 isolated helper scripts (`antigravity_usage.py`, `opencode_usage.py`) and the
@@ -536,6 +538,27 @@ CodexBar/Pi adapters under the shared process-group timeout helper, because
 that is where the kill-group and orphan-reaping semantics are proven. Adding a
 fourth provider means: an adapter, a roster entry, and tests — not a new arm
 in a dozen `case "$provider"` statements.
+
+## Delivery transports
+
+A task reaches a provider by exactly one of two transports, and the choice is a
+capability on the adapter (`QuotaAdapter.transport`), not a branch:
+
+```text
+pi      ──▶ runtime.models.ModelRunner     codex, antigravity
+direct  ──▶ runtime.direct.DirectRunner    opencode, clinepass
+```
+
+`runtime.dispatch.TransportRouter` presents both as the single
+`prepare`/`run -> AttemptResult` surface `Application` already used, so the
+coordinator, the retry debt, the locks, the cards and the run log never learn
+which one answered. The direct runner keeps the same credential discipline as
+`opencode_usage.py` (the key reaches curl through its stdin config, never argv
+or the environment), writes the same quota snapshot the retired capture
+extension wrote, and emits the same per-attempt log lines. It disables
+reasoning with `reasoning_effort: "none"`, which is measured, not cosmetic:
+the same prompt costs 16 tokens with it and 86 without. `QUOTA_SENTINEL_TRANSPORT`
+moves one provider back onto Pi for an A/B run without editing code.
 
 ## Notification boundary
 

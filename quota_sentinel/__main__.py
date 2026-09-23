@@ -85,8 +85,8 @@ def default_state_dir() -> Path:
 # Every mode the shell accepted for card-preview / send-test-card. "both"
 # keeps its historical meaning: the original codex+antigravity pair.
 PREVIEW_MODES = (
-    "usage", "single", "codex", "antigravity", "opencode", "progress",
-    "both", "all", "auto",
+    "usage", "single", "codex", "antigravity", "opencode", "clinepass",
+    "progress", "both", "all", "auto",
 )
 
 
@@ -560,7 +560,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_now.add_argument(
         "target", nargs="?", default="all",
-        choices=("codex", "antigravity", "opencode", "all", "both"),
+        choices=("codex", "antigravity", "opencode", "clinepass", "all", "both"),
         help="a single provider, or the whole roster (default: %(default)s)",
     )
     run_now.set_defaults(handler=lambda a: run_run(a.state_dir, a))

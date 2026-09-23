@@ -30,9 +30,11 @@ from quota_sentinel.quota import (
     QuotaWindow,
     demote_to_cached,
     normalize_codexbar_antigravity,
+    normalize_codexbar_clinepass,
     normalize_codexbar_codex,
     normalize_codexbar_opencode,
     normalize_pi_antigravity,
+    normalize_pi_clinepass,
     normalize_pi_codex,
     normalize_pi_opencode,
     parse_document,
@@ -46,11 +48,13 @@ _NORMALIZE_BAR = {
     "codex": normalize_codexbar_codex,
     "antigravity": normalize_codexbar_antigravity,
     "opencode": normalize_codexbar_opencode,
+    "clinepass": normalize_codexbar_clinepass,
 }
 _NORMALIZE_PI = {
     "codex": normalize_pi_codex,
     "antigravity": normalize_pi_antigravity,
     "opencode": normalize_pi_opencode,
+    "clinepass": normalize_pi_clinepass,
 }
 _ROOT = Path(__file__).resolve().parents[2]
 _MAX_PROBE_BYTES = 1024 * 1024
@@ -177,6 +181,7 @@ class QuotaCollector:
         codexbar_timeout: float = 20,
         antigravity_codexbar_timeout: float = 35,
         opencode_codexbar_timeout: float = 20,
+        clinepass_codexbar_timeout: float = 20,
         antigravity_native_timeout: float = 20,
         opencode_native_timeout: float = 15,
         codexbar_kill_grace: float = 10,
@@ -197,6 +202,7 @@ class QuotaCollector:
         self.codexbar_timeout = codexbar_timeout
         self.antigravity_codexbar_timeout = antigravity_codexbar_timeout
         self.opencode_codexbar_timeout = opencode_codexbar_timeout
+        self.clinepass_codexbar_timeout = clinepass_codexbar_timeout
         self.antigravity_native_timeout = antigravity_native_timeout
         self.opencode_native_timeout = opencode_native_timeout
         self.codexbar_kill_grace = codexbar_kill_grace
@@ -389,7 +395,7 @@ class QuotaCollector:
                        "python", "-B", str(self.antigravity_usage_helper),
                        "--agy", str(self.agy_bin), "--timeout", str(timeout)]
             stdin = None
-        else:
+        elif provider == "opencode":
             if not self.opencode_usage_helper.is_file():
                 return None
             key = self._api_key()
@@ -399,6 +405,12 @@ class QuotaCollector:
             command = [str(self.python_bin), "-B", str(self.opencode_usage_helper),
                        "--curl", str(self.curl_bin), "--timeout", str(timeout)]
             stdin = (key + "\n").encode()
+        else:
+            # No native helper exists for this provider yet; its ladder starts
+            # at CodexBar. Returning None is the honest "this rung has nothing"
+            # the collector already understands, and it keeps a provider's
+            # command from being built out of another provider's helper.
+            return None
         result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin)
         if result.returncode != 0 or not result.stdout:
             reason_match = re.search(rb"(?:antigravity_usage|opencode_usage): ([a-z_0-9]+)", result.stderr)
@@ -422,9 +434,14 @@ class QuotaCollector:
         if not os.access(self.codexbar_bin, os.X_OK):
             return None
         names = {"opencode": "opencodego"}
-        sources = ("cli", "oauth") if provider == "codex" else (("api",) if provider == "opencode" else ("cli",))
+        # CodexBar's ClinePass provider documents exactly two source modes
+        # (auto and api) and reaches the vendor with an API key, like OpenCode's.
+        api_only = provider in ("opencode", "clinepass")
+        sources = ("cli", "oauth") if provider == "codex" else (("api",) if api_only else ("cli",))
         timeout = (self.antigravity_codexbar_timeout if provider == "antigravity" else
-                   self.opencode_codexbar_timeout if provider == "opencode" else self.codexbar_timeout)
+                   self.opencode_codexbar_timeout if provider == "opencode" else
+                   self.clinepass_codexbar_timeout if provider == "clinepass" else
+                   self.codexbar_timeout)
         for source in sources:
             command = [str(self.codexbar_bin), "usage", "--provider", names.get(provider, provider),
                        "--source", source, "--format", "json", "--json-only", "--no-color"]
