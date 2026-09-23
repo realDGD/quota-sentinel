@@ -65,6 +65,7 @@ _MAX_PROBE_BYTES = 1024 * 1024
 _NATIVE_HELPER_SLACK_SECONDS = 5
 _TIERS = (Tier.NATIVE, Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT)
 _OPENCODE_API_KEY_SERVICE = "quota-sentinel.opencode-go-api-key"
+_CLINEPASS_API_KEY_SERVICE = "quota-sentinel.clinepass-api-key"
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,7 @@ class QuotaCollector:
         codexbar_bin: Path = Path("/opt/homebrew/bin/codexbar"),
         opencode_usage_helper: Path = _ROOT / "opencode_usage.py",
         antigravity_usage_helper: Path = _ROOT / "antigravity_usage.py",
+        clinepass_usage_helper: Path = _ROOT / "clinepass_usage.py",
         curl_bin: Path = Path("/usr/bin/curl"),
         security_bin: Path = Path("/usr/bin/security"),
         python_bin: Path = Path(sys.executable),
@@ -184,6 +186,7 @@ class QuotaCollector:
         clinepass_codexbar_timeout: float = 20,
         antigravity_native_timeout: float = 20,
         opencode_native_timeout: float = 15,
+        clinepass_native_timeout: float = 15,
         codexbar_kill_grace: float = 10,
     ) -> None:
         self.state_dir = Path(state_dir)
@@ -194,6 +197,7 @@ class QuotaCollector:
         self.codexbar_bin = Path(codexbar_bin)
         self.opencode_usage_helper = Path(opencode_usage_helper)
         self.antigravity_usage_helper = Path(antigravity_usage_helper)
+        self.clinepass_usage_helper = Path(clinepass_usage_helper)
         self.curl_bin = Path(curl_bin)
         self.security_bin = Path(security_bin)
         self.python_bin = Path(python_bin)
@@ -205,6 +209,7 @@ class QuotaCollector:
         self.clinepass_codexbar_timeout = clinepass_codexbar_timeout
         self.antigravity_native_timeout = antigravity_native_timeout
         self.opencode_native_timeout = opencode_native_timeout
+        self.clinepass_native_timeout = clinepass_native_timeout
         self.codexbar_kill_grace = codexbar_kill_grace
 
     def _cache_path(self, provider: str) -> Path:
@@ -296,15 +301,19 @@ class QuotaCollector:
             except (QuotaNormalizationError, OSError):
                 continue
 
-    def _api_key(self) -> str:
-        if self.opencode_api_key_getter is not None:
+    def _api_key(self, service: str, env_key: str) -> str:
+        """The provider's own env override, then its Keychain item.
+
+        ``opencode_api_key_getter`` remains the injectable seam the OpenCode
+        suites use; every other provider reads its own service.
+        """
+        if service == _OPENCODE_API_KEY_SERVICE and self.opencode_api_key_getter is not None:
             return self.opencode_api_key_getter() or ""
-        value = os.environ.get("OPENCODE_API_KEY", "")
+        value = os.environ.get(env_key, "")
         if value:
             return value
         return keychain.read(
-            _OPENCODE_API_KEY_SERVICE, security_bin=str(self.security_bin),
-            timeout=5,
+            service, security_bin=str(self.security_bin), timeout=5,
         )
 
     def _native_codex(self) -> Optional[ProviderQuota]:
@@ -398,22 +407,35 @@ class QuotaCollector:
         elif provider == "opencode":
             if not self.opencode_usage_helper.is_file():
                 return None
-            key = self._api_key()
+            key = self._api_key(_OPENCODE_API_KEY_SERVICE, "OPENCODE_API_KEY")
             if not key:
                 return None
             timeout = self.opencode_native_timeout
             command = [str(self.python_bin), "-B", str(self.opencode_usage_helper),
                        "--curl", str(self.curl_bin), "--timeout", str(timeout)]
             stdin = (key + "\n").encode()
+        elif provider == "clinepass":
+            if not self.clinepass_usage_helper.is_file():
+                return None
+            key = self._api_key(_CLINEPASS_API_KEY_SERVICE, "CLINE_API_KEY")
+            if not key:
+                return None
+            timeout = self.clinepass_native_timeout
+            command = [str(self.python_bin), "-B", str(self.clinepass_usage_helper),
+                       "--curl", str(self.curl_bin), "--timeout", str(timeout)]
+            stdin = (key + "\n").encode()
         else:
-            # No native helper exists for this provider yet; its ladder starts
-            # at CodexBar. Returning None is the honest "this rung has nothing"
-            # the collector already understands, and it keeps a provider's
-            # command from being built out of another provider's helper.
+            # No native helper exists for this provider; its ladder starts at
+            # CodexBar. Returning None is the honest "this rung has nothing" the
+            # collector already understands, and it keeps one provider's command
+            # from being built out of another provider's helper.
             return None
         result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin)
         if result.returncode != 0 or not result.stdout:
-            reason_match = re.search(rb"(?:antigravity_usage|opencode_usage): ([a-z_0-9]+)", result.stderr)
+            reason_match = re.search(
+                rb"(?:antigravity_usage|opencode_usage|clinepass_usage): ([a-z_0-9]+)",
+                result.stderr,
+            )
             reason = reason_match.group(1).decode() if reason_match else "runtime_unavailable"
             self.logger("quota %s: native /usage failed (%s)" % (provider, reason))
             return None

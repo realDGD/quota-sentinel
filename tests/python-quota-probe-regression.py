@@ -51,6 +51,7 @@ class QuotaProbeTests(unittest.TestCase):
             codexbar_bin=self.missing,
             opencode_usage_helper=self.missing,
             antigravity_usage_helper=self.missing,
+            clinepass_usage_helper=self.missing,
             curl_bin=self.missing,
             opencode_api_key_getter=lambda: "",
         )
@@ -295,21 +296,42 @@ print(json.dumps({quota!r}))
         self.assertEqual(seen["stdin"], "sk-secret\n")
         self.assertNotIn("sk-secret", " ".join(seen["argv"]))
 
+    def test_clinepass_native_receives_key_on_stdin_not_argv(self):
+        record = self.root / "clinepass-key-record.json"
+        helper = self.root / "clinepass_helper.py"
+        quota = dict(source="Native · clinepass /plan/usage-limits", fresh=True,
+                     capturedAt=1788002498, **WINDOWS)
+        helper.write_text(f"""import json, pathlib, sys
+pathlib.Path({str(record)!r}).write_text(json.dumps({{'argv':sys.argv[1:], 'stdin':sys.stdin.read()}}))
+print(json.dumps({quota!r}))
+""")
+        with mock.patch.dict(os.environ, {"CLINE_API_KEY": "cline-secret"}):
+            result = self.collector(clinepass_usage_helper=helper).collect()["clinepass"]
+        self.assertEqual(result.tier, Tier.NATIVE)
+        self.assertTrue(result.fresh)
+        seen = json.loads(record.read_text())
+        self.assertEqual(seen["stdin"], "cline-secret\n")
+        self.assertNotIn("cline-secret", " ".join(seen["argv"]))
+
     def test_factory_honors_all_probe_timeout_overrides(self):
         options = quota_probe_options({
             "QUOTA_SENTINEL_CODEXBAR_TIMEOUT": "1.5",
             "QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT": "2.5",
             "QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT": "3.5",
+            "QUOTA_SENTINEL_CLINEPASS_CODEXBAR_TIMEOUT": "3.75",
             "QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT": "4.5",
             "QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT": "5.5",
+            "QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT": "5.75",
             "QUOTA_SENTINEL_CODEXBAR_KILL_GRACE": "0.5",
         })
         for name, expected in (
             ("codexbar_timeout", 1.5),
             ("antigravity_codexbar_timeout", 2.5),
             ("opencode_codexbar_timeout", 3.5),
+            ("clinepass_codexbar_timeout", 3.75),
             ("antigravity_native_timeout", 4.5),
             ("opencode_native_timeout", 5.5),
+            ("clinepass_native_timeout", 5.75),
             ("codexbar_kill_grace", 0.5),
         ):
             with self.subTest(name=name):

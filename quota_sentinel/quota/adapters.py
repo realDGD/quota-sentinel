@@ -92,9 +92,7 @@ ADAPTERS: Dict[str, QuotaAdapter] = {
         provider="clinepass",
         title="DeepSeek V4.1 Flash · ClinePass",
         monthly_display_only=True,
-        # No native helper yet: CodexBar's bundled clinepass provider is the
-        # fresh source, and the direct transport writes the snapshot tier.
-        tiers=(Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT),
+        tiers=TIER_LADDER,
         transport="direct",
     ),
 }

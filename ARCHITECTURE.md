@@ -528,9 +528,10 @@ Freshness is a property of the tier, not of a caller's memory: only the two
 live tiers are Fresh, and only a Fresh observation can move a deadline.
 OpenCode's and ClinePass's monthly windows are `monthly_display_only=True` on
 their adapters, and the scheduler's observation reader cannot even see them — a
-stronger guarantee than a comment telling callers not to look. ClinePass has no
-native helper yet, so its ladder is declared without the first rung rather than
-pretending a rung exists.
+stronger guarantee than a comment telling callers not to look. Every provider
+now has a tier ① helper or adapter; ClinePass's reads the same internal
+`/plan/usage-limits` endpoint the Cline CLI does and rejects a window with no
+`resetsAt`, because an idle plan has no boundary to schedule from.
 
 Vendor probes execute in `quota_sentinel.runtime.quota_probe`, which runs the
 isolated helper scripts (`antigravity_usage.py`, `opencode_usage.py`) and the

@@ -109,6 +109,10 @@ def quota_probe_options(environment: Optional[Mapping[str, str]] = None) -> Dict
             REPO_DIR / "opencode_usage.py",
         ),
         "antigravity_usage_helper": REPO_DIR / "antigravity_usage.py",
+        "clinepass_usage_helper": _path_override(
+            env, "QUOTA_SENTINEL_CLINEPASS_USAGE_HELPER",
+            REPO_DIR / "clinepass_usage.py",
+        ),
         "curl_bin": _path_override(env, "QUOTA_SENTINEL_CURL_BIN", DEFAULT_CURL_BIN),
         "codexbar_timeout": _seconds_override(env, "QUOTA_SENTINEL_CODEXBAR_TIMEOUT", 20),
         "antigravity_codexbar_timeout": _seconds_override(
@@ -125,6 +129,9 @@ def quota_probe_options(environment: Optional[Mapping[str, str]] = None) -> Dict
         ),
         "opencode_native_timeout": _seconds_override(
             env, "QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT", 15
+        ),
+        "clinepass_native_timeout": _seconds_override(
+            env, "QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT", 15
         ),
         "codexbar_kill_grace": _seconds_override(
             env, "QUOTA_SENTINEL_CODEXBAR_KILL_GRACE", 10, allow_zero=True

@@ -95,13 +95,18 @@ runs in normal operation.
      monthly cap is carried for display only and never participates in
      scheduling.
 4. **ClinePass Quota**:
-   - **Primary**: none yet — the ladder starts at CodexBar Live.
+   - **Primary**: Native `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`
+     with the API key (`clinepass_usage.py`, metadata only; no model prompt).
+     This endpoint is not in Cline's public API reference — it is the one the
+     Cline CLI, CodexBar and the community usage tools read — and the helper
+     identifies itself with the documented `X-Title` header.
    - **Fallbacks**: CodexBar Live (`--provider clinepass --source api`),
      CodexBar cached result, then the direct-transport snapshot.
      ClinePass reports three limits (5-hour, weekly, monthly) that all share
-     one anchor; the monthly cap is display only. CodexBar omits `resetsAt`
-     entirely while the account has no open window, and such a reading is
-     rejected — an idle plan has no boundary to schedule from.
+     one anchor; the monthly cap is display only. Both live tiers reject a
+     window without `resetsAt`, which is what an account with no open window
+     returns — an idle plan has no boundary to schedule from, and a fabricated
+     one would become a deadline.
 
 All live quota calls are metadata-only: they consume no prompt tokens and no
 inference turns.
@@ -154,9 +159,9 @@ security add-generic-password -U -a quota-sentinel \
 Without the OpenCode key the Native tier is skipped and CodexBar's `opencodego`
 provider (which keeps its own copy of the key) takes over; without a key the
 direct attempt itself fails in milliseconds with `credential missing`, before
-spending a token, and `status` reports which key is missing. ClinePass has no
-Native helper yet, so its fresh reading always comes from CodexBar's bundled
-`clinepass` provider.
+spending a token, and `status` reports which key is missing. Both keys feed
+their provider's Native tier and its direct model transport; CodexBar remains
+the second rung when a key is unavailable.
 
 Codex and Antigravity are delivered by the Pi agent and authenticated from
 Pi's own entries in `auth.json`; they never read these Keychain items.
@@ -429,6 +434,7 @@ Every external process is bounded so a hang can never hold the scheduler:
 | Transport A/B override | `QUOTA_SENTINEL_TRANSPORT="opencode=pi"` | Moves one provider back onto the Pi agent for comparison |
 | Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
 | OpenCode Go Native `/usage` API | `QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Tier ① failed → CodexBar Live; fixed reason code logged, never a response body |
+| ClinePass Native `/plan/usage-limits` API | `QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Same; an idle account (no `resetsAt`) logs `missing_reset_time` and falls through |
 | CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); OpenCode: `QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT` (20s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
 | Feishu WebSocket listener outer bound | 480s | Subprocess group terminated (default quota acquisition ≈ 207s + existing Feishu auth/send retries ≈ 183s + margin) |
 | Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The `check` process and every nested detached process group are terminated |
@@ -468,7 +474,7 @@ The quota acquisition pipeline strictly follows a 4-tier hierarchy for both prov
    Codex: codex app-server JSON-RPC (account/rateLimits/read)
    Antigravity: built-in agy -p /usage --output-format json (via uv)
    OpenCode Go: GET opencode.ai/zen/go/v1/usage with the API key (via python3)
-   ClinePass: (no native helper yet; starts at tier ②)
+   ClinePass: GET api.cline.bot/api/v1/users/me/plan/usage-limits (via python3)
    ↓ (fail)
 ② CodexBar Live (FRESH)
    codexbar usage --provider <codex|antigravity> --source cli

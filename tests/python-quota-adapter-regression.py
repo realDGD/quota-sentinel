@@ -44,6 +44,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import antigravity_usage as antigravity_quota
+import clinepass_usage as clinepass_quota
 import opencode_usage as opencode_quota
 
 from quota_sentinel.quota import (
@@ -220,14 +221,6 @@ class AdapterTests(unittest.TestCase):
             ["native", "codexbar-live", "codexbar-cache", "pi-snapshot"],
         )
         for provider in PROVIDERS:
-            if provider == "clinepass":
-                # ClinePass has no native helper yet; its ladder starts at the
-                # bundled CodexBar provider and keeps the snapshot fallback.
-                self.assertEqual(
-                    tier_plan(provider),
-                    (Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT),
-                )
-                continue
             self.assertEqual(tier_plan(provider), TIER_LADDER)
             self.assertEqual(adapter_for(provider).tiers, TIER_LADDER)
 
@@ -1739,6 +1732,26 @@ def ocg_report():
     }}
 
 
+def cp_report():
+    """The live ClinePass payload shape: three limits under data.limits."""
+    return {"success": True, "data": {"limits": [
+        {"type": "five_hour", "percentUsed": 12,
+         "resetsAt": CP_FIVE_HOUR_RESET_ISO},
+        {"type": "weekly", "percentUsed": 4,
+         "resetsAt": CP_WEEKLY_RESET_ISO},
+        {"type": "monthly", "percentUsed": 2,
+         "resetsAt": CP_MONTHLY_RESET_ISO},
+    ]}}
+
+
+CP_FIVE_HOUR_RESET_ISO = "2026-09-23T14:09:42.819795817Z"
+CP_FIVE_HOUR_EPOCH = 1790172582
+CP_WEEKLY_RESET_ISO = "2026-09-30T09:09:42.822018837Z"
+CP_WEEKLY_EPOCH = 1790759382
+CP_MONTHLY_RESET_ISO = "2026-10-23T09:09:42.824158127Z"
+CP_MONTHLY_EPOCH = 1792746582
+
+
 class OpencodeNativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1998,7 +2011,7 @@ class OpencodeNativeHelperTests(unittest.TestCase):
             if helper.poll() is None:
                 helper.terminate(); helper.wait(timeout=3)
 
-    def test_outer_budget_covers_three_providers_and_delivery(self):
+    def test_outer_budget_covers_four_providers_and_delivery(self):
         tree = ast.parse((REPO_ROOT / "feishu_listener.py").read_text())
         bound = next(
             node.value.value for node in tree.body
@@ -2007,9 +2020,229 @@ class OpencodeNativeHelperTests(unittest.TestCase):
                     and target.id == "USAGE_COMMAND_TIMEOUT_SECONDS"
                     for target in node.targets)
         )
-        acquisition = 20 + 15 + 2 * (20 + 10) + 20 + 1 + 35 + 10 + 16 + (20 + 10)
+        # Per provider: every fresh rung's own budget plus CodexBar's kill
+        # grace. ClinePass joined the roster with a native helper, so its two
+        # budgeted rungs (15 + 20 + 10) are part of the worst case now.
+        acquisition = (20 + 15 + 2 * (20 + 10) + 20 + 1 + 35 + 10 + 16
+                       + (20 + 10) + (15 + 20 + 10))
         delivery = 45 + 3 * 45 + 3
         self.assertGreater(bound, acquisition + delivery)
+
+
+class ClinePassNativeHelperTests(unittest.TestCase):
+    """Tier ① for ClinePass: the same discipline as the OpenCode helper."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def script(self, body, name):
+        path = self.directory / name
+        path.write_text(f"#!{sys.executable}\n" + body)
+        path.chmod(0o700)
+        return path
+
+    def curl(self, body=None, status="200", name="curl"):
+        payload = json.dumps(cp_report() if body is None else body)
+        # Mirror the real invocation: body, then --write-out's "\n<status>".
+        return self.script(
+            "import json,pathlib,sys\n"
+            "pathlib.Path(sys.argv[0] + '.argv').write_text("
+            "json.dumps(sys.argv[1:]))\n"
+            "pathlib.Path(sys.argv[0] + '.stdin').write_text(sys.stdin.read())\n"
+            f"sys.stdout.write({payload!r} + '\\n' + {status!r})\n",
+            name,
+        )
+
+    def test_used_percent_becomes_remaining_in_all_three_windows(self):
+        result = clinepass_quota.normalize_report(cp_report(), 1789630000)
+        self.assertEqual(result["source"], "Native · clinepass /plan/usage-limits")
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["capturedAt"], 1789630000)
+        self.assertEqual(result["fiveHour"], {
+            "remainingPercent": 88, "resetAt": CP_FIVE_HOUR_EPOCH})
+        self.assertEqual(result["weekly"], {
+            "remainingPercent": 96, "resetAt": CP_WEEKLY_EPOCH})
+        self.assertEqual(result["monthly"], {
+            "remainingPercent": 98, "resetAt": CP_MONTHLY_EPOCH})
+
+    def test_nanosecond_reset_is_truncated_to_whole_seconds(self):
+        # The live gateway answers "...T09:09:42.819795817Z", which the 3.9
+        # interpreter's fromisoformat refuses; the fraction is dropped.
+        data = cp_report()
+        data["data"]["limits"][0]["resetsAt"] = "2026-09-23T14:09:42.819795817Z"
+        self.assertEqual(
+            clinepass_quota.normalize_report(data, 1)["fiveHour"]["resetAt"],
+            1790172582,
+        )
+
+    def test_monthly_is_optional_and_a_bad_one_is_dropped_not_fatal(self):
+        for monthly in (None, {"type": "monthly"},
+                        {"type": "monthly", "percentUsed": "2",
+                         "resetsAt": CP_MONTHLY_RESET_ISO}):
+            data = cp_report()
+            limits = [limit for limit in data["data"]["limits"]
+                      if limit["type"] != "monthly"]
+            if monthly is not None:
+                limits.append(monthly)
+            data["data"]["limits"] = limits
+            with self.subTest(monthly=monthly):
+                self.assertNotIn(
+                    "monthly", clinepass_quota.normalize_report(data, 1)
+                )
+
+    def test_percent_endpoints_are_clamped(self):
+        for percent, expected in ((0, 100), (100, 0)):
+            data = cp_report()
+            for limit in data["data"]["limits"]:
+                limit["percentUsed"] = percent
+            self.assertEqual(
+                clinepass_quota.normalize_report(data, 1)["fiveHour"][
+                    "remainingPercent"],
+                expected,
+            )
+
+    def test_required_window_missing_or_malformed_rejected(self):
+        for api_name in ("five_hour", "weekly"):
+            data = cp_report()
+            data["data"]["limits"] = [
+                limit for limit in data["data"]["limits"]
+                if limit["type"] != api_name
+            ]
+            with self.assertRaises(clinepass_quota.QuotaError):
+                clinepass_quota.normalize_report(data, 1)
+        variations = []
+        for bad_percent in (None, True, "12", -1, 101, float("nan"),
+                            float("inf")):
+            data = cp_report()
+            data["data"]["limits"][0]["percentUsed"] = bad_percent
+            variations.append(data)
+        for bad_reset in (None, "garbage", "2026-09-23T14:09:42",
+                          "1960-01-01T00:00:00Z", 1790172582):
+            data = cp_report()
+            data["data"]["limits"][1]["resetsAt"] = bad_reset
+            variations.append(data)
+        for data in variations:
+            with self.subTest(data=data):
+                with self.assertRaises(clinepass_quota.QuotaError):
+                    clinepass_quota.normalize_report(data, 1)
+
+    def test_an_idle_account_without_resets_is_rejected_not_invented(self):
+        # The live gateway omits resetsAt entirely while no window is open.
+        # A fabricated reset would become a deadline, so this fails closed.
+        data = cp_report()
+        for limit in data["data"]["limits"]:
+            limit.pop("resetsAt", None)
+        with self.assertRaises(clinepass_quota.QuotaError):
+            clinepass_quota.normalize_report(data, 1)
+
+    def test_success_flag_and_shape_are_enforced(self):
+        for mutation in ("success_false", "no_data", "limits_not_list",
+                         "not_object"):
+            data = cp_report()
+            if mutation == "success_false":
+                data["success"] = False
+            elif mutation == "no_data":
+                del data["data"]
+            elif mutation == "limits_not_list":
+                data["data"]["limits"] = {"type": "five_hour"}
+            else:
+                data = ["not", "an", "object"]
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(clinepass_quota.QuotaError):
+                    clinepass_quota.normalize_report(data, 1)
+
+    def test_output_and_nonzero_exit_are_bounded(self):
+        with self.assertRaisesRegex(clinepass_quota.QuotaError, "output_too_large"):
+            clinepass_quota.run_bounded(
+                [sys.executable, "-c", "print('x'*1000)"], self.directory, 2, 100
+            )
+        with self.assertRaisesRegex(clinepass_quota.QuotaError, "command_failed"):
+            clinepass_quota.run_bounded(
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                self.directory, 2, 100,
+            )
+
+    def test_key_travels_on_stdin_into_a_curl_header_config(self):
+        curl = self.curl()
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "clinepass_usage.py"),
+             "--curl", str(curl)],
+            input="cline-secret-value\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["fiveHour"]["remainingPercent"], 88
+        )
+        argv = json.loads(Path(str(curl) + ".argv").read_text())
+        self.assertIn("--config", argv)
+        self.assertNotIn("cline-secret-value", " ".join(argv))
+        config = Path(str(curl) + ".stdin").read_text()
+        self.assertIn("Authorization: Bearer cline-secret-value", config)
+        # Cline's docs: X-Title labels the caller in their usage logs.
+        self.assertIn("X-Title: quota-sentinel", config)
+
+    def test_http_status_maps_to_fixed_reason_codes(self):
+        for status, reason in (("401", "http_401"), ("403", "http_403"),
+                               ("500", "http_error")):
+            curl = self.curl(
+                body={"success": False}, status=status, name=f"curl{status}"
+            )
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(REPO_ROOT / "clinepass_usage.py"),
+                     "--curl", str(curl)],
+                    input="cline-x\n", capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+
+    def test_missing_key_and_missing_curl_fail_closed(self):
+        curl = self.curl()
+        for args, stdin, reason in (
+            (["--curl", str(curl)], "\n", "auth_missing"),
+            (["--curl", str(self.directory / "absent")], "cline-x\n",
+             "curl_unavailable"),
+        ):
+            with self.subTest(reason=reason):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(REPO_ROOT / "clinepass_usage.py")]
+                    + args,
+                    input=stdin, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+
+    def test_cli_logs_fixed_reason_not_response_body_secrets(self):
+        curl = self.script(
+            "import sys\nsys.stdout.write('app_secret=TOPSECRET\\n401')\n",
+            "curlLeaky",
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "clinepass_usage.py"),
+             "--curl", str(curl)],
+            input="cline-real-key\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("http_401", result.stderr)
+        self.assertNotIn("TOPSECRET", result.stderr)
+        self.assertNotIn("cline-real-key", result.stderr)
+
+    def test_invalid_json_body_is_rejected(self):
+        curl = self.script("import sys\nsys.stdout.write('not json\\n200')\n",
+                           "curlBadJson")
+        result = subprocess.run(
+            [sys.executable, "-B", str(REPO_ROOT / "clinepass_usage.py"),
+             "--curl", str(curl)],
+            input="cline-x\n", capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid_report", result.stderr)
 
 
 if __name__ == "__main__":
