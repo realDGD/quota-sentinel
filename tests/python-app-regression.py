@@ -553,6 +553,82 @@ class BurstEngineTests(unittest.TestCase):
             app.check()
         self.assertIn("pending (debt unpaid)", "\n".join(captured.output))
 
+    # ---- measuring the window boundary ----------------------------------
+    def test_every_check_logs_the_scheduler_reason_per_provider(self):
+        """The policy already says WHY a deadline did or did not move.
+
+        Without its own words the window boundary is unmeasurable after the
+        fact: you cannot tell whether the provider's reset had already rolled
+        when the deadline fired, which is exactly what decides whether the
+        four-minute buffer is load-bearing or just delaying us.
+        """
+        store = FileStateStore(self.state_dir)
+        for provider in PROVIDERS:
+            store.commit(provider, ProviderState(),
+                         ProviderState(next_due_at=4000000000))
+        app, calls, _ = self.build([])
+        with self.assertLogs("quota_sentinel.app", level="INFO") as captured:
+            app.check()
+        text = "\n".join(captured.output)
+        for provider in PROVIDERS:
+            self.assertIn("sched %s: " % provider, text)
+        # The policy's own words, not a paraphrase.
+        self.assertIn("no valid fresh reset", text)
+
+    def test_a_moved_reset_anchor_is_logged_with_its_delta(self):
+        """A moved anchor must be readable as old -> new plus the drift.
+
+        The drift per cycle is what the four-minute buffer costs, so it has
+        to be visible without reconstructing it from state files later.
+        """
+        store = FileStateStore(self.state_dir)
+        store.commit(
+            "codex", ProviderState(),
+            ProviderState(last_known_reset=2000, reset_anchor=2000,
+                          next_due_at=2240),
+        )
+        app, _, _ = self.build([], readings={"codex": fresh_reading(2200)})
+        with self.assertLogs("quota_sentinel.app", level="INFO") as captured:
+            app.usage()
+        text = "\n".join(captured.output)
+        self.assertIn("reset anchor", text)
+        self.assertIn("1970-01-01 08:33:20 CST", text)   # 2000, the old anchor
+        self.assertIn("1970-01-01 08:36:40 CST", text)   # 2200, the new one
+        self.assertIn("+0h03m20s", text)                 # the 200s drift
+
+    def test_the_check_path_reports_an_anchor_move_too(self):
+        """The check path moves the anchor through decide_due, not _sync.
+
+        Both paths must report the movement, or the drift can only be
+        reconstructed from one of them.
+        """
+        app, _, _ = self.build([], readings={"codex": fresh_reading(4000)})
+        with self.assertLogs("quota_sentinel.app", level="INFO") as captured:
+            app.check()
+        text = "\n".join(captured.output)
+        self.assertIn("sched codex: fresh reset established generation anchor", text)
+        self.assertIn("reset anchor unset -> 1970-01-01 09:06:40 CST", text)
+        self.assertIn("(no previous anchor)", text)
+
+    def test_the_boundary_lines_carry_no_paths_or_secrets(self):
+        store = FileStateStore(self.state_dir)
+        store.commit(
+            "codex", ProviderState(),
+            ProviderState(last_known_reset=2000, reset_anchor=2000,
+                          next_due_at=2240),
+        )
+        app, _, _ = self.build([], readings={"codex": fresh_reading(2200)})
+        with self.assertLogs("quota_sentinel.app", level="INFO") as captured:
+            app.usage()
+        text = "\n".join(captured.output)
+        # No absolute home path may reach the boundary lines. The bare
+        # home-directory literal is deliberately absent from this file: AR6b
+        # scans committed sources for it, and Path.home() covers the same
+        # ground without tripping the guard.
+        for forbidden in (str(self.state_dir), str(Path.home()),
+                          "Bearer", "sk-"):
+            self.assertNotIn(forbidden, text, text)
+
 
 class AppConfigTests(unittest.TestCase):
     def test_env_overrides_match_the_documented_shell_names(self):

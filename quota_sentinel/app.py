@@ -76,6 +76,22 @@ def _observation(reading: object) -> QuotaObservation:
     )
 
 
+def _reset_text(value: Optional[int]) -> str:
+    return "unset" if value is None else format_reset_time(value)
+
+
+def _drift_text(before: Optional[int], after: Optional[int]) -> str:
+    """How far the window boundary moved, in one glance: +0h03m20s."""
+    if before is None or after is None:
+        return "no previous anchor"
+    delta = after - before
+    sign = "+" if delta >= 0 else "-"
+    delta = abs(delta)
+    return "%s%dh%02dm%02ds" % (
+        sign, delta // 3600, (delta % 3600) // 60, delta % 60,
+    )
+
+
 class Application:
     """Coordinate locks, probes, attempts and notifications.
 
@@ -184,10 +200,35 @@ class Application:
                 self.sleep(self.config.retry_interval)
         return results, pi_raw
 
+    def _log_anchor(self, provider: str, before: Optional[int], after: Optional[int]) -> None:
+        """One line per real boundary movement, on every path that can move it.
+
+        The check path moves the anchor through ``decide_due``, the post-run
+        and /usage paths through ``_sync``; both must report the same thing or
+        the drift cannot be reconstructed from one place.
+        """
+        if after == before:
+            return
+        logger.info(
+            "quota %s: reset anchor %s -> %s (%s)",
+            provider, _reset_text(before), _reset_text(after),
+            _drift_text(before, after),
+        )
+
     def _sync(self, provider: str, reading: object, now: int) -> None:
         state = service.load_state(self.state_dir, provider)
         transition, _ = policy.sync_deadline(state, _observation(reading), now)
         service.apply_transition(self.state_dir, provider, transition)
+        # The policy already computes WHY the deadline did or did not move;
+        # writing its own words down is what makes the window boundary
+        # measurable after the fact. The question it answers is the one that
+        # decides whether the four-minute reset buffer earns its cost: had the
+        # provider's reset already rolled when the deadline fired, and how far
+        # does the boundary drift each cycle?
+        logger.info("sched %s: %s", provider, transition.reason)
+        self._log_anchor(
+            provider, state.last_known_reset, transition.after.last_known_reset
+        )
 
     def _run_selected(
         self, providers: Sequence[str], workspace: Path, collector: object
@@ -297,6 +338,15 @@ class Application:
                         result = service.decide_due(
                             self.state_dir, provider, now,
                             _observation(readings.get(provider)),
+                        )
+                        # The shell logged one "sched <provider>: <reason>"
+                        # line per provider per check; that line is also the
+                        # record of what the provider reported about its reset
+                        # at the moment the deadline fired.
+                        logger.info("sched %s: %s", provider, result.reason)
+                        self._log_anchor(
+                            provider, result.before_state.last_known_reset,
+                            result.state.last_known_reset,
                         )
                         if result.decision is Decision.RUN_NOW:
                             due.append(provider)
