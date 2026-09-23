@@ -82,6 +82,8 @@ class DirectProvider:
     envelope: bool = False
     # OpenCode Go refuses a request without a stable session id.
     session_header: bool = False
+    # ClinePass reads its caller's name from the documented X-Title header.
+    title_header: bool = False
     # Which usage payload the runner knows how to turn into a snapshot.
     quota_kind: str = "opencode"
 
@@ -105,6 +107,7 @@ DIRECT_PROVIDERS: Dict[str, DirectProvider] = {
         key_service="quota-sentinel.clinepass-api-key",
         env_key="CLINE_API_KEY",
         envelope=True,
+        title_header=True,
         quota_kind="clinepass",
     ),
 }
@@ -341,6 +344,11 @@ class DirectRunner:
             'header = "Authorization: Bearer %s"\n'
             'header = "Content-Type: application/json"\n' % key
         )
+        if spec.title_header:
+            # Cline's docs: X-Title labels the caller in their usage logs. The
+            # native probes send the same value, so one name covers every
+            # request this deployment makes.
+            config += 'header = "X-Title: %s"\n' % USER_AGENT.split("/")[0]
         if spec.session_header:
             config += 'header = "x-opencode-session: %s"\n' % (SESSION_ID % spec.provider)
         return config

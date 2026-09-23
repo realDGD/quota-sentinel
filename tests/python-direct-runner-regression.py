@@ -208,6 +208,7 @@ class DirectRunnerTests(unittest.TestCase):
         self.assertTrue(result.success)
         chat = [call for call in self.calls() if call["url"].endswith("/chat/completions")]
         self.assertNotIn("x-opencode-session", chat[0]["stdin"])
+        self.assertIn('header = "X-Title: quota-sentinel"', chat[0]["stdin"])
         self.assertEqual(json.loads(chat[0]["body"])["model"],
                          "cline-pass/deepseek-v4.1-flash")
 
