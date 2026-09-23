@@ -825,13 +825,18 @@ class ScheduleStateContractSpecTests(unittest.TestCase):
         # min over non-pending providers, exclude pending debts, snapshot
         # shape, and the provider roster all belong to the orchestrator
         # layer — NOT to the store (store stays per-provider pure read).
+        from quota_sentinel.quota.adapters import PROVIDERS
+
         write_slot(self.state_dir, "codex", "next-due-at", "300")
         write_slot(self.state_dir, "antigravity", "next-due-at", "100")
         write_slot(self.state_dir, "opencode", "next-due-at", "500")
         schedule = self.ScheduleState(self.state_dir)
         self.assertEqual(schedule.next_due(), 100)
-        self.assertEqual(schedule.snapshot(),
-                         {"codex": 300, "antigravity": 100, "opencode": 500})
+        # The snapshot covers the whole roster, so a provider with no slot file
+        # appears as None rather than being silently absent from the aggregate.
+        expected = {provider: None for provider in PROVIDERS}
+        expected.update({"codex": 300, "antigravity": 100, "opencode": 500})
+        self.assertEqual(schedule.snapshot(), expected)
         # pending debt excluded from wake math (watchdog repays it instead)
         write_slot(self.state_dir, "antigravity", "retry-pending", "1")
         self.assertEqual(self.ScheduleState(self.state_dir).next_due(), 300)

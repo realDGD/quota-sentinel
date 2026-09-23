@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence, TypeVar
 
 from quota_sentinel.state import AuthoritativeStateStore, StateStoreError
+from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
 
 logger = logging.getLogger("task_orchestrator")
@@ -232,7 +233,7 @@ class ScheduleState:
     def __init__(
         self,
         state_dir: Path = DEFAULT_STATE_DIR,
-        providers: tuple[str, ...] = ("codex", "antigravity", "opencode"),
+        providers: tuple[str, ...] = DEFAULT_PROVIDERS,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.providers = providers

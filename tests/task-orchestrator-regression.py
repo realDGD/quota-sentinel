@@ -10,6 +10,7 @@ backoff, SQLite history, and externally-triggered /usage recording.
 from __future__ import annotations
 
 import os
+import inspect
 import plistlib
 import signal
 import sqlite3
@@ -24,7 +25,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.state import bootstrap_legacy_authority
+from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
 from task_orchestrator import (
     CHECK_COMMAND_TIMEOUT_SECONDS,
@@ -118,6 +121,26 @@ class TaskOrchestratorTest(unittest.TestCase):
 
     def write_pending(self, provider: str, value: int) -> None:
         (self.state_dir / f"{provider}-retry-pending").write_text(f"{value}\n")
+
+    def test_default_roster_is_the_package_roster(self):
+        """The precise-timer roster must not be a frozen local copy.
+
+        This engine runs for days. A roster captured as a literal keeps it
+        waking only for the providers that existed when it started: ClinePass
+        was added to the package and the live engine, started a day earlier,
+        kept firing it on the fifteen-minute grid instead of at its
+        reset+240s deadline, which is exactly the drift the buffer exists to
+        prevent.
+        """
+        self.assertEqual(DEFAULT_PROVIDERS, PROVIDERS)
+        self.assertEqual(ScheduleState(self.state_dir).providers, PROVIDERS)
+        # Pin the DEFAULT itself, not just an instance: TaskOrchestrator()
+        # builds `schedule_state or ScheduleState()`, so a literal default is
+        # the exact shape this regression exists for.
+        self.assertEqual(
+            inspect.signature(ScheduleState.__init__).parameters["providers"].default,
+            PROVIDERS,
+        )
 
     def test_startup_and_quarter_hour_watchdog_preserve_launchd_cadence(self) -> None:
         self.engine.run_startup()

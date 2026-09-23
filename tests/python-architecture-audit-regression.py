@@ -619,6 +619,13 @@ class WholeRosterAuthoritySwitch(unittest.TestCase):
         # The roster is the shared constant, not a local list that could
         # drift away from the migration/parity surface.
         self.assertGreaterEqual(len(migration.DEFAULT_PROVIDERS), 2)
+        # Two literals still have to agree: the state layer's roster and the
+        # adapter roster are the same deployment fact, and nothing else pins
+        # them together. A provider present in one and missing from the other
+        # is a provider the scheduler half-knows.
+        from quota_sentinel.quota.adapters import PROVIDERS
+
+        self.assertEqual(migration.DEFAULT_PROVIDERS, PROVIDERS)
 
     def test_ar14_public_and_bridge_verbs_reject_a_provider_subset(self):
         from quota_sentinel.__main__ import build_parser
