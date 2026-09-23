@@ -74,7 +74,14 @@ def run_bounded(command, cwd, timeout, max_bytes, stdin_text=None):
         except subprocess.TimeoutExpired:
             raise QuotaError("command_timeout") from None
         if rc != 0:
-            raise QuotaError("command_failed")
+            # curl's exit code is the only explanation available (its stderr is
+            # discarded so a vendor body can never leak), and "command_failed"
+            # alone cannot tell a rate-limited gateway from a DNS blip. 28 is
+            # curl's own timeout; everything else keeps its code as a suffix so
+            # the run log stays diagnosable without carrying vendor text.
+            if rc == 28:
+                raise QuotaError("command_timeout")
+            raise QuotaError("command_failed_%d" % rc)
         return output
     finally:
         stop_owned_process(process)

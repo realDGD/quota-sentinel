@@ -2166,6 +2166,21 @@ class ClinePassNativeHelperTests(unittest.TestCase):
                 self.directory, 2, 100,
             )
 
+    def test_curl_exit_code_survives_in_the_reason(self):
+        # "command_failed" alone cannot tell a gateway reset from a DNS blip,
+        # and the body and curl stderr are deliberately discarded, so the exit
+        # code rides along in the reason instead.
+        with self.assertRaisesRegex(clinepass_quota.QuotaError, "command_failed_7"):
+            clinepass_quota.run_bounded(
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                self.directory, 2, 100,
+            )
+        with self.assertRaisesRegex(clinepass_quota.QuotaError, "command_timeout"):
+            clinepass_quota.run_bounded(
+                [sys.executable, "-c", "raise SystemExit(28)"],
+                self.directory, 2, 100,
+            )
+
     def test_key_travels_on_stdin_into_a_curl_header_config(self):
         curl = self.curl()
         result = subprocess.run(
