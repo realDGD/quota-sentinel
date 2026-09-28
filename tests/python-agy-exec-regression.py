@@ -13,11 +13,20 @@ replays one scenario, so every claim the transport makes can be checked:
     answers, at 40x;
   * the pre-turn `Eligibility check failed` handshake is retried and costs
     nothing, and a retry must not be mistaken for a malformed reply;
+  * that retry is fenced twice: only the CURRENT turn's stderr is read (the
+    file is append-only, so a marker from an earlier turn would otherwise make a
+    later, unrelated failure look free), and the turn must have spent nothing (a
+    handshake fails before the turn starts, so a failure that reported tokens is
+    not a free retry);
   * success is read from the parsed JSON (status, response, usage) rather than
-    from the log format;
-  * a functional failure falls back to Pi, and so does a cost regression — the
-    second one without recording the profile as verified, so the next attempt
-    re-tests instead of trusting a regression;
+    from the log format, and a SUCCESS that cannot report `input_tokens >= 1` is
+    a functional failure: the input ceiling is the only structural proof that
+    the minimal profile rather than the stock agent answered;
+  * a functional failure falls back to Pi; a cost regression does NOT — the
+    reply was already delivered and the window anchored, so re-delivering it
+    would spend more quota to reach the same fact, and a regressed profile is
+    not recorded as verified, so the next attempt re-tests instead of trusting
+    it;
   * the attempt environment carries the subscription credential only: the
     Gemini API key, which bills a different product and would not anchor the
     same window, is removed.
@@ -126,11 +135,67 @@ if mode in ("transient-once", "transient-always") and (mode == "transient-always
     print(json.dumps({transient}))
     raise SystemExit(1)
 
+if mode == "stderr-transient-once" and turns() <= 1:
+    # The same free handshake, but reported on the CLI's own stderr instead of
+    # in the JSON `error` field. It must still be recognised — from the bytes
+    # THIS turn wrote, which is the slice the transport now reads.
+    print("Eligibility check failed: EOF", file=sys.stderr)
+    print(json.dumps({transient}))
+    raise SystemExit(1)
+
+if mode == "stale-marker":
+    if turns() <= 1:
+        print("Eligibility check failed: EOF", file=sys.stderr)
+        print(json.dumps({transient}))
+        raise SystemExit(1)
+    # A later, unrelated failure that spends nothing and reports no marker of
+    # its own. The marker above is still sitting in the appended stderr file.
+    print(json.dumps({{
+        "status": "ERROR", "response": "", "error": "unrelated backend refusal",
+        "num_turns": 0,
+        "usage": {{"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0,
+                   "cache_read_tokens": 0, "total_tokens": 0}},
+    }}))
+    raise SystemExit(1)
+
+if mode == "marker-with-spend":
+    # The handshake marker IS in this turn's own stderr, but the turn reports
+    # 564 input tokens: it cannot have failed before it started.
+    print("Eligibility check failed: EOF", file=sys.stderr)
+    print(json.dumps({{
+        "status": "ERROR", "response": "", "error": "unrelated backend refusal",
+        "num_turns": 0,
+        "usage": {{"input_tokens": 564, "output_tokens": 0, "thinking_tokens": 0,
+                   "cache_read_tokens": 0, "total_tokens": 564}},
+    }}))
+    raise SystemExit(1)
+
+if mode == "no-usage":
+    # A SUCCESS turn that reports nothing about what it spent: the input
+    # ceiling cannot be evaluated, so nothing proves which profile answered.
+    print(json.dumps({{"status": "SUCCESS", "response": "1"}}))
+    raise SystemExit(0)
+
+if mode == "zero-usage":
+    # Present but zero: the shape a free read-only command has. `0` is no more
+    # verified than absent, because the ceiling cannot judge it either.
+    print(json.dumps({{"status": "SUCCESS", "response": "1", "num_turns": 0,
+                       "usage": {{"input_tokens": 0, "output_tokens": 0,
+                                  "thinking_tokens": 0, "cache_read_tokens": 0,
+                                  "total_tokens": 0}}}}))
+    raise SystemExit(0)
+
+if mode == "error-no-usage":
+    # Non-SUCCESS keeps its existing handling: no usage to report is normal
+    # here, so the attempt is judged on its status alone.
+    print(json.dumps({{"status": "ERROR", "response": "", "error": "boom"}}))
+    raise SystemExit(1)
+
 input_tokens = 22311 if mode == "stock-cost" else 564
 thinking = 30 if mode == "thinking" else 0
 output = 30 if mode == "thinking" else 1
 reply = {{"success": "1", "stock-cost": "1", "thinking": "1",
-          "transient-once": "1", "missing-agent": "1",
+          "transient-once": "1", "stderr-transient-once": "1", "missing-agent": "1",
           "agents-unavailable": "1"}}.get(mode, "Sure, what would you like me to do?")
 print(json.dumps({{
     "conversation_id": "c-1", "status": "SUCCESS", "response": reply,
@@ -143,11 +208,17 @@ print(json.dumps({{
 
 
 class _FakePi:
-    """Stands in for the Pi runner: records the delegation, returns its own result."""
+    """Stands in for the Pi runner: records the delegation, returns its own result.
 
-    def __init__(self):
+    ``success=False`` is the pessimistic stub: used to prove that an attempt is
+    never handed to Pi when it does not have to be, because a fallback that
+    fails would turn a delivered success into a failure the scheduler retries.
+    """
+
+    def __init__(self, success=True):
         self.prepared = []
         self.calls = []
+        self.success = success
 
     def prepare(self, provider, workspace):
         self.prepared.append((provider, Path(workspace)))
@@ -155,11 +226,11 @@ class _FakePi:
     def run(self, provider, workspace, phase, attempt, limit):
         self.calls.append((provider, phase, attempt, limit))
         return AttemptResult(
-            success=True, exit_code=0, timed_out=False, elapsed=1.5,
+            success=self.success, exit_code=0, timed_out=False, elapsed=1.5,
             stdout_path=Path(workspace) / "pi-stdout",
             stderr_path=Path(workspace) / "pi-stderr",
             quota_path=Path(workspace) / "pi-quota.json",
-            error_summary="",
+            error_summary="" if self.success else "pi:stub-failure",
         )
 
 
@@ -387,24 +458,91 @@ class AgyExecTests(unittest.TestCase):
         self.assertTrue(is_transient_error(None, "Service Unavailable"))
         self.assertFalse(is_transient_error("reply='maybe'", "some other failure"))
 
-    # ------------------------------------------------------------------ cost
-    def test_stock_agent_cost_is_a_regression_not_a_success(self):
-        result = self.runner(mode="stock-cost", fallback=self.pi).run(
+    def test_a_current_turn_stderr_marker_is_still_a_free_retry(self):
+        # The fence must not be so tight that the real handshake stops being
+        # retried: the marker is on stderr, this turn spent nothing, so it is
+        # still free.
+        result = self.runner(mode="stderr-transient-once").run(
             "antigravity", self.workspace, "initial", 1, 3
         )
-        self.assertIn("cost-regression:input=22311>=%s" % AGY_INPUT_CEILING, self.log())
-        self.assertIn("input=22311", self.log())
-        self.assertEqual(self.pi.calls, [("antigravity", "initial", 1, 3)])
         self.assertTrue(result.success)
-        # A regression must NOT be recorded as a verified profile.
-        self.assertIsNone(self.smoke_record())
+        self.assertEqual(len(self.calls("turn")), 2)
+        self.assertIn("transient handshake failure; retry 1/3", self.log())
 
-    def test_cost_regression_without_a_fallback_still_fails_the_attempt(self):
-        result = self.runner(mode="stock-cost").run(
+    def test_a_stale_stderr_marker_does_not_make_a_later_failure_transient(self):
+        # The marker is written by the FIRST turn, which really was the free
+        # handshake. The second turn's own failure is unrelated and the marker
+        # is still in the appended file, so reading the whole tail would retry
+        # it three more times for nothing.
+        result = self.runner(mode="stale-marker").run(
             "antigravity", self.workspace, "initial", 1, 3
         )
         self.assertFalse(result.success)
-        self.assertTrue(result.error_summary.startswith("cost-regression:"))
+        self.assertEqual(len(self.calls("turn")), 2)
+        self.assertIn("status=ERROR", result.error_summary)
+        self.assertEqual(self.log().count("transient handshake failure"), 1)
+        # The file itself stays append-only: only the slice is per-turn, so the
+        # first turn's diagnosis is still on disk.
+        stderr = (self.workspace / "antigravity-stderr").read_text()
+        self.assertIn("Eligibility check failed", stderr)
+
+    def test_a_spent_token_failure_is_not_retried_as_a_handshake(self):
+        # The marker is in THIS turn's stderr, so only the second fence can
+        # refuse the retry: the turn reports 564 input tokens, and a handshake
+        # fails before a turn starts.
+        result = self.runner(mode="marker-with-spend").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertEqual(len(self.calls("turn")), 1)
+        self.assertFalse(result.success)
+        self.assertIn("status=ERROR", result.error_summary)
+        self.assertNotIn("transient handshake", self.log())
+
+    def test_the_stderr_window_is_the_current_turn_only(self):
+        path = self.root / "stderr-window.log"
+        path.write_bytes(b"earlier turn: Eligibility check failed\n" * 20)
+        offset = agy_exec._file_size(path)
+        with path.open("ab") as handle:
+            handle.write(b"this turn: something else\n")
+        window = agy_exec._stderr_tail(path, offset)
+        self.assertIn("this turn: something else", window)
+        self.assertNotIn("Eligibility check failed", window)
+        # Diagnosis is not lost: the whole file is still readable, and the
+        # 4096-byte cap still applies to the window.
+        self.assertIn("Eligibility check failed", agy_exec._stderr_tail(path))
+        with path.open("ab") as handle:
+            handle.write(b"x" * 5000)
+        self.assertEqual(len(agy_exec._stderr_tail(path, offset)), agy_exec._STDERR_TAIL_BYTES)
+
+    # ------------------------------------------------------------------ cost
+    def test_stock_agent_cost_is_accepted_and_never_re_delivered(self):
+        # The reply `1` was already delivered and the window anchored, so this
+        # attempt is usable as it stands. Handing it to Pi would spend more
+        # quota to reach the same fact — and Pi failing here (the stub does)
+        # would turn a delivered success into a failure the scheduler pays for
+        # again.
+        pi = _FakePi(success=False)
+        result = self.runner(mode="stock-cost", fallback=pi).run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.error_summary, "")
+        self.assertEqual(pi.calls, [])
+        self.assertEqual(pi.prepared, [])
+        self.assertIn("result=cost-regression", self.log())
+        self.assertIn("cost regression (input=22311>=%s" % AGY_INPUT_CEILING, self.log())
+        self.assertIn("the delivery is accepted", self.log())
+        # ...but it is NOT a verified ignition, and it is not recorded as one.
+        self.assertNotIn("ignition", self.log())
+        self.assertIsNone(self.smoke_record())
+
+    def test_a_cost_regression_succeeds_even_without_a_fallback(self):
+        result = self.runner(mode="stock-cost").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.error_summary, "")
+        self.assertIn("result=cost-regression", self.log())
         self.assertIsNone(self.smoke_record())
 
     def test_thinking_tokens_are_reported_but_not_policed(self):
@@ -418,13 +556,75 @@ class AgyExecTests(unittest.TestCase):
         self.assertFalse(any("thinking" in line for line in [result.error_summary]))
         self.assertTrue(result.success)
 
-    def test_a_runaway_reply_is_a_cost_regression(self):
-        runner = self.runner()
+    def test_a_runaway_reply_is_an_accepted_cost_regression(self):
+        runner = self.runner(fallback=self.pi)
         runner.config.output_ceiling = 1
         result = runner.run("antigravity", self.workspace, "initial", 1, 3)
-        self.assertFalse(result.success)
-        self.assertIn("output=", result.error_summary)
+        self.assertTrue(result.success)
+        self.assertEqual(result.error_summary, "")
+        self.assertEqual(self.pi.calls, [])
+        self.assertIn("output=1>=1", self.log())
+        self.assertIn("result=cost-regression", self.log())
         self.assertIsNone(self.smoke_record())
+
+    def test_a_cost_regression_does_not_refresh_an_existing_verified_record(self):
+        # The record is what makes the next attempt skip the smoke test, so a
+        # regression must leave it exactly as it was: accepted this time, but
+        # the profile still needs attention.
+        path = self.state_dir / "agy-exec-profile.json"
+        before = {"version": "1.2.12-fake", "fingerprint": profile_fingerprint(),
+                  "usage": {"input_tokens": 564}, "checked_at": 1}
+        path.write_text(json.dumps(before))
+        result = self.runner(mode="stock-cost").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(self.smoke_record(), before)
+        self.assertNotIn("profile changed", self.log())
+
+    # -------------------------------------------------------- unverified usage
+    def test_a_success_without_usage_is_not_a_verified_success(self):
+        # The input ceiling is the only structural proof of WHICH profile
+        # answered; a SUCCESS turn that cannot report what it spent cannot be
+        # checked against it, so it is not a verified ignition.
+        result = self.runner(mode="no-usage").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_summary, "functional:usage=unverified")
+        self.assertIn("result=failed", self.log())
+        self.assertIsNone(self.smoke_record())
+
+    def test_a_success_without_usage_falls_back_to_pi(self):
+        # Functional, so the Pi fallback is exactly as it is for any other
+        # functional failure.
+        result = self.runner(mode="no-usage", fallback=self.pi).run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertIn("functional:usage=unverified", self.log())
+        self.assertEqual(self.pi.prepared, [("antigravity", self.workspace)])
+        self.assertEqual(self.pi.calls, [("antigravity", "initial", 1, 3)])
+        self.assertTrue(result.success)  # delivered by the fallback
+        self.assertIsNone(self.smoke_record())
+
+    def test_a_success_reporting_zero_input_is_not_a_verified_success(self):
+        # 0 is as unverifiable as absent: the ceiling cannot tell a free
+        # read-only command from the question being answered for nothing.
+        result = self.runner(mode="zero-usage").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_summary, "functional:usage=unverified")
+
+    def test_a_non_success_turn_keeps_its_own_handling_of_missing_usage(self):
+        # Non-SUCCESS has no usage to report by nature; that must not become a
+        # second, misleading problem on top of the status.
+        result = self.runner(mode="error-no-usage").run(
+            "antigravity", self.workspace, "initial", 1, 3
+        )
+        self.assertFalse(result.success)
+        self.assertIn("status=ERROR", result.error_summary)
+        self.assertNotIn("usage=unverified", result.error_summary)
 
     # ------------------------------------------------------------------ failures
     def test_wrong_reply_falls_back_to_pi(self):
@@ -467,6 +667,12 @@ class AgyExecTests(unittest.TestCase):
         )
         self.assertEqual((status, response, usage["input_tokens"], problems),
                          ("SUCCESS", "1", 564, []))
+        # A missing `usage` is not a parse problem here: `parse_result` reports
+        # what the document says, and whether an unreported ignition counts as a
+        # verified success is a per-turn policy decision, not a parse one.
+        self.assertEqual(
+            parse_result(json.dumps({"status": "SUCCESS", "response": "1"}))[3], []
+        )
 
 
 class TransportPriorityTests(unittest.TestCase):

@@ -34,19 +34,31 @@ guards possible before any token is spent:
   but only after the tokens were gone.
 * **transient handshake** — ``Eligibility check failed`` happens before the turn
   starts and reports 0 tokens (measured 6 failures in a row during one burst),
-  so it is retried rather than being reported as a delivery failure.
+  so it is retried rather than being reported as a delivery failure. Two fences
+  keep that retry honest: only the CURRENT turn's stderr is read (the file is
+  append-only across turns, so an old marker would otherwise make a later,
+  unrelated failure look free), and the current turn must have spent nothing —
+  a handshake fails before the turn starts, so anything that reported tokens is
+  not a free retry.
 
 Two failure classes are treated differently, exactly as in the codex transport:
 
 * **functional** — non-zero exit, a non-``SUCCESS`` status, a reply that is not
-  ``1``, or a missing agent: the attempt failed and the Pi transport is used
-  instead;
+  ``1``, a missing agent, or a ``SUCCESS`` turn whose ``usage`` cannot prove it
+  spent input (``input_tokens >= 1``): the attempt failed and the Pi transport is
+  used instead. The last one is not pedantry — the input ceiling is the only
+  structural proof that the 564-token profile rather than the 22,311-token stock
+  agent answered, so an unverifiable ignition is not a verified success;
 * **cost regression** — the run succeeded but reports more input than the
   measured profile, or a runaway reply (a renamed frontmatter key, a dropped
   ``--agent``, or a server-side change that reintroduces the scaffolding): the
-  attempt is *still usable*, but it is reported as a regression and the Pi
-  transport is used instead, so a regression can never quietly burn 40x the
-  quota. Thinking tokens are reported and not policed — see the ceilings below.
+  attempt is **accepted as a success**. The reply was already delivered and the
+  window already anchored, so handing the same attempt to Pi would spend MORE
+  quota to reach the same fact and could only turn a success into a failure
+  (which the scheduler would then pay for again). It is logged as a regression
+  and deliberately NOT recorded as a verified profile, so the next attempt
+  re-tests the profile instead of trusting it. Thinking tokens are reported and
+  not policed — see the ceilings below.
 
 One deliberate omission: this transport writes no quota snapshot for
 ``AttemptResult.quota_path``. The Pi transport's capture file is normalized as
@@ -225,7 +237,13 @@ def parse_result(raw: str) -> Tuple[Optional[str], Optional[str], Optional[dict]
 
 
 def is_transient_error(*texts: Optional[str]) -> bool:
-    """Whether a failure is the pre-turn handshake, which costs nothing to retry."""
+    """Whether a failure is the pre-turn handshake, which costs nothing to retry.
+
+    A pure marker matcher on the text it is given: the two conditions that make a
+    marker mean "free retry" — the text must be the CURRENT turn's stderr, and
+    the turn must have spent nothing — are decided by the caller, which is the
+    only place that knows both.
+    """
     joined = " ".join(text for text in texts if text).lower()
     return any(marker in joined for marker in TRANSIENT_MARKERS)
 
@@ -402,9 +420,16 @@ class AgyExecRunner:
         file unparseable — a transient retry would then be reported as a
         malformed reply instead of the success it was. stderr is appended
         because the CLI's own logging is the diagnosis, and it is not parsed.
+
+        The size of stderr is measured BEFORE the run and returned with the exit
+        code, so the caller can read back exactly the bytes this turn appended.
+        The file stays append-only; only the slice is per-turn. Without that, a
+        marker written by any earlier turn would still be in the tail and would
+        make a later, unrelated failure look like the free handshake.
         """
         command = self._helper_command(inner)
         started = time.monotonic()
+        stderr_offset = _file_size(paths.stderr_path)
         with open(paths.stdout_path, "wb") as stdout, open(paths.stderr_path, "ab") as stderr:
             completed = subprocess.run(
                 command,
@@ -414,7 +439,7 @@ class AgyExecRunner:
                 stderr=stderr,
                 check=False,
             )
-        return completed.returncode, time.monotonic() - started
+        return completed.returncode, time.monotonic() - started, stderr_offset
 
     def agy_version(self) -> Optional[str]:
         try:
@@ -486,11 +511,17 @@ class AgyExecRunner:
         return AGENT_NAME in [name for name in agents if isinstance(name, str)]
 
     def _one_turn(self, paths: PreparedPaths) -> _Attempt:
-        exit_code, elapsed = self._run_cli(self._command(), paths)
+        exit_code, elapsed, stderr_offset = self._run_cli(self._command(), paths)
         raw = paths.stdout_path.read_bytes().decode("utf-8", "replace")
         status, response, usage, problems = parse_result(raw)
-        stderr_tail = _stderr_tail(paths.stderr_path)
+        stderr_this_turn = _stderr_tail(paths.stderr_path, stderr_offset)
         numbers = _usage_numbers(usage)
+        # Two fences, both required. The text is this turn's stderr only, so an
+        # old marker cannot make a fresh failure look free; and the turn must
+        # have spent nothing, because the handshake fails BEFORE the turn starts
+        # and therefore reports no usage. A failure that reported tokens is a
+        # real turn and must not be replayed for free.
+        spent = numbers["input_tokens"] != 0 or numbers["output_total"] != 0
         return _Attempt(
             status=status,
             response=response,
@@ -499,8 +530,8 @@ class AgyExecRunner:
             exit_code=exit_code,
             timed_out=exit_code == 124,
             elapsed=elapsed,
-            transient=(status != "SUCCESS" and is_transient_error(
-                document_error(raw), stderr_tail,
+            transient=(status != "SUCCESS" and not spent and is_transient_error(
+                document_error(raw), stderr_this_turn,
             )),
         )
 
@@ -557,6 +588,16 @@ class AgyExecRunner:
             problems.append("exit=%s" % attempt.exit_code)
         if attempt.status != "SUCCESS":
             problems.append("status=%s" % attempt.status)
+        elif attempt.usage.get("input_tokens", 0) < 1:
+            # A SUCCESS turn that cannot show what it spent is not a verified
+            # ignition, so it is functional, not a success. `parse_result` does
+            # not make a missing `usage` a parse problem on its own — a
+            # non-SUCCESS turn has no usage to report and keeps its own
+            # handling — but the policy here needs the number: `input_tokens`
+            # is the only structural proof that the 564-token minimal profile
+            # and not the 22,311-token stock agent answered, and the input
+            # ceiling cannot be evaluated without it.
+            problems.append("usage=unverified")
         if attempt.response is None:
             problems.append("no response")
         elif attempt.response.strip() != USER_PROMPT:
@@ -692,45 +733,75 @@ class AgyExecRunner:
                 error_summary="",
             )
 
-        reason = "functional:" + ",".join(functional) if functional else \
-            "cost-regression:" + ",".join(regression)
+        reason = "functional:" + ",".join(functional)
         if functional:
             self._log_attempt(phase, attempt, limit, result, "failed")
-        else:
-            # Measured, not guessed: the run worked, so this is information
-            # about the profile, not about the network.
-            self._log_attempt(phase, attempt, limit, result, "cost-regression")
-            self.logger(
-                "model %s transport=agy cost regression (%s); expected input<%s output<%s "
-                "— the minimal profile no longer applies"
-                % (AGY_PROVIDER, ",".join(regression),
-                   self.config.input_ceiling, self.config.output_ceiling)
+            fallback = self._fallback_to_pi(workspace, phase, attempt, limit, reason)
+            if fallback is not None:
+                return fallback
+            return AttemptResult(
+                success=False,
+                exit_code=result.exit_code,
+                timed_out=result.timed_out,
+                elapsed=result.elapsed,
+                stdout_path=paths.stdout_path,
+                stderr_path=paths.stderr_path,
+                quota_path=paths.quota_path,
+                error_summary=reason,
             )
-        fallback = self._fallback_to_pi(workspace, phase, attempt, limit, reason)
-        if fallback is not None:
-            return fallback
+
+        # Cost regression with no functional problem: ACCEPTED as a success, and
+        # deliberately NOT handed to Pi. The reply was already delivered and the
+        # window already anchored, so the fact this attempt exists to produce is
+        # already true; re-delivering it through Pi would spend more quota to
+        # reach the same fact, and if Pi then failed the scheduler would retry
+        # and spend a third time. Measured, not guessed: the run worked, so this
+        # is information about the profile, not about the network. The smoke
+        # record stays untouched because a regressed profile is not a verified
+        # one — the next attempt re-tests instead of trusting it.
+        self._log_attempt(phase, attempt, limit, result, "cost-regression")
+        self.logger(
+            "model %s transport=agy cost regression (%s); expected input<%s output<%s "
+            "— the delivery is accepted and the profile needs attention"
+            % (AGY_PROVIDER, ",".join(regression),
+               self.config.input_ceiling, self.config.output_ceiling)
+        )
         return AttemptResult(
-            success=False,
+            success=True,
             exit_code=result.exit_code,
-            timed_out=result.timed_out,
+            timed_out=False,
             elapsed=result.elapsed,
             stdout_path=paths.stdout_path,
             stderr_path=paths.stderr_path,
             quota_path=paths.quota_path,
-            error_summary=reason,
+            error_summary="",
         )
 
 
 _STDERR_TAIL_BYTES = 4096
 
 
-def _stderr_tail(path: Path) -> str:
+def _file_size(path: Path) -> int:
+    """The current size of ``path``, or 0 when it does not exist yet."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _stderr_tail(path: Path, offset: int = 0) -> str:
+    """The last ``_STDERR_TAIL_BYTES`` of ``path`` at or after ``offset``.
+
+    ``offset`` is where the current turn started writing, so the result never
+    reaches back into an earlier turn's logging; the byte cap is applied on top
+    of that slice, exactly as before.
+    """
     try:
         size = path.stat().st_size
-        if size == 0:
+        if size <= offset:
             return ""
         with path.open("rb") as handle:
-            handle.seek(max(0, size - _STDERR_TAIL_BYTES))
+            handle.seek(max(offset, size - _STDERR_TAIL_BYTES))
             return handle.read().decode("utf-8", "replace")
     except OSError:
         return ""
