@@ -181,6 +181,29 @@ class ApplicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _AppConfig.from_env({"QUOTA_SENTINEL_PROBE_ONLY": "antigravty"})
 
+    def test_probe_only_provider_is_refused_by_an_explicit_run(self):
+        """`run <provider>` on a switched-off trigger is a refusal.
+
+        The switch promises that the provider is never executed. Skipping it
+        silently would report a run that delivered nothing as a success, so the
+        explicit target — and only the explicit target — is refused before the
+        run lock, the probe or the first attempt.
+        """
+        with self.assertRaises(ValueError):
+            self._probe_only_app(["antigravity"]).run(("antigravity",))
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.notifier.events, [])
+
+    def test_probe_only_provider_leaves_the_default_roster_but_the_rest_runs(self):
+        """The default roster is what can be delivered; nothing else changes."""
+        results = self._probe_only_app(["antigravity"]).run()
+        expected = tuple(p for p in PROVIDERS if p != "antigravity")
+        self.assertEqual(tuple(sorted(results)), tuple(sorted(expected)))
+        self.assertTrue(all(call[0] != "antigravity" for call in self.runner.calls))
+        # The card reports the providers that actually ran, so a switched-off
+        # provider never appears in a delivery nobody made.
+        self.assertEqual(self.notifier.events[0][:2], ("task", expected))
+
     def test_due_run_records_debt_before_model_and_commits_success(self):
         self.app.run(("codex",))
         self.assertEqual(self.runner.calls, [("codex", "initial", 1, 1)])
@@ -379,6 +402,37 @@ class ApplicationTests(unittest.TestCase):
             app.run(("codex",))
         self.assertEqual(self.runner.calls, [])
 
+    def test_watchdog_retry_also_stops_before_any_model_attempt(self):
+        """The retry burst is a burst: it owes the same readiness check.
+
+        A retry runs BEFORE the due evaluation, so it is the one path that
+        could reach the model without ever passing the run-requirements gate —
+        spending three attempts' worth of quota on a task nobody can receive.
+        """
+        class NotReady(FakeNotifier):
+            def validate_ready(self):
+                raise RuntimeError("missing Feishu app secret")
+
+        store = FileStateStore(self.state_dir)
+        store.commit(
+            "codex", ProviderState(),
+            ProviderState(retry_pending=True, last_attempt_at=0),
+        )
+        for provider in (p for p in PROVIDERS if p != "codex"):
+            store.commit(
+                provider, ProviderState(), ProviderState(next_due_at=3000)
+            )
+        app = Application(
+            self.state_dir, self.runner, lambda workspace: self.collector,
+            NotReady(), clock=lambda: 1000, sleep=lambda seconds: None,
+            config=AppConfig(initial_attempts=1, watchdog_attempts=1, quota_wait=0),
+            workspace_parent=Path(self.temp.name),
+        )
+        with self.assertRaises(RuntimeError):
+            app.check()
+        self.assertEqual(self.runner.calls, [])
+        self.assertTrue(store.load("codex").retry_pending)
+
     # ---- Lock INFRASTRUCTURE failures degrade exactly like BUSY ----
     def test_check_skips_when_the_quota_lock_cannot_be_acquired_at_all(self):
         store = FileStateStore(self.state_dir)
@@ -409,6 +463,32 @@ class ApplicationTests(unittest.TestCase):
             results = self.app.run(("codex",))
         self.assertEqual(results["codex"], "发送成功")
         self.assertEqual(self.notifier.events[0][:2], ("task", ("codex",)))
+
+    def test_a_recovered_retry_is_still_reported_when_the_quota_lock_is_broken(self):
+        """The card is owed by the attempt, not by the deadline calibration.
+
+        A watchdog retry that succeeds commits its success immediately, so its
+        debt is gone. If the card were dropped here, the only record of that
+        success would never exist: no later tick has anything left to report.
+        """
+        store = FileStateStore(self.state_dir)
+        store.commit(
+            "codex", ProviderState(),
+            ProviderState(retry_pending=True, last_attempt_at=0),
+        )
+        for provider in (p for p in PROVIDERS if p != "codex"):
+            store.commit(
+                provider, ProviderState(), ProviderState(next_due_at=3000)
+            )
+        with mock.patch.object(
+            app_module, "acquire_quota_lock", side_effect=LockError("no shlock")
+        ):
+            self.assertEqual(self.app.check(), ())
+        self.assertEqual(self.runner.calls, [("codex", "watchdog-retry", 1, 1)])
+        self.assertFalse(store.load("codex").retry_pending)
+        self.assertEqual(
+            self.notifier.events, [("task", ("codex",), {"codex": "发送成功"})]
+        )
 
 
 class BurstEngineTests(unittest.TestCase):

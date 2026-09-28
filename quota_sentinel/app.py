@@ -264,6 +264,20 @@ class Application:
         self, providers: Sequence[str], workspace: Path, collector: object
     ) -> Dict[str, str]:
         names = self._providers(providers)
+        # Belt and braces for the one contract this switch exists for. Both
+        # callers above already filter, but nothing may start a model for a
+        # provider whose trigger is switched off — not even if a future caller
+        # hands this method a roster that was never filtered.
+        disabled = tuple(p for p in names if p in self.config.probe_only)
+        if disabled:
+            logger.info(
+                "run: probe-only provider(s) dropped from the roster: %s",
+                " ".join(disabled),
+            )
+            names = tuple(p for p in names if p not in self.config.probe_only)
+        if not names:
+            logger.info("run: every selected provider is probe-only; no attempt")
+            return {}
         # Before the first attempt, never after: a missing push credential
         # discovered once three 300s model timeouts have been spent is a
         # failure the operator paid for and cannot use.
@@ -298,7 +312,33 @@ class Application:
         return results
 
     def run(self, providers: Sequence[str] = ()) -> Dict[str, str]:
-        names = self._providers(providers)
+        requested = tuple(providers)
+        names = self._providers(requested)
+        disabled = tuple(p for p in names if p in self.config.probe_only)
+        if disabled:
+            if requested:
+                # An explicit target is an operator asking to spend quota on a
+                # provider whose model trigger is switched off. Refusing before
+                # the run lock, the probe and the first attempt is the only
+                # honest answer: quietly skipping would look like a delivered
+                # task, and running it would break the one promise the switch
+                # makes.
+                raise ValueError(
+                    "probe-only provider(s) cannot be run: %s "
+                    "(unset QUOTA_SENTINEL_PROBE_ONLY to re-enable the model "
+                    "trigger)" % ", ".join(disabled)
+                )
+            # The default roster is "everything that can be delivered", so a
+            # switched-off provider is simply not part of it, and the task card
+            # that follows reports only what actually ran.
+            logger.info(
+                "run: probe-only provider(s) excluded from the default roster: %s",
+                " ".join(disabled),
+            )
+            names = tuple(p for p in names if p not in self.config.probe_only)
+        if not names:
+            logger.info("run: every provider is probe-only; nothing to attempt")
+            return {}
         with acquire_run_lock(self.state_dir, timeout=0):
             read_authority(self.state_dir)
             with self._workspace() as temp:
@@ -337,6 +377,12 @@ class Application:
                 retry_results: Dict[str, str] = {}
                 pi_raw: Mapping[str, Path] = {}
                 if retry:
+                    # The same refusal every other burst gets, for the same
+                    # reason: a retry-eligible provider whose task cannot be
+                    # delivered spends quota on a run nobody can read. This
+                    # path used to skip the check because it runs before the
+                    # due evaluation that owns it.
+                    self._require_ready(retry)
                     logger.info(
                         "check: pending debt on %s; watchdog retry burst first",
                         " ".join(retry),
@@ -347,10 +393,25 @@ class Application:
                     )
                     collector.save_pi_snapshots(pi_raw)
 
+                # A recovered retry is owed a card from here on: the attempts
+                # already happened and their debt is already paid, so a later
+                # tick has nothing left to report. The quota lock below guards
+                # the DEADLINE CALIBRATION only, which is why the card has to be
+                # sent from both exits — dropping it was how a successful retry
+                # became permanently invisible.
+                recovered = [
+                    provider for provider in retry
+                    if retry_results.get(provider) == "发送成功"
+                ]
+
                 try:
                     quota_lock = acquire_quota_lock(self.state_dir, timeout=0)
                 except LockError:
                     logger.info("check: quota.lock busy, skipped")
+                    if recovered:
+                        self.notifier.task(
+                            recovered, retry_results, {}, self._now()
+                        )
                     return ()
                 with quota_lock:
                     readings = collector.collect(pi_raw)
@@ -404,10 +465,6 @@ class Application:
                         if result.decision is Decision.RUN_NOW:
                             due.append(provider)
 
-                recovered = [
-                    provider for provider in retry
-                    if retry_results.get(provider) == "发送成功"
-                ]
                 if recovered:
                     self.notifier.task(
                         recovered, retry_results, readings, self._now()
