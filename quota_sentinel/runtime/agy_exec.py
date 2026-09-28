@@ -72,6 +72,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -154,6 +155,29 @@ TRANSIENT_MARKERS: Tuple[str, ...] = (
 # different product and would not be the same fact. Same reasoning, and the
 # same shape, as the codex transport's API-key removal.
 API_KEY_VARS: Tuple[str, ...] = ("GEMINI_API_KEY",)
+
+# The free ``/agents`` guard is bounded TWICE, and the two numbers are not the
+# same one. The wrapper gets the SHORTER deadline and gives the CLI its own
+# session, so the wrapper is normally the one that kills and reaps the CLI;
+# the parent holds a later, last-resort deadline for the case where the wrapper
+# itself wedges, and reaps the whole tree when it fires. Handing both the SAME
+# deadline — which is what this guard used to do — meant the parent killed the
+# wrapper (a Python process) at the very moment the wrapper began its own
+# SIGTERM→SIGKILL escalation, so a CLI that ignores SIGTERM outlived the
+# bounded call: one leaked CLI per timed-out guard, against the promise that
+# every external process is bounded and cleaned up.
+#
+# The floors keep a tiny or zero-grace config from collapsing the two deadlines
+# back into one: a guard shorter than ~0.2s cannot bound a Python interpreter's
+# startup anyway, and a zero kill grace would hand the wrapper the same deadline
+# as the parent, which is the defect being fenced here.
+_GUARD_MIN_TOTAL_SECONDS = 0.2
+_GUARD_MIN_DEADLINE_SECONDS = 0.1
+_GUARD_MIN_GRACE_SECONDS = 0.1
+# How long the parent waits past the wrapper's own worst case (its deadline plus
+# its kill grace) before it stops trusting the wrapper and reaps the tree itself.
+# It is also the reap wait after that SIGKILL.
+_GUARD_REAP_MARGIN_SECONDS = 1.0
 
 
 def agent_document() -> str:
@@ -405,11 +429,28 @@ class AgyExecRunner:
     def _cwd(self, paths: PreparedPaths) -> Path:
         return Path(paths.agent_dir) / "cwd"
 
-    def _helper_command(self, inner: List[str]) -> List[str]:
+    def _helper_command(
+        self,
+        inner: List[str],
+        *,
+        timeout: Optional[float] = None,
+        kill_grace: Optional[float] = None,
+    ) -> List[str]:
+        """One CLI invocation, wrapped by ``run_with_timeout.py``.
+
+        The turn path passes no overrides: there the wrapper's deadline IS the
+        bound, which is why ``_run_cli`` gives ``subprocess.run`` no deadline of
+        its own — the wrapper therefore always outlives its own deadline and
+        gets to do its own process-group cleanup. Only the guard overrides both
+        numbers, because only the guard also holds a parent-side deadline; see
+        ``_guard_deadlines`` for why the wrapper's must be the shorter one.
+        """
         helper = Path(__file__).resolve().parents[2] / "run_with_timeout.py"
+        deadline = self.config.timeout if timeout is None else timeout
+        grace = self.config.kill_grace if kill_grace is None else kill_grace
         return [
-            sys.executable, str(helper), "--timeout", str(self.config.timeout),
-            "--kill-grace", str(self.config.kill_grace), "--", *inner,
+            sys.executable, str(helper), "--timeout", str(deadline),
+            "--kill-grace", str(grace), "--", *inner,
         ]
 
     def _run_cli(self, inner: List[str], paths: PreparedPaths):
@@ -470,6 +511,42 @@ class AgyExecRunner:
             "--output-format", "json",
         ]
 
+    # ------------------------------------------------------------ agent guard
+    def _guard_deadlines(self) -> Tuple[float, float, float]:
+        """``(wrapper_deadline, wrapper_grace, parent_deadline)`` for the guard.
+
+        The wrapper runs the CLI in its OWN session, so the wrapper's own
+        timeout is what normally collects the CLI: SIGTERM to that group, then
+        SIGKILL once its grace is spent. For that the wrapper has to outlive its
+        deadline, so the parent — which can only kill the wrapper — must wait
+        past ``wrapper_deadline + wrapper_grace`` before it takes over. The
+        grace is clamped to half the timeout so a large ``kill_grace`` cannot
+        push the guard far past the timeout it promises, and the parent's
+        deadline is that total plus one reap margin, which is what makes it a
+        last resort instead of a race the wrapper loses.
+
+        End to end this lands where the old, single deadline landed — the guard
+        still returns at about ``timeout`` — but on the normal path it is the
+        wrapper, not the parent, that ends the CLI, and therefore the wrapper
+        that reaps the process group it created.
+        """
+        total = max(_GUARD_MIN_TOTAL_SECONDS, float(self.config.timeout))
+        grace = max(
+            _GUARD_MIN_GRACE_SECONDS,
+            min(max(0.0, float(self.config.kill_grace)), total / 2.0),
+        )
+        deadline = max(_GUARD_MIN_DEADLINE_SECONDS, total - grace)
+        return deadline, grace, deadline + grace + _GUARD_REAP_MARGIN_SECONDS
+
+    def _guard_command(self, inner: List[str]) -> List[str]:
+        """The guard's wrapper command, carrying the SHORTER inner deadline."""
+        deadline, grace, _parent = self._guard_deadlines()
+        return self._helper_command(inner, timeout=deadline, kill_grace=grace)
+
+    def _guard_timeout(self) -> float:
+        """The parent's last-resort deadline for the guard."""
+        return self._guard_deadlines()[2]
+
     def agent_listed(self, paths: PreparedPaths) -> Optional[bool]:
         """Whether ``--agent`` will resolve, at zero token cost.
 
@@ -478,21 +555,49 @@ class AgyExecRunner:
         cannot answer at all — an unreachable backend is not evidence that the
         agent is missing, and treating it as such would turn a network blip
         into a permanent fallback.
+
+        The guard is bounded twice and the order of the two is the point: the
+        wrapper's deadline is strictly shorter than the parent's (see
+        ``_guard_deadlines``), so the wrapper — which owns the CLI's process
+        group — is the one that kills and reaps the CLI on a timeout. The
+        parent's deadline is a genuine last resort: it waits past the wrapper's
+        whole deadline plus its kill grace, and if it fires anyway it reaps the
+        wrapper's entire tree rather than killing the wrapper and orphaning the
+        grandchild it can no longer reach.
         """
         inner = [
             str(self.config.agy_bin), "-p", "/agents",
             "--output-format", "json",
         ]
         try:
-            completed = subprocess.run(
-                self._helper_command(inner),
+            process = subprocess.Popen(
+                self._guard_command(inner),
                 cwd=str(self._cwd(paths)),
                 env=self._environment(),
-                capture_output=True, timeout=self.config.timeout, check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # The wrapper leads its own group, so the last resort below can
+                # signal it (and what it spawned) without any chance of
+                # signalling this process; the CLI it starts still gets its own
+                # session from the helper.
+                start_new_session=True,
             )
-        except (OSError, subprocess.SubprocessError):
+        except OSError:
             return None
-        raw = completed.stdout.decode("utf-8", "replace")
+        try:
+            stdout, _stderr = process.communicate(timeout=self._guard_timeout())
+        except subprocess.TimeoutExpired:
+            # The wrapper itself wedged: it has already had its own deadline
+            # plus the grace it was told to give its child, so what is left is
+            # the SIGKILL it could not deliver itself.
+            _reap_guard_tree(process)
+            return None
+        except (OSError, subprocess.SubprocessError):
+            # Any other failure to collect it still must not leave the tree
+            # running: a backgrounded CLI is a leak either way.
+            _reap_guard_tree(process)
+            return None
+        raw = stdout.decode("utf-8", "replace")
         try:
             document = json.loads(raw.strip() or "null")
         except ValueError:
@@ -805,6 +910,103 @@ def _stderr_tail(path: Path, offset: int = 0) -> str:
             return handle.read().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+# ---------------------------------------------------- last-resort guard reaping
+def _tree_process_groups(root_pid: int) -> List[int]:
+    """Every process group in ``root_pid``'s descendant tree, plus its own.
+
+    The same technique the orchestrator's ``SubprocessRunner`` uses for the
+    outer ``check`` bound, and for the same reason: the wrapper starts the CLI
+    in its OWN session (that is the helper's contract), so a kill aimed at the
+    wrapper's group cannot reach the CLI at all. A ``ps`` snapshot taken while
+    the wrapper is still alive is the only thing that links the two — once the
+    wrapper dies the CLI is reparented and that link is gone, which is exactly
+    how a killed wrapper orphans a grandchild. Our own group is never returned:
+    the caller signals these with SIGKILL, and this process must not be in the
+    set.
+    """
+    groups = [root_pid]
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,pgid="],
+            check=False, capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Without a snapshot the wrapper's own group is still worth killing;
+        # losing the snapshot costs the grandchild, not the caller.
+        return groups
+
+    children: Dict[int, List[int]] = {}
+    pgids: Dict[int, int] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, ppid, pgid = (int(field) for field in fields)
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        pgids[pid] = pgid
+
+    seen = {root_pid}
+    stack = [root_pid]
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            stack.append(child)
+
+    own_group = os.getpgrp()
+    for pid in seen:
+        pgid = pgids.get(pid, 0)
+        if pgid > 0 and pgid != own_group and pgid not in groups:
+            groups.append(pgid)
+    return groups
+
+
+def _reap_guard_tree(process: subprocess.Popen) -> None:
+    """SIGKILL the guard's whole tree, then reap the wrapper.
+
+    This is the parent's last resort, so it does not ask politely first: the
+    wrapper has already had its own deadline plus the grace it was told to give
+    its child, and anything still alive after that is by definition ignoring the
+    signals the wrapper sent. The descendant groups are collected BEFORE the
+    wrapper is killed, because that snapshot is the only handle on a CLI that
+    the wrapper started in a session of its own; killing the wrapper first would
+    orphan it. Non-fatal by construction: every step tolerates a process that
+    has already exited, and the caller only ever returns ``None`` from here.
+    """
+    for pgid in _tree_process_groups(process.pid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    # The wrapper by PID as well. It leads the group above because
+    # ``agent_listed`` starts it with ``start_new_session=True``, but the reap
+    # must not silently depend on the caller having done that.
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.communicate(timeout=_GUARD_REAP_MARGIN_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A descendant SIGKILL has not yet collected can still hold the pipe
+        # write end open; the wrapper itself must not stay unreaped for it.
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=_GUARD_REAP_MARGIN_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def document_error(raw: str) -> Optional[str]:

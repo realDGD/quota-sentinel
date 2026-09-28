@@ -11,6 +11,11 @@ replays one scenario, so every claim the transport makes can be checked:
   * the agent is confirmed with the CLI's own `/agents` command BEFORE the turn,
     because an unresolvable agent is not an error at all — the default agent
     answers, at 40x;
+  * that guard is bounded TWICE, and the two bounds are ordered: the wrapper's
+    deadline is strictly shorter than the parent's last-resort deadline, so the
+    wrapper — which owns the CLI's process group — is what kills and reaps the
+    CLI on a timeout. A CLI that ignores SIGTERM must not outlive the guard, and
+    a wedged wrapper must not orphan the CLI it started in its own session;
   * the pre-turn `Eligibility check failed` handshake is retried and costs
     nothing, and a retry must not be mistaken for a malformed reply;
   * that retry is fenced twice: only the CURRENT turn's stderr is read (the
@@ -37,8 +42,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -75,7 +83,7 @@ TRANSIENT_BODY = {
 }
 
 FAKE_AGY = '''#!{python}
-import json, os, sys, time
+import json, os, signal, sys, time
 
 record = os.environ.get("QS_FAKE_AGY_RECORD")
 argv = sys.argv[1:]
@@ -107,11 +115,24 @@ if "--version" in argv:
 
 if "/agents" in argv:
     note("agents")
+    if mode == "agents-ignore-term":
+        # A wedged CLI: it answers nothing and refuses SIGTERM, so only a
+        # SIGKILL — the wrapper's escalation, or the parent's last resort — can
+        # end it. Nothing below this line is reached.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
     if mode == "agents-unavailable":
         print("the backend is unreachable", file=sys.stderr)
         print("not json at all")
         raise SystemExit(0)
-    agents = [] if mode == "missing-agent" else ["quota-primer", "another-agent"]
+    if mode == "missing-agent":
+        agents = []
+    elif mode == "other-agent-only":
+        # The list answered; this agent is genuinely not on it. That is False,
+        # which is a different fact from the None of an unreadable list.
+        agents = ["another-agent"]
+    else:
+        agents = ["quota-primer", "another-agent"]
     print(json.dumps({{
         "conversation_id": "", "status": "SUCCESS", "response": "",
         "num_turns": 0,
@@ -206,6 +227,65 @@ print(json.dumps({{
 }}))
 '''.format(python=sys.executable, transient=json.dumps(TRANSIENT_BODY))
 
+# A stand-in for run_with_timeout.py itself, in the one state no inner deadline
+# can save: the wrapper wedges and never gets around to killing anything. It
+# starts its child the same way the real helper does — in a session of its own —
+# so the parent's last resort cannot reach that child by killing the wrapper's
+# process group, only through a process-tree snapshot. It publishes both PIDs so
+# the test can check what survived.
+WEDGED_WRAPPER = '''#!{python}
+import json, os, subprocess, sys, time
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True
+)
+with open(os.environ["QS_WEDGE_RECORD"], "w") as handle:
+    handle.write(json.dumps({{"wrapper": os.getpid(), "child": child.pid}}))
+time.sleep(600)
+'''.format(python=sys.executable)
+
+
+def _alive(pid) -> bool:
+    """Whether ``pid`` is a live process.
+
+    A zombie that its parent has not reaped yet is not alive for the purpose of
+    "did anything survive the bound": it holds no code, no descriptors and no
+    quota, and the kernel is about to collect it.
+    """
+    completed = subprocess.run(
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True, text=True, check=False,
+    )
+    state = completed.stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def _wait_for(predicate, timeout=5.0, interval=0.05):
+    """Poll ``predicate`` until it is truthy or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if value or time.monotonic() >= deadline:
+            return value
+        time.sleep(interval)
+
+
+def _kill_pids(pids) -> None:
+    """Best-effort fixture hygiene: never leave a test process behind."""
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except (OSError, TypeError, ValueError):
+            pass
+
+
+def _kill_matching(pattern: str) -> None:
+    """Best-effort fixture hygiene by command line, for a test that failed."""
+    completed = subprocess.run(
+        ["pgrep", "-f", pattern], capture_output=True, text=True, check=False,
+    )
+    _kill_pids(completed.stdout.split())
+
 
 class _FakePi:
     """Stands in for the Pi runner: records the delegation, returns its own result.
@@ -246,18 +326,21 @@ class AgyExecTests(unittest.TestCase):
         self.agy = self.root / "agy"
         self.agy.write_text(FAKE_AGY)
         self.agy.chmod(0o755)
+        # Hygiene, not assertion: whatever the test proved, a fixture CLI must
+        # not outlive it (registered after the tmpdir, so it runs before it).
+        self.addCleanup(_kill_matching, str(self.agy))
         self.lines: list = []
         self.pi = _FakePi()
 
-    def runner(self, *, mode="success", fallback=None, timeout=30, environment=None,
-               preflight=True) -> AgyExecRunner:
+    def runner(self, *, mode="success", fallback=None, timeout=30, kill_grace=1,
+               environment=None, preflight=True) -> AgyExecRunner:
         env = {"QS_FAKE_AGY_RECORD": str(self.record), "QS_FAKE_AGY_MODE": mode}
         env.update(environment or {})
         config = AgyExecConfig(
             agy_bin=self.agy,
             state_dir=self.state_dir,
             timeout=timeout,
-            kill_grace=1,
+            kill_grace=kill_grace,
             transient_retries=3,
             preflight=preflight,
             environment=env,
@@ -282,6 +365,30 @@ class AgyExecTests(unittest.TestCase):
             self.workspace / "antigravity-agy" / "cwd" / ".agents" / "agents"
             / AGENT_NAME / "agent.md"
         )
+
+    def survivors(self, timeout=3.0) -> list:
+        """PIDs whose command line still matches this test's fake agy.
+
+        Polled rather than sampled once: a CLI that was SIGKILLed is reparented
+        and collected a moment later, and the contract is "no survivor shortly
+        after the call returned", not "no survivor in the same microsecond".
+        """
+        def snapshot():
+            completed = subprocess.run(
+                ["pgrep", "-f", str(self.agy)],
+                capture_output=True, text=True, check=False,
+            )
+            return [
+                pid for pid in completed.stdout.split()
+                if pid.isdigit() and int(pid) != os.getpid()
+            ]
+
+        deadline = time.monotonic() + timeout
+        while True:
+            pids = snapshot()
+            if not pids or time.monotonic() >= deadline:
+                return pids
+            time.sleep(0.05)
 
     # ------------------------------------------------------------------ profile
     def test_profile_is_the_measured_minimal_agent(self):
@@ -433,6 +540,137 @@ class AgyExecTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(self.calls("agents"), [])
         self.assertEqual(len(self.calls("turn")), 1)
+
+    # ----------------------------------------------------------- guard cleanup
+    def test_the_guard_reports_a_listed_agent(self):
+        runner = self.runner()
+        paths = runner.prepare("antigravity", self.workspace)
+        self.assertIs(runner.agent_listed(paths), True)
+        self.assertEqual(self.calls("agents")[0]["argv"][:2], ["-p", "/agents"])
+
+    def test_the_guard_reports_an_agent_that_is_not_listed(self):
+        # The list answered, and this agent is not on it: False. That is a
+        # different fact from the None of a list that could not be read, and
+        # the guard's whole point is the difference between the two.
+        runner = self.runner(mode="other-agent-only")
+        paths = runner.prepare("antigravity", self.workspace)
+        self.assertIs(runner.agent_listed(paths), False)
+
+    def test_a_guard_that_ignores_sigterm_is_bounded_and_leaves_no_survivor(self):
+        # The two deadlines used to be the SAME number, so the parent killed the
+        # wrapper at the very instant the wrapper began its own SIGTERM→SIGKILL
+        # escalation: a CLI that ignores SIGTERM then outlived the bounded call,
+        # one leaked CLI per timed-out guard. The wrapper's deadline is now the
+        # shorter one, so the wrapper wins the race and reaps the group it made.
+        runner = self.runner(mode="agents-ignore-term", timeout=2, kill_grace=0.5)
+        paths = runner.prepare("antigravity", self.workspace)
+        started = time.monotonic()
+        listed = runner.agent_listed(paths)
+        elapsed = time.monotonic() - started
+        # Still a timeout, still non-fatal: an unreachable backend is not
+        # evidence that the agent is missing.
+        self.assertIsNone(listed)
+        self.assertTrue(self.calls("agents"), "the fake CLI never received /agents")
+        # ...and still bounded, at the wrapper's deadline (1.5s) plus its kill
+        # grace (0.5s), not at an unbounded wait for a CLI that never exits.
+        self.assertLess(elapsed, 2 + 0.5 + 1.0)
+        self.assertEqual(self.survivors(), [], "the guard outlived itself")
+
+    def test_the_guard_wrapper_deadline_is_strictly_shorter_than_the_parent_guard(self):
+        # Both numbers must derive from the config, and the wrapper's must stay
+        # strictly the shorter one: `inner == timeout` is exactly the collapse
+        # that leaks a CLI. `kill_grace=0` is the trap case — `timeout -
+        # kill_grace` would collapse them there.
+        for timeout, kill_grace in ((30, 1), (60, 10), (2, 0.5), (4, 0)):
+            runner = self.runner(timeout=timeout, kill_grace=kill_grace)
+            command = runner._guard_command([str(self.agy), "-p", "/agents"])
+            inner = float(command[command.index("--timeout") + 1])
+            grace = float(command[command.index("--kill-grace") + 1])
+            parent = runner._guard_timeout()
+            with self.subTest(timeout=timeout, kill_grace=kill_grace):
+                self.assertLess(inner, timeout, "the wrapper no longer wins the race")
+                self.assertLessEqual(
+                    inner + grace, timeout + 0.05,
+                    "the wrapper's worst case outlives the guard's promise",
+                )
+                self.assertGreater(
+                    parent, inner + grace,
+                    "the parent guard can fire before the wrapper has finished",
+                )
+                self.assertGreater(parent, timeout)
+        # The numbers follow the config, not a constant in the transport.
+        slow = self.runner(timeout=60)._guard_command([str(self.agy)])
+        quick = self.runner(timeout=30)._guard_command([str(self.agy)])
+        self.assertEqual(
+            float(slow[slow.index("--timeout") + 1])
+            - float(quick[quick.index("--timeout") + 1]),
+            30.0,
+        )
+
+    def test_the_turn_path_keeps_the_wrapper_as_its_only_bound(self):
+        # _run_cli deliberately passes NO outer deadline: there the wrapper's own
+        # deadline is the only bound, so the wrapper always outlives it and gets
+        # to reap the CLI's process group itself. A second, equal deadline here
+        # is exactly the guard's leak — this pins the shape so the fix cannot
+        # migrate the bug to the turn path.
+        runner = self.runner(timeout=30)
+        paths = runner.prepare("antigravity", self.workspace)
+        seen = {}
+        real_run = agy_exec.subprocess.run
+
+        def spy(command, **kwargs):
+            seen["command"] = command
+            seen["timeout"] = kwargs.get("timeout")
+            return real_run(command, **kwargs)
+
+        agy_exec.subprocess.run = spy
+        try:
+            exit_code, _elapsed, _offset = runner._run_cli(
+                [str(self.agy), "-p", USER_PROMPT], paths
+            )
+        finally:
+            agy_exec.subprocess.run = real_run
+        self.assertEqual(exit_code, 0)
+        self.assertIsNone(seen.get("timeout"), "the turn path gained an outer deadline")
+        command = seen["command"]
+        self.assertEqual(float(command[command.index("--timeout") + 1]), 30)
+        self.assertEqual(float(command[command.index("--kill-grace") + 1]), 1)
+
+    def test_the_parent_last_resort_reaps_a_tree_whose_wrapper_wedged(self):
+        # The wrapper is the polite path, but it is also a Python process: if IT
+        # is the thing that wedges, no inner deadline can help. The parent's last
+        # resort must then end the CLI the wrapper started — which the helper
+        # puts in a session of ITS OWN, so killing the wrapper's process group
+        # cannot reach it. Only a tree snapshot taken while the wrapper is still
+        # alive can, which is why the snapshot comes before the kill.
+        record = self.root / "wedged.json"
+        wrapper = self.root / "wedged-wrapper"
+        wrapper.write_text(WEDGED_WRAPPER)
+        wrapper.chmod(0o755)
+        env = dict(os.environ)
+        env["QS_WEDGE_RECORD"] = str(record)
+        process = subprocess.Popen(
+            [sys.executable, str(wrapper)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.assertTrue(
+            _wait_for(lambda: record.exists()), "the wedged wrapper never started"
+        )
+        pids = json.loads(record.read_text())
+        self.addCleanup(_kill_pids, list(pids.values()))
+        self.assertTrue(_alive(pids["wrapper"]), pids)
+        self.assertTrue(_alive(pids["child"]), pids)
+
+        agy_exec._reap_guard_tree(process)
+
+        self.assertEqual(
+            _wait_for(lambda: not any(_alive(pid) for pid in pids.values())),
+            True,
+            "the parent's last resort left the tree running: %s" % pids,
+        )
 
     # ---------------------------------------------------------- transient retry
     def test_transient_handshake_is_retried_without_replaying_the_turn(self):
