@@ -137,6 +137,32 @@ class TestFeishuListener(unittest.TestCase):
             start_new_session=True,
         )
 
+    def test_a_wedged_keychain_read_cannot_hold_daemon_startup(self):
+        """`security` is an external process like any other: it is bounded.
+
+        Without the bound the listener blocks in `read_keychain` before it can
+        serve anything, and a timeout has to be reported exactly like a failed
+        read (an empty credential), not raised into the daemon's start-up.
+        """
+        import tempfile
+        import time as _time
+
+        with tempfile.TemporaryDirectory(prefix="qs-listener-keychain-") as tmp:
+            security = Path(tmp) / "security"
+            security.write_text(
+                "#!%s\nimport time\nwhile True:\n    time.sleep(1)\n" % sys.executable
+            )
+            security.chmod(0o755)
+            started = _time.monotonic()
+            value = feishu_listener.read_keychain(
+                "quota-sentinel.feishu-app-id",
+                security_bin=str(security),
+                timeout=1,
+            )
+            elapsed = _time.monotonic() - started
+        self.assertEqual(value, "")
+        self.assertLess(elapsed, 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

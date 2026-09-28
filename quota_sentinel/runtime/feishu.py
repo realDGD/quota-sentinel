@@ -37,6 +37,9 @@ ENV_NAMES = {
     "user_id": "FEISHU_USER_ID",
 }
 TRANSIENT_HTTP_CODES = {408, 429, 500, 502, 503, 504}
+# The same budget the Keychain READ already used at this call site (15s); the
+# write was the one `security` invocation in the port with no bound at all.
+KEYCHAIN_WRITE_TIMEOUT_SECONDS = 15
 # 3.9 still has socket.timeout as its own OSError subclass; 3.10+ aliases it
 # to TimeoutError, so both names are listed.
 TIMEOUT_ERRORS = (TimeoutError, socket.timeout)
@@ -110,8 +113,12 @@ class KeychainCredentials:
                 [self.security_bin, "add-generic-password", "-U", "-a", KEYCHAIN_ACCOUNT,
                  "-s", SERVICES["user_id"], "-T", self.security_bin, "-w", value],
                 check=False, capture_output=True, text=True,
+                # Bounded like the read (keychain.DEFAULT_READ_TIMEOUT_SECONDS):
+                # `discover-feishu-user` must not hang on an unanswered Keychain
+                # prompt, and a write that cannot finish is a refusal, not a wait.
+                timeout=KEYCHAIN_WRITE_TIMEOUT_SECONDS,
             )
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             raise FeishuError("could not save Feishu user ID in Keychain") from exc
         if done.returncode != 0:
             raise FeishuError("could not save Feishu user ID in Keychain")

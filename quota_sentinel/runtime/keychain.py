@@ -19,6 +19,13 @@ SECURITY_BIN = "/usr/bin/security"
 # Explicit opt-out for tests and CI: without it, a headless host would still
 # consult the login Keychain and could pick up a real operator's credentials.
 DISABLE_ENV = "QUOTA_SENTINEL_KEYCHAIN_DISABLED"
+# Every read is bounded even when the caller forgets the argument. A wedged
+# `security` (an unanswered Keychain prompt, stuck IPC) would otherwise block
+# the readiness gate, the direct transport's key lookup and the /usage answer
+# forever — and those are exactly the paths where a missing credential is
+# supposed to fail in milliseconds. `None` therefore means "the default", not
+# "unbounded"; a caller with its own budget still passes it explicitly.
+DEFAULT_READ_TIMEOUT_SECONDS = 15
 
 
 def disabled(environment: Optional[Mapping[str, str]] = None) -> bool:
@@ -37,13 +44,16 @@ def read(
     """Read a generic password; an absent Keychain or item is empty, not fatal."""
     if disabled(environment):
         return ""
+    budget = DEFAULT_READ_TIMEOUT_SECONDS if timeout is None else timeout
     try:
         result = subprocess.run(
             [security_bin, "find-generic-password", "-a", account,
              "-s", service, "-w"],
-            check=False, capture_output=True, timeout=timeout,
+            check=False, capture_output=True, timeout=budget,
         )
     except (OSError, subprocess.SubprocessError):
+        # A timeout is one more way the item is unavailable, not an error the
+        # caller has to handle: the credential ladder moves on either way.
         return ""
     if result.returncode != 0:
         return ""
@@ -54,5 +64,5 @@ def present(service: str, **kwargs) -> bool:
     return bool(read(service, **kwargs))
 
 
-__all__ = ["DISABLE_ENV", "KEYCHAIN_ACCOUNT", "SECURITY_BIN", "disabled",
-           "present", "read"]
+__all__ = ["DEFAULT_READ_TIMEOUT_SECONDS", "DISABLE_ENV", "KEYCHAIN_ACCOUNT",
+           "SECURITY_BIN", "disabled", "present", "read"]

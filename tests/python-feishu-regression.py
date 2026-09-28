@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -303,6 +304,47 @@ class TransportTests(unittest.TestCase):
         self.assertIn("Gemini 3.7 Flash · Low", usage_text)
         self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", usage_text)
         self.assertIn("配额正在刷新", client.sent[2]["content"])
+
+
+class KeychainBoundTests(unittest.TestCase):
+    """`security` is an external process: both directions are bounded.
+
+    The read defaulted to "no timeout" and the write had no budget at all, so a
+    wedged Keychain (an unanswered prompt, stuck IPC) could block the readiness
+    gate, the direct key lookup and `discover-feishu-user` forever.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="qs-keychain-")
+        self.addCleanup(self.temp.cleanup)
+        self.security = Path(self.temp.name) / "security"
+        self.security.write_text(
+            "#!%s\nimport time\nwhile True:\n    time.sleep(1)\n" % sys.executable
+        )
+        self.security.chmod(0o755)
+
+    def test_a_wedged_read_is_bounded_without_an_explicit_budget(self):
+        from quota_sentinel.runtime import keychain as keychain_module
+        with mock.patch.object(keychain_module, "DEFAULT_READ_TIMEOUT_SECONDS", 1):
+            started = time.monotonic()
+            value = keychain_module.read(
+                "quota-sentinel.test-service", security_bin=str(self.security)
+            )
+            elapsed = time.monotonic() - started
+        # A timeout is "no credential", exactly like a missing item.
+        self.assertEqual(value, "")
+        self.assertLess(elapsed, 5.0)
+
+    def test_a_wedged_write_is_a_refusal_not_a_wait(self):
+        with mock.patch.object(feishu_module, "KEYCHAIN_WRITE_TIMEOUT_SECONDS", 1):
+            store = feishu_module.KeychainCredentials(
+                environment={}, security_bin=str(self.security)
+            )
+            started = time.monotonic()
+            with self.assertRaises(FeishuError):
+                store.save_user_id("ou_test")
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
 
 
 if __name__ == "__main__":

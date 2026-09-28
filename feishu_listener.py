@@ -56,12 +56,22 @@ TASK_ORCHESTRATOR: TaskOrchestrator | None = None
 # acquisition and delivery. No cadence changes.
 USAGE_COMMAND_TIMEOUT_SECONDS = 480
 
+# The listener reads its own credentials before it can serve anything. A wedged
+# `security` (an unanswered Keychain prompt, stuck IPC) must not hold daemon
+# start-up forever: the read is bounded like every other external process, and
+# a timeout is reported exactly like a failed read.
+KEYCHAIN_READ_TIMEOUT_SECONDS = 10
 
-def read_keychain(service: str) -> str:
+
+def read_keychain(
+    service: str,
+    security_bin: str = "/usr/bin/security",
+    timeout: float = KEYCHAIN_READ_TIMEOUT_SECONDS,
+) -> str:
     try:
         res = subprocess.run(
             [
-                "/usr/bin/security",
+                security_bin,
                 "find-generic-password",
                 "-a",
                 KEYCHAIN_ACCOUNT,
@@ -72,9 +82,12 @@ def read_keychain(service: str) -> str:
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
         return res.stdout.strip()
-    except subprocess.CalledProcessError as e:
+    except subprocess.SubprocessError as e:
+        # CalledProcessError (no item, denied) and TimeoutExpired (the bound
+        # above) are the same thing to every caller: an empty credential.
         logger.error(f"Failed to read keychain for {service}: {e}")
         return ""
 
