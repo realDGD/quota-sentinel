@@ -13,6 +13,7 @@ off a retired backend after a cutover.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import sqlite3
@@ -23,8 +24,21 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 
+# The outer `check` bound is DERIVED from these modules, never re-typed: the
+# numbers that decide how long a legal check may run live with the channels
+# that spend them and with the Application that drives them. All of these are
+# import-cheap and stdlib-only, which is what keeps this module inside the
+# launchd/system-interpreter graph (pinned by
+# tests/python-entrypoint-regression.py E11).
+# `quota_sentinel.runtime.factory` is deliberately NOT imported here: it is the
+# composition root, a module this one has no business depending on, and its own
+# graph already carries urllib and the probe plumbing.
+from quota_sentinel.app import AppConfig
+from quota_sentinel.runtime import agy_exec, codex_exec
+from quota_sentinel.runtime.direct import DIRECT_TIMEOUT_SECONDS
+from quota_sentinel.runtime.models import ModelRunnerConfig
 from quota_sentinel.state import AuthoritativeStateStore, StateStoreError
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
@@ -52,14 +66,211 @@ WATCHDOG_INTERVAL_SECONDS = 900
 DEADLINE_BACKOFF_SECONDS = 60
 EXTERNAL_STATE_RECHECK_SECONDS = 60
 LOOP_ERROR_BACKOFF_SECONDS = 60
-CHECK_COMMAND_TIMEOUT_SECONDS = float(
-    # One check may first repay a two-attempt pending debt and then run the
-    # remaining providers' three-attempt initial burst, with two
-    # quota-collection phases. Providers within a round run in parallel, so
-    # three providers still cost 2x310s + 3x310s + 2x207s ≈ 1964s: 2100s stays
-    # above that legal worst case while remaining finite.
-    os.environ.get("QUOTA_SENTINEL_CHECK_TIMEOUT", "2100")
-)
+
+# ---------------------------------------------------------------------------
+# The outer `check` bound.
+#
+# The orchestrator runs `check` as ONE child process and kills its whole process
+# tree when the bound expires, so the bound has to sit above the longest wall
+# clock a LEGAL check can spend. That number is not a matter of taste: it is the
+# sum of what the channels themselves allow, and it grew the day Codex and
+# Antigravity stopped being delivered by Pi alone. The retired literal (2100s)
+# was hand-computed for the Pi-only world as `2x310 + 3x310 + 2x207 ≈ 1964`s;
+# with the codex/agy channels in place a legal check can run far past it, and the
+# outer kill would cut down a run that was still inside its own rules.
+#
+# So the bound is DERIVED, in one place, from the modules that own the numbers —
+# never re-typed. Raising a channel's timeout or retry count, or the
+# Application's attempt limits, moves the bound in the same commit:
+#
+#   one agy attempt = (AGY_TRANSIENT_RETRIES + 1) turns x (AGY_EXEC_TIMEOUT_SECONDS
+#                     + agy kill grace)          = 4 x 130 = 520s
+#                   + the agent-listing guard, bounded by the same timeout
+#                                                = 130s
+#                   + one Pi fallback (ModelRunnerConfig.timeout + kill grace)
+#                                                = 310s
+#                   = 960s
+#   ...which is the most expensive of the four transports (Pi 310 + its Codex
+#   terminal 130; Codex 130 + Pi 310; direct DIRECT_TIMEOUT_SECONDS = 120 with
+#   no fallback at all). Providers inside one round run in PARALLEL
+#   (Application._burst), so a round costs that MAXIMUM, not a sum over the
+#   roster.
+#
+#   watchdog burst  = 2 x 960 + 1 x 30 (retry_interval between rounds) = 1950s
+#   initial burst   = 3 x 960 + 2 x 30                                 = 2940s
+#   quota probes    = 2 phases x 300                                   =  600s
+#   ------------------------------------------------------------------------
+#   legal worst case                                                   = 5490s
+#
+# and the DEFAULT applied below adds CHECK_TIMEOUT_SAFETY_FRACTION on top of
+# that, which is what keeps lock waits (`quota_wait`), Keychain reads, state I/O
+# and card delivery from eating into the margin. `QUOTA_SENTINEL_CHECK_TIMEOUT`
+# still overrides the whole computation; a value that is not a positive finite
+# number falls back to the derived default instead of failing the import.
+# ---------------------------------------------------------------------------
+
+# One quota-probe phase, bounded generously. The README measures the default
+# acquisition at ≈207s, but that measurement leaves out the CodexBar kill grace
+# (10s on up to four calls) and the two Keychain reads (5s each) that a phase can
+# also pay, so the BOUND is higher than the measurement: codex's app-server
+# handshake (two 5s deadlines) + both of codex's CodexBar sources + the
+# antigravity/opencode/clinepass native helpers with their 5s slack + each
+# CodexBar call with its kill grace + the Keychain reads ≈ 250s. It stays a
+# named constant here rather than an import because the per-tier timeouts live
+# in `runtime/factory.py`'s quota_probe_options — the one module this file must
+# not drag into the launchd import graph — and an operator's per-tier override
+# is not a bound this module can know. 300s is that sum with room to spare.
+QUOTA_PROBE_PHASE_ALLOWANCE_SECONDS = 300
+# `Application.check` runs the probe once before deciding what is due and once
+# after the initial burst, to calibrate the deadlines it just moved.
+QUOTA_PROBE_PHASES_PER_CHECK = 2
+# Applied where the default is formed, not inside the worst case: the callers
+# that assert the default covers the bound must be able to compare the two.
+CHECK_TIMEOUT_SAFETY_FRACTION = 0.10
+CHECK_TIMEOUT_ENV = "QUOTA_SENTINEL_CHECK_TIMEOUT"
+# The direct transport's timeout override, applied by the composition root when
+# it builds the direct runner (see `_positive_seconds`).
+DIRECT_TIMEOUT_ENV = "QUOTA_SENTINEL_DIRECT_TIMEOUT"
+
+
+def _positive_seconds(
+    environment: Mapping[str, str] | None, name: str, default: float,
+) -> float:
+    """`${VAR:-default}` with the composition root's exact tolerance.
+
+    The run path applies this one override itself (``factory._seconds_override``
+    when it builds the direct runner), so only its NAME is pinned here; every
+    other term is read through the owning channel's own ``from_env``, which
+    keeps its own names next to its own defaults. A value that is not a positive
+    finite number means the default, exactly as the run path decides it.
+    """
+    env = os.environ if environment is None else environment
+    raw = env.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def worst_case_attempt_seconds(
+    environment: Mapping[str, str] | None = None,
+) -> float:
+    """The longest ONE provider attempt may legally take, in seconds.
+
+    Every term is read from the module that owns it, so this cannot drift from
+    the channels it describes:
+
+    * Pi — one bounded turn (``ModelRunnerConfig.timeout``) plus its kill
+      grace. The shipped Pi runner hands a failed turn to the Codex terminal, so
+      that one hop is part of the Pi budget too.
+    * Codex — one bounded turn (``CODEX_EXEC_TIMEOUT_SECONDS``) plus its kill
+      grace, plus Pi as its one-hop fallback.
+    * agy — the agent-listing guard and every turn run under the same timeout,
+      so its budget is ``AGY_TRANSIENT_RETRIES + 1`` turns (plus the guard while
+      ``preflight`` is on), plus Pi as its one-hop fallback.
+    * direct — one bounded HTTP attempt (``DIRECT_TIMEOUT_SECONDS``, or the
+      operator's override of it) and no fallback at all.
+
+    The chain is always ONE hop deep (a runner that has just taken an attempt
+    can never hand it back), which is why the fallback is added, not chained.
+    """
+    pi = ModelRunnerConfig.from_env(environment)
+    codex = codex_exec.CodexExecConfig.from_env(
+        environment, state_dir=DEFAULT_STATE_DIR
+    )
+    agy = agy_exec.AgyExecConfig.from_env(environment, state_dir=DEFAULT_STATE_DIR)
+    direct = _positive_seconds(
+        environment, DIRECT_TIMEOUT_ENV, float(DIRECT_TIMEOUT_SECONDS)
+    )
+
+    pi_turn = pi.timeout + pi.kill_grace
+    codex_turn = codex.timeout + codex.kill_grace
+    agy_turn = agy.timeout + agy.kill_grace
+    # The free guard runs BEFORE the turn and is bounded by the same timeout; it
+    # is a real subprocess, so leaving it out would understate a legal agy
+    # attempt by a whole turn.
+    agy_guard = agy_turn if agy.preflight else 0.0
+
+    return max(
+        pi_turn + codex_turn,             # Pi primary, Codex as its one-hop fallback
+        codex_turn + pi_turn,             # Codex primary, Pi as its one-hop fallback
+        agy_guard + (agy.transient_retries + 1) * agy_turn + pi_turn,
+        direct,                           # direct: one attempt, no fallback
+    )
+
+
+def worst_case_burst_seconds(
+    rounds: int, per_attempt: float, retry_interval: float,
+) -> float:
+    """One burst: `rounds` parallel attempt rounds and the sleeps between them.
+
+    `Application._burst` sleeps `retry_interval` after every round except the
+    last, and only while providers remain — counting every gap is the bound.
+    """
+    return max(0, rounds) * per_attempt + max(0, rounds - 1) * retry_interval
+
+
+def worst_case_check_seconds(
+    environment: Mapping[str, str] | None = None,
+    config: AppConfig | None = None,
+) -> float:
+    """The legal worst case of ONE `check`, in seconds, without the margin.
+
+    A check that has debt to repay runs a watchdog retry burst first, then a
+    full initial burst for the providers that are due, with one quota-probe
+    phase before the decision and one after the initial burst. Both bursts are
+    bounded by the Application's own attempt limits, read from `AppConfig`
+    (the same object `create_application` builds) so an operator override moves
+    the bound too.
+    """
+    limits = config if config is not None else AppConfig.from_env(environment)
+    per_attempt = worst_case_attempt_seconds(environment)
+    model_phase = (
+        worst_case_burst_seconds(
+            limits.watchdog_attempts, per_attempt, limits.retry_interval
+        )
+        + worst_case_burst_seconds(
+            limits.initial_attempts, per_attempt, limits.retry_interval
+        )
+    )
+    return (
+        model_phase
+        + QUOTA_PROBE_PHASES_PER_CHECK * QUOTA_PROBE_PHASE_ALLOWANCE_SECONDS
+    )
+
+
+def check_command_timeout(
+    environment: Mapping[str, str] | None = None,
+    config: AppConfig | None = None,
+) -> float:
+    """`QUOTA_SENTINEL_CHECK_TIMEOUT`, or the derived bound plus its margin.
+
+    The override is an operator escape hatch and wins whenever it is a positive
+    finite number. Anything else — unset, empty, non-numeric, zero, negative —
+    falls through to the derived default rather than failing the import: this
+    module is loaded by launchd, so a typo in an environment variable must not
+    take the listener down.
+    """
+    derived = worst_case_check_seconds(environment, config) * (
+        1.0 + CHECK_TIMEOUT_SAFETY_FRACTION
+    )
+    env = os.environ if environment is None else environment
+    raw = env.get(CHECK_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return derived
+    try:
+        override = float(raw)
+    except ValueError:
+        return derived
+    if not math.isfinite(override) or override <= 0:
+        return derived
+    return override
+
+
+CHECK_COMMAND_TIMEOUT_SECONDS = check_command_timeout()
 
 T = TypeVar("T")
 

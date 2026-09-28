@@ -25,17 +25,25 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from quota_sentinel.app import AppConfig
 from quota_sentinel.quota.adapters import PROVIDERS
+from quota_sentinel.runtime import agy_exec, codex_exec
+from quota_sentinel.runtime.models import ModelRunnerConfig
 from quota_sentinel.state import bootstrap_legacy_authority
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
 from task_orchestrator import (
     CHECK_COMMAND_TIMEOUT_SECONDS,
+    CHECK_TIMEOUT_SAFETY_FRACTION,
     CommandResult,
     ScheduleState,
     SubprocessRunner,
     TaskOrchestrator,
     TaskStore,
+    check_command_timeout,
+    worst_case_attempt_seconds,
+    worst_case_burst_seconds,
+    worst_case_check_seconds,
 )
 
 
@@ -438,7 +446,16 @@ class LaunchAgentConfigTest(unittest.TestCase):
         self.assertEqual(job.get("Umask"), 0o077)
 
     def test_outer_check_timeout_covers_the_legal_retry_path(self) -> None:
-        self.assertGreaterEqual(CHECK_COMMAND_TIMEOUT_SECONDS, 2_000)
+        # The real invariant, not a magic floor: the shipped default has to sit
+        # above the worst case the channels themselves allow, and that worst case
+        # has to be above the literal this pin used to compare against — which is
+        # exactly what the codex/agy transports broke.
+        bound = worst_case_check_seconds()
+        self.assertGreater(CHECK_COMMAND_TIMEOUT_SECONDS, bound)
+        self.assertGreater(
+            bound, 2_100,
+            "the retired 2100s literal is no longer above a legal check",
+        )
 
     def test_legacy_watchdog_and_timer_are_disabled_rollback_artifacts(self) -> None:
         watchdog = self.load_plist("quota-sentinel.plist")
@@ -449,6 +466,108 @@ class LaunchAgentConfigTest(unittest.TestCase):
         self.assertTrue(timer.get("Disabled"))
         self.assertFalse(timer.get("RunAtLoad"))
         self.assertFalse(timer.get("KeepAlive"))
+
+
+class CheckTimeoutDerivationTest(unittest.TestCase):
+    """The outer `check` bound is DERIVED, not a literal that can go stale.
+
+    History matters here: 2100s was hand-computed for a Pi-only world as
+    `2x310 + 3x310 + 2x207 ≈ 1964s`. The codex and agy channels changed the
+    per-attempt budget — agy alone may run `AGY_TRANSIENT_RETRIES + 1` turns, a
+    guard with the same timeout, and then hand the attempt to Pi — so the old
+    literal stopped covering a legal check and would have killed it mid-run.
+    These tests pin the two halves of the fix: the bound follows the live
+    constants, and the default sits above the bound unless an operator overrides
+    it.
+    """
+
+    # A budget with no environment in it: `{}` means "defaults only", so a
+    # developer's exported QUOTA_SENTINEL_* cannot move these assertions.
+    ENV: dict[str, str] = {}
+
+    def test_default_exceeds_the_derived_worst_case(self) -> None:
+        bound = worst_case_check_seconds(self.ENV)
+        self.assertGreater(bound, 2_100, "the retired literal under-bounds a check")
+        # The margin is what makes the default strictly exceed the bound.
+        derived = bound * (1.0 + CHECK_TIMEOUT_SAFETY_FRACTION)
+        self.assertEqual(check_command_timeout(self.ENV), derived)
+        # The module constant is that default unless an operator overrode it in
+        # this process's environment; with no override the shipped value must
+        # clear the bound.
+        if "QUOTA_SENTINEL_CHECK_TIMEOUT" not in os.environ:
+            self.assertEqual(CHECK_COMMAND_TIMEOUT_SECONDS, derived)
+            self.assertGreater(CHECK_COMMAND_TIMEOUT_SECONDS, bound)
+
+    def test_attempt_bound_covers_the_agy_turns_and_the_pi_fallback(self) -> None:
+        """The agy channel is the worst single attempt, and it is read live."""
+        turns = agy_exec.AGY_TRANSIENT_RETRIES + 1
+        fallback = ModelRunnerConfig.from_env(self.ENV)
+        self.assertGreaterEqual(
+            worst_case_attempt_seconds(self.ENV),
+            turns * agy_exec.AGY_EXEC_TIMEOUT_SECONDS
+            + fallback.timeout + fallback.kill_grace,
+        )
+
+    def test_burst_bound_counts_the_sleeps_between_rounds(self) -> None:
+        self.assertEqual(worst_case_burst_seconds(3, 100.0, 30.0), 360.0)
+        self.assertEqual(worst_case_burst_seconds(1, 100.0, 30.0), 100.0)
+
+    def test_bound_follows_a_raised_channel_timeout(self) -> None:
+        """Raise the agy turn timeout: the bound moves by the turns it bounds.
+
+        The turn count is the initial turn, every transient retry, and the
+        agent-listing guard (which runs under the same timeout); the multiplier
+        is every attempt round a check can run (watchdog + initial).
+        """
+        limits = AppConfig()
+        rounds = limits.watchdog_attempts + limits.initial_attempts
+        turns = agy_exec.AGY_TRANSIENT_RETRIES + 2
+        baseline = worst_case_check_seconds(self.ENV)
+        raised_to = agy_exec.AGY_EXEC_TIMEOUT_SECONDS + 240
+        with patch.object(agy_exec, "AGY_EXEC_TIMEOUT_SECONDS", raised_to):
+            raised = worst_case_check_seconds(self.ENV)
+        self.assertAlmostEqual(raised - baseline, rounds * turns * 240.0)
+
+    def test_bound_follows_a_raised_retry_count(self) -> None:
+        limits = AppConfig()
+        rounds = limits.watchdog_attempts + limits.initial_attempts
+        turn = agy_exec.AGY_EXEC_TIMEOUT_SECONDS + 10  # timeout + kill grace
+        baseline = worst_case_check_seconds(self.ENV)
+        with patch.object(
+            agy_exec, "AGY_TRANSIENT_RETRIES", agy_exec.AGY_TRANSIENT_RETRIES + 2
+        ):
+            raised = worst_case_check_seconds(self.ENV)
+        self.assertAlmostEqual(raised - baseline, rounds * 2 * turn)
+
+    def test_bound_follows_the_other_channels_and_the_attempt_limits(self) -> None:
+        baseline = worst_case_check_seconds(self.ENV)
+        with patch.object(codex_exec, "CODEX_EXEC_TIMEOUT_SECONDS", 900):
+            codex_raised = worst_case_check_seconds(self.ENV)
+        self.assertGreater(codex_raised, baseline)
+        # AppConfig's limits are the Application's own, so an operator override
+        # of them has to move the bound as well.
+        more_rounds = dict(self.ENV, QUOTA_SENTINEL_INITIAL_ATTEMPTS="9")
+        self.assertGreater(worst_case_check_seconds(more_rounds), baseline)
+        longer_gap = dict(self.ENV, QUOTA_SENTINEL_RETRY_INTERVAL="300")
+        self.assertGreater(worst_case_check_seconds(longer_gap), baseline)
+
+    def test_env_override_still_wins(self) -> None:
+        self.assertEqual(
+            check_command_timeout({"QUOTA_SENTINEL_CHECK_TIMEOUT": "1234"}), 1234.0
+        )
+        with patch.dict(os.environ, {"QUOTA_SENTINEL_CHECK_TIMEOUT": "1500.5"}):
+            self.assertEqual(check_command_timeout(), 1500.5)
+
+    def test_unusable_override_falls_back_to_the_derived_default(self) -> None:
+        derived = worst_case_check_seconds(self.ENV) * (
+            1.0 + CHECK_TIMEOUT_SAFETY_FRACTION
+        )
+        for raw in ("", "  ", "abc", "0", "-5", "inf", "nan"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    check_command_timeout({"QUOTA_SENTINEL_CHECK_TIMEOUT": raw}),
+                    derived,
+                )
 
 
 if __name__ == "__main__":
