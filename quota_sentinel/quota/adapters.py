@@ -61,7 +61,10 @@ class QuotaAdapter:
     title: str
     monthly_display_only: bool
     tiers: Tuple[Tier, ...]
-    # "pi" starts the Pi agent; "direct" calls the vendor's own API.
+    # "pi" starts the Pi agent; "direct" calls the vendor's own API; "codex"
+    # starts OpenAI's own CLI (the sanctioned client) against the Codex
+    # subscription; "agy" starts Google's own Antigravity CLI against the
+    # Antigravity subscription.
     transport: str = "pi"
 
     def tier_is_fresh(self, tier: Tier) -> bool:
@@ -71,15 +74,26 @@ class QuotaAdapter:
 ADAPTERS: Dict[str, QuotaAdapter] = {
     "codex": QuotaAdapter(
         provider="codex",
-        title="GPT-5.6 Luna",
+        title="GPT-6 Luna",
         monthly_display_only=False,
         tiers=TIER_LADDER,
+        # Pi stays the primary path: it costs ~54 tokens per ignition against
+        # the official CLI's ~1,687, and the official client is kept as the
+        # fallback that takes over when Pi cannot deliver. Selection is one
+        # variable away in both directions (QUOTA_SENTINEL_TRANSPORT).
     ),
     "antigravity": QuotaAdapter(
         provider="antigravity",
         title="Gemini 3.7 Flash · Low",
         monthly_display_only=False,
         tiers=TIER_LADDER,
+        # agy is the primary path here, the mirror image of codex's priority:
+        # the official CLI with a purpose-built minimal agent costs ~564 input
+        # tokens per ignition (measured, agy 1.2.12), against the stock agent's
+        # ~22,311 and Pi's own scaffolding. Pi stays the one-hop fallback for
+        # when that profile stops applying. Selection is one variable away in
+        # both directions (QUOTA_SENTINEL_TRANSPORT="antigravity=pi").
+        transport="agy",
     ),
     "opencode": QuotaAdapter(
         provider="opencode",

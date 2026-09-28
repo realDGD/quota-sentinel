@@ -542,24 +542,80 @@ in a dozen `case "$provider"` statements.
 
 ## Delivery transports
 
-A task reaches a provider by exactly one of two transports, and the choice is a
+A task reaches a provider by exactly one of four transports, and the choice is a
 capability on the adapter (`QuotaAdapter.transport`), not a branch:
 
 ```text
-pi      ──▶ runtime.models.ModelRunner     codex, antigravity
-direct  ──▶ runtime.direct.DirectRunner    opencode, clinepass
+codex   ──▶ runtime.codex_exec.CodexExecRunner  (fallback for codex)
+agy     ──▶ runtime.agy_exec.AgyExecRunner      antigravity (fallback for it: pi)
+pi      ──▶ runtime.models.ModelRunner          codex, antigravity fallback
+direct  ──▶ runtime.direct.DirectRunner         opencode, clinepass
 ```
 
-`runtime.dispatch.TransportRouter` presents both as the single
+`runtime.dispatch.TransportRouter` presents all four as the single
 `prepare`/`run -> AttemptResult` surface `Application` already used, so the
 coordinator, the retry debt, the locks, the cards and the run log never learn
-which one answered. The direct runner keeps the same credential discipline as
+which one answered.
+
+**Pi is the shipped path for codex; the official CLI is its fallback.** Pi costs
+~54 tokens per ignition against the official CLI's ~1,687 (measured below), so
+the cheap path runs first and the official client takes the attempt only when
+Pi cannot deliver it. `QUOTA_SENTINEL_TRANSPORT=codex=codex` inverts the
+priority for an A/B run without editing code. The chain is deliberately one hop
+deep in both directions: the composition root builds each runner's counterpart
+as a *terminal* instance (no fallback of its own), so an attempt can be handed
+over exactly once and can never bounce back.
+
+The codex transport exists because a transport also decides *who the client
+is*, not only what a turn costs. A default `codex exec` carries the whole Codex
+agent (skills, multi-agent roles, permissions, environment context, tools) and
+measured 9,658 tokens per attempt on 2026-09-27; the profile in
+`runtime/codex_exec.py` is the same official CLI with those layers switched off
+by official configuration keys and measured **1,682 input / 5 output tokens for
+the same `1` reply**. It parses the `--json` event stream (final assistant text
+plus `turn.completed` usage) instead of reading a log format, so every attempt
+writes its own cost into the run log.
+
+Two failure classes are separated on purpose. A **functional** failure (non-zero
+exit, no completion event, a reply that is not `1`, reasoning tokens above zero)
+and a **cost regression** (the run succeeded but the profile no longer applies —
+a renamed feature flag, or a server-side metadata change) both fall back to Pi,
+and the second one is announced with its measured numbers. A regression is never
+recorded as a verified profile, so the next attempt tests again. The
+`CODEX_EXEC_PROFILE` fingerprint covers the local half of "did the profile
+change"; the per-attempt token ceilings cover the half nobody can see.
+
+**Antigravity ships the opposite priority: the official CLI first, Pi as its
+fallback.** `agy` is an agent too, and a stock turn carries its scaffolding:
+measured on 2026-09-27 against agy 1.2.12 with `gemini-3.8-flash-low`, a plain
+`agy -p "1"` costs 22,311 input / 28 output tokens, of which ~20.3k is the
+schema of the 57 built-in tools alone. `runtime/agy_exec.py` writes one markdown
+agent into an empty cwd per attempt — `excludeDefaultComponents: true` (no
+default prompt sections, no built-in tools), `inheritCustomizations: false` (no
+rules, skills, plugins, subagents, MCP servers) and a one-line body — and the
+same turn measures **564 input / 1 output / 0 thinking**. Measured without
+`excludeDefaultComponents` it is 1,997; `tools: []` changes nothing once that key
+is set.
+
+Two guards there cost zero tokens, because read-only slash commands are answered
+by the CLI itself (`input_tokens` 0, `num_turns` 0): `agy -p /agents` confirms
+the agent resolves *before* the turn (an unresolvable `--agent` silently falls
+back to the default agent at ~40x, which the input ceiling would catch only after
+paying for it), and the pre-turn `Eligibility check failed` handshake is retried
+rather than reported as a delivery failure. Thinking tokens are reported and not
+policed — at `--effort low` the model decides (0 and 34 were both measured on
+identical input), so the integrity signal is the structural input side. This
+transport writes no quota snapshot: the Pi capture file is normalized as a *Pi*
+document, and tier-① already reads the same `/usage` payload for free.
+
+The direct runner keeps the same credential discipline as
 `opencode_usage.py` (the key reaches curl through its stdin config, never argv
 or the environment), writes the same quota snapshot the retired capture
 extension wrote, and emits the same per-attempt log lines. It disables
 reasoning with `reasoning_effort: "none"`, which is measured, not cosmetic:
 the same prompt costs 16 tokens with it and 86 without. `QUOTA_SENTINEL_TRANSPORT`
-moves one provider back onto Pi for an A/B run without editing code.
+(`codex=pi`, `agy=pi`, `opencode=pi`, …) moves one provider onto another
+transport for an A/B run without editing code.
 
 ## Notification boundary
 

@@ -225,8 +225,16 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(adapter_for(provider).tiers, TIER_LADDER)
 
     def test_transport_names_who_delivers_the_task(self):
+        # Pi is the shipped path for codex because it costs ~54 tokens per
+        # ignition against the official CLI's ~1,687; the official client is
+        # wired as its fallback (and as an opt-in primary via
+        # QUOTA_SENTINEL_TRANSPORT=codex=codex).
         self.assertEqual(adapter_for("codex").transport, "pi")
-        self.assertEqual(adapter_for("antigravity").transport, "pi")
+        # Antigravity's priority runs the other way: the official CLI with its
+        # minimal agent costs ~564 input tokens per ignition against the stock
+        # agent's ~22,311, so agy is primary and Pi is its fallback (revert with
+        # QUOTA_SENTINEL_TRANSPORT=antigravity=pi).
+        self.assertEqual(adapter_for("antigravity").transport, "agy")
         self.assertEqual(adapter_for("opencode").transport, "direct")
         self.assertEqual(adapter_for("clinepass").transport, "direct")
 
@@ -247,7 +255,7 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(ADAPTERS["antigravity"].monthly_display_only)
 
     def test_card_titles_name_the_plan_and_model(self):
-        self.assertEqual(ADAPTERS["codex"].title, "GPT-5.6 Luna")
+        self.assertEqual(ADAPTERS["codex"].title, "GPT-6 Luna")
         self.assertEqual(ADAPTERS["antigravity"].title, "Gemini 3.7 Flash · Low")
         self.assertEqual(ADAPTERS["opencode"].title, "DeepSeek V4.1 Flash · OpenCode Go")
         self.assertEqual(ADAPTERS["clinepass"].title, "DeepSeek V4.1 Flash · ClinePass")

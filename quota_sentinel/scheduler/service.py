@@ -102,6 +102,28 @@ def decide_due(
     )
 
 
+def reanchor_probe_only(
+    state_dir: Path,
+    provider: str,
+    now: int,
+    observation: QuotaObservation,
+) -> DecisionResult:
+    """Apply the probe-only transition for one provider, and never run it."""
+    store = router(state_dir)
+    state = store.load(provider)
+    transition = policy.reanchor_probe_only(state, observation, now)
+    backend = apply_transition(state_dir, provider, transition)
+    return DecisionResult(
+        provider=provider,
+        decision=Decision.WAIT,
+        reason=transition.reason,
+        changed=transition.changed,
+        before_state=transition.before,
+        state=transition.after,
+        backend=backend,
+    )
+
+
 def begin_attempt(state_dir: Path, provider: str, now: int) -> DecisionResult:
     store = router(state_dir)
     state = store.load(provider)
@@ -184,6 +206,7 @@ __all__ = [
     "load_roster",
     "apply_transition",
     "decide_due",
+    "reanchor_probe_only",
     "begin_attempt",
     "record_attempt",
     "commit_success",

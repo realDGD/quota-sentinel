@@ -27,6 +27,8 @@ from quota_sentinel.runtime.cards import (
     format_reset_time, render_progress_test_card, render_task_card,
     render_usage_card,
 )
+from quota_sentinel.runtime.agy_exec import AgyExecConfig, AgyExecRunner
+from quota_sentinel.runtime.codex_exec import CodexExecConfig, CodexExecRunner
 from quota_sentinel.runtime.direct import (
     DIRECT_PROVIDERS, DIRECT_TIMEOUT_SECONDS, DirectRunner,
 )
@@ -45,7 +47,7 @@ CLINEPASS_API_KEY_SERVICE = "quota-sentinel.clinepass-api-key"
 DRY_RUN_ENV = "FEISHU_DRY_RUN"
 TRANSPORT_ENV = "QUOTA_SENTINEL_TRANSPORT"
 DEFAULT_CURL_BIN = Path("/usr/bin/curl")
-TRANSPORTS = ("pi", "direct")
+TRANSPORTS = ("pi", "direct", "codex", "agy")
 
 
 class NotReadyError(RuntimeError):
@@ -158,7 +160,7 @@ def require_ready(
 
 
 def transport_for(provider: str) -> str:
-    """How one provider's task is delivered: "pi" or "direct" (the default)."""
+    """How one provider's task is delivered: "pi", "direct", "codex" or "agy"."""
     return adapter_for(provider).transport
 
 
@@ -196,7 +198,26 @@ def create_application(
     # phase/attempt/result/elapsed and a REDACTED stderr summary; without this
     # seam a failed attempt would leave no trace at all in the operator's run
     # log. The direct runner speaks the same lines, so one log covers both.
-    pi_runner = ModelRunner(ModelRunnerConfig.from_env(env), logger=logger)
+    #
+    # Pi and Codex are each other's fallback, but the chain is always ONE hop
+    # deep. Two terminal instances exist for exactly that reason: a runner can
+    # hand an attempt to its counterpart, and a counterpart that has just taken
+    # an attempt can never hand it back.
+    codex_config = CodexExecConfig.from_env(env, state_dir=state_dir)
+    agy_config = AgyExecConfig.from_env(env, state_dir=state_dir)
+    pi_terminal = ModelRunner(ModelRunnerConfig.from_env(env), logger=logger)
+    codex_terminal = CodexExecRunner(
+        codex_config, logger=logging.getLogger("quota_sentinel.codex").info
+    )
+    agy_terminal = AgyExecRunner(
+        agy_config, logger=logging.getLogger("quota_sentinel.agy").info
+    )
+    # The shipped priority: Pi first (54 tokens per ignition), the official CLI
+    # as the transport that takes over when Pi cannot deliver (~1.7k).
+    pi_runner = ModelRunner(
+        ModelRunnerConfig.from_env(env), logger=logger,
+        fallback_for={"codex": codex_terminal},
+    )
     direct_runner = DirectRunner(
         curl_bin=options["curl_bin"],
         timeout=_seconds_override(
@@ -205,8 +226,26 @@ def create_application(
         logger=logging.getLogger("quota_sentinel.direct").info,
         environment=env,
     )
+    # Selecting the codex transport inverts the priority for A/B runs, and
+    # keeps its own fallback: when the minimal profile stops applying (a
+    # renamed feature flag, a server-side model change) the attempt is
+    # delivered by Pi instead of quietly costing five times as much.
+    codex_runner = CodexExecRunner(
+        codex_config, logger=logging.getLogger("quota_sentinel.codex").info,
+        fallback=pi_terminal,
+    )
+    # Antigravity's shipped priority runs the other way: the official CLI with
+    # its minimal agent is the primary path (~564 input tokens per ignition
+    # against the stock agent's ~22,311), and Pi takes the attempt over when
+    # that profile stops applying — a renamed frontmatter key or a dropped
+    # --agent would otherwise cost 40x without failing.
+    agy_runner = AgyExecRunner(
+        agy_config, logger=logging.getLogger("quota_sentinel.agy").info,
+        fallback=pi_terminal,
+    )
     runner = TransportRouter(
-        {"pi": pi_runner, "direct": direct_runner},
+        {"pi": pi_runner, "direct": direct_runner, "codex": codex_runner,
+         "agy": agy_runner},
         provider_transports(env),
     )
     notifier = create_notifier(environment=env, dry_run_flag=dry_run_flag)
@@ -299,23 +338,54 @@ def readiness_problems(
     config = ModelRunnerConfig.from_env(env)
     transports = provider_transports(env)
 
-    # Only a provider that actually runs through Pi may demand the Pi binary,
-    # Pi's credential store or a capture extension. A direct provider whose key
-    # is missing fails in milliseconds inside its own attempt instead, without
-    # spending a single token, so it is reported by `status` rather than
-    # refusing the whole roster.
+    # Only a transport that is actually reachable may demand its binaries and
+    # credentials; a direct provider whose key is missing fails in
+    # milliseconds inside its own attempt instead, without spending a single
+    # token, so it is reported by `status` rather than refusing the whole
+    # roster. The codex transport is the exception that proves the rule: it
+    # falls back to Pi, so Pi's prerequisites are checked for it too — a
+    # fallback that cannot run is not a fallback, it is a second failure
+    # discovered late.
     pi_providers = [
         provider for provider in providers
         if provider in PROVIDERS and transports.get(provider) == "pi"
     ]
+    # The codex transport runs OpenAI's own CLI, so it needs that binary and
+    # the CLI's own credential — not Pi's. Checking here is what keeps a
+    # missing credential a startup problem instead of a failed attempt that
+    # already cost the fallback transport a model turn.
+    codex_providers = [
+        provider for provider in providers
+        if provider in PROVIDERS and transports.get(provider) == "codex"
+    ]
+    # The agy transport runs Google's own CLI and resolves its own sign-in from
+    # the machine's keyring, so it demands no credential path of ours — only
+    # the binary, checked below.
+    agy_providers = [
+        provider for provider in providers
+        if provider in PROVIDERS and transports.get(provider) == "agy"
+    ]
+    codex_config = CodexExecConfig.from_env(env, state_dir=state_dir)
+    agy_config = AgyExecConfig.from_env(env, state_dir=state_dir)
+    # Either direction of the priority chain needs BOTH clients: Pi and the
+    # official CLI are each other's fallback for the codex provider, and agy's
+    # fallback is Pi for the antigravity one — a fallback that cannot run is not
+    # a fallback, it is a second failure discovered late.
+    pi_needed = sorted(set(pi_providers) | set(codex_providers) | set(agy_providers))
+    codex_needed = sorted(set(codex_providers) | {p for p in pi_providers if p == "codex"})
+    pi_providers = pi_needed
 
     executables = {
         "curl": quota_probe_options(env)["curl_bin"],
         "security": Path(keychain.SECURITY_BIN),
         "shlock": Path(SHLOCK_BIN),
     }
-    if pi_providers:
+    if pi_needed:
         executables["pi"] = config.pi_bin
+    if codex_needed:
+        executables["codex"] = codex_config.codex_bin
+    if agy_providers:
+        executables["agy"] = agy_config.agy_bin
     for name, path in executables.items():
         if not os.access(path, os.X_OK):
             problems.append("%s is not executable: %s" % (name, path))
@@ -331,6 +401,11 @@ def readiness_problems(
             for provider in pi_providers:
                 if not _auth_has_provider(config.auth_file, provider):
                     problems.append("Pi credential for %s is missing" % provider)
+
+    if codex_needed:
+        codex_auth = Path(codex_config.codex_home) / "auth.json"
+        if not os.access(codex_auth, os.R_OK):
+            problems.append("Codex CLI credential is not readable: %s" % codex_auth)
 
     for provider in providers:
         if provider not in PROVIDERS:

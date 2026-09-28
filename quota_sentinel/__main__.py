@@ -350,6 +350,11 @@ def run_wait(state_dir: Path, args: argparse.Namespace) -> int:
 
 
 def run_run(state_dir: Path, args: argparse.Namespace) -> int:
+    # Imported here, like the other Feishu edges in this module: the handler
+    # below must be able to REPORT a delivery failure, and a missing import
+    # turns exactly that path into a NameError that hides the real error.
+    from quota_sentinel.runtime.feishu import FeishuError
+
     providers = () if args.target in ("all", "both") else (args.target,)
     results: dict = {}
 

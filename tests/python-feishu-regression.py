@@ -68,7 +68,7 @@ class CardTests(unittest.TestCase):
         self.assertEqual(body["header"]["template"], "green")
         elements = body["body"]["elements"]
         self.assertEqual(len(elements), 4)
-        self.assertIn("GPT-5.6 Luna", elements[0]["columns"][0]["elements"][0]["content"])
+        self.assertIn("GPT-6 Luna", elements[0]["columns"][0]["elements"][0]["content"])
         self.assertEqual(elements[1]["content"], "Native · codex app-server")
         windows = elements[2]
         self.assertEqual(len(windows["columns"]), 2)
@@ -299,7 +299,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(client.sent[0]["receive_id"], "u")
         self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", client.sent[0]["content"])
         usage_text = json.dumps(card(client.sent[1]), ensure_ascii=False)
-        self.assertIn("GPT-5.6 Luna", usage_text)
+        self.assertIn("GPT-6 Luna", usage_text)
         self.assertIn("Gemini 3.7 Flash · Low", usage_text)
         self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", usage_text)
         self.assertIn("配额正在刷新", client.sent[2]["content"])

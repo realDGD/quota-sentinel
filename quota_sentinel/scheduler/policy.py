@@ -425,6 +425,58 @@ def retry_blocked(state: ProviderState, now: int) -> Transition:
     )
 
 
+def reanchor_probe_only(
+    state: ProviderState, observation: QuotaObservation, now: int
+) -> Transition:
+    """A probe-only provider is never executed: keep its deadline ahead of now.
+
+    Switching a provider's model trigger off must not switch its quota probe
+    off: the reading is free, the card still shows it, and the deadline still
+    has to be calibrated. Refusing only the run is not enough, though. A
+    deadline left in the past makes the precision timer fire immediately on
+    every wake-up and raises retry debt on the next tick — a provider that can
+    never run could never repay it.
+
+    This transition therefore deliberately breaks the "matured debt cannot
+    move later" rule of ``evaluate_due``, and only for a disabled provider:
+    the deadline follows the freshly observed reset with the same
+    ``reset + RESET_BUFFER_SECONDS`` arithmetic a run would have produced, or
+    advances one run interval when no fresh reset is available. Debt and
+    candidate state are cleared because they can never be acted on.
+
+    The verdict is ``WAIT``, never ``RUN_NOW``: this function is the reason a
+    disabled provider cannot enter a run roster.
+    """
+    reset_at = valid_reset_at(observation, now)
+    if reset_at is not None:
+        due = reset_at + RESET_BUFFER_SECONDS
+        after = replace(
+            state,
+            retry_pending=False,
+            reset_candidate=None,
+            reset_anchor=reset_at,
+            last_known_reset=reset_at,
+            next_due_at=due,
+        )
+        reason = (
+            f"trigger disabled (probe-only): not executed; deadline follows "
+            f"observed reset={reset_at} due={due}"
+        )
+    else:
+        due = max(state.next_due_at or 0, now + RUN_INTERVAL_SECONDS)
+        after = replace(
+            state,
+            retry_pending=False,
+            reset_candidate=None,
+            next_due_at=due,
+        )
+        reason = (
+            f"trigger disabled (probe-only): not executed; no fresh reset, "
+            f"deadline advanced due={due}"
+        )
+    return Transition(state, after, Decision.WAIT, reason, after != state)
+
+
 def _keep(state: ProviderState, action: SyncAction, reason: str) -> Transition:
     return Transition(state, state, Decision.NO_CHANGE, reason, False)
 
@@ -453,5 +505,6 @@ __all__ = [
     "sync_deadline",
     "evaluate_due",
     "retry_blocked",
+    "reanchor_probe_only",
     "NO_OBSERVATION",
 ]

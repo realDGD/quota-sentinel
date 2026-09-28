@@ -1,6 +1,6 @@
 # Quota Sentinel + Gemini + DeepSeek (Feishu enterprise app)
 
-Runs GPT-5.6 Luna, Gemini 3.7 Flash (Low) and DeepSeek V4 Flash (OpenCode Go)
+Runs GPT-6 Luna, Gemini 3.7 Flash (Low) and DeepSeek V4 Flash (OpenCode Go)
 in parallel, sends one combined status message through a Feishu enterprise
 self-built app, and saves no Pi sessions.
 
@@ -8,7 +8,7 @@ Feishu receives an interactive card with a green header when both model calls
 succeed and a red header when either one fails. Its body is equivalent to:
 
 ```text
-GPT-5.6 Luna
+GPT-6 Luna
 🟢 发送成功
 5 小时：■■■■■□□□□□ 剩余 48%
 ↳ 重置　2026-08-29 22:04:34 CST（剩余 1小时 14分）
@@ -429,7 +429,9 @@ Every external process is bounded so a hang can never hold the scheduler:
 
 | Operation | Bound | After the bound |
 | --- | --- | --- |
-| Model task, Pi transport (codex / antigravity) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
+| Model task, codex transport (Codex) | `QUOTA_SENTINEL_CODEX_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_CODEX_KILL_GRACE` (10s) | The attempt falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_CODEX_INPUT_CEILING`, default 2500, or output ≥ 50) does the same and is logged as `cost-regression` |
+| Model task, agy transport (antigravity) | `QUOTA_SENTINEL_AGY_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_AGY_KILL_GRACE` (10s) | The attempt falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_AGY_INPUT_CEILING`, default 1500, or a runaway reply) does the same, and a missing agent is refused **before** any token is spent |
+| Model task, Pi transport (codex; antigravity fallback) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
 | Model task, direct transport (opencode / clinepass) | `QUOTA_SENTINEL_DIRECT_TIMEOUT` (default 120s) | Same; a missing Keychain key fails in milliseconds with `credential missing` before any token is spent |
 | Transport A/B override | `QUOTA_SENTINEL_TRANSPORT="opencode=pi"` | Moves one provider back onto the Pi agent for comparison |
 | Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
@@ -443,6 +445,149 @@ Model and CodexBar timeouts run through `run_with_timeout.py`: the child gets it
 SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
 period, and reaps the group so no orphans remain. Exit code 124 marks a
 timeout; the child's own exit code is otherwise propagated unchanged.
+
+## The codex transport (official client)
+
+Codex's five-hour window can only be started by a real request, so the provider
+needs one model turn every cycle. **Pi remains the shipped path** because it is
+far cheaper; OpenAI's own CLI is implemented as the transport that takes over
+when Pi cannot deliver, and as an opt-in primary for A/B runs. The transport
+decides not only what a turn costs but also *who the client appears to be* —
+which is exactly why the official client is kept available.
+
+Measured on 2026-09-27 against codex-cli 0.157.1, `gpt-6-luna`,
+`model_reasoning_effort="none"`:
+
+| Attempt | tokens |
+| --- | ---: |
+| Pi agent (shipped path) | **49 input / 5 output** |
+| `codex exec` with default configuration | ~9,658 |
+| the profile in `runtime/codex_exec.py` | **1,682 input / 5 output** |
+
+Both paths reply exactly `1`, so the success criterion did not change. The
+codex saving is structural: every layer of Codex's agent scaffolding (skills,
+multi-agent roles, permission and environment context, and the tool set) is
+switched off with official configuration keys, and every attempt reports its
+own `input/cached/output/reasoning` numbers into the run log.
+
+The priority chain is one hop deep in both directions:
+
+```text
+shipped   Pi ──fails──▶ Codex (terminal)
+opt-in    Codex ──fails or regresses──▶ Pi (terminal)
+```
+
+The composition root builds each counterpart as a terminal instance, so an
+attempt can be handed over exactly once and can never bounce back.
+
+Two failure classes are handled differently, because they mean different
+things:
+
+* **functional** — non-zero exit, no `turn.completed`, a reply other than `1`,
+  or reasoning tokens above zero: the attempt is handed to the counterpart
+  transport;
+* **cost regression** — the run succeeded but reports more than the measured
+  profile (`QUOTA_SENTINEL_CODEX_INPUT_CEILING`, default 2500 input, or 50
+  output): the attempt is still delivered (by Pi), logged as
+  `result=cost-regression`, and **not** recorded as a verified profile, so the
+  next cycle tests again instead of trusting a regression.
+
+The profile is one canonical list (`PROFILE_OVERRIDES`, `PROFILE_DISABLED_FEATURES`)
+whose hash is stored next to the state; a CLI version change *or* a profile edit
+re-runs the smoke test and says so in the log. The token ceilings cover the
+change nobody can see: a server-side model-metadata change shows up as a number
+over the ceiling, not as a silent 5x bill.
+
+Select either path with one variable, no code edit:
+
+```bash
+QUOTA_SENTINEL_TRANSPORT="codex=pi"    quota-sentinel run codex   # Pi primary (shipped)
+QUOTA_SENTINEL_TRANSPORT="codex=codex" quota-sentinel run codex   # official CLI primary
+```
+
+## The agy transport (official Antigravity CLI)
+
+Antigravity's five-hour window is anchored by the first real request in it — a
+read-only `/usage` probe costs 0 tokens and does **not** anchor anything — so the
+provider needs one model turn per window cycle. Antigravity therefore ships the
+opposite priority to codex: **`agy` first, Pi as its one-hop fallback.**
+
+`agy` is an agent, and a stock turn carries its scaffolding. Measured on
+2026-09-27 against agy 1.2.12, model `gemini-3.8-flash-low`, `--effort low`:
+
+| Attempt | tokens |
+| --- | ---: |
+| the profile in `runtime/agy_exec.py` | **564 input / 1 output / 0 thinking** |
+| the same profile with `--mode plan` | 1,354 input |
+| stock `agy -p "1"` (default agent, 57 tools) | 22,311 input / 28 output |
+
+Of the stock 22,311, ~20.3k is the schema of the 57 built-in tools alone. The
+profile is one markdown agent written per attempt into an empty cwd:
+`excludeDefaultComponents: true` drops the default prompt sections *and* the
+built-in tools, `inheritCustomizations: false` keeps this machine's rules,
+skills, plugins, subagents and MCP servers out, and the body is one line asking
+for exactly `1`. Two of those keys are load-bearing and one is not: measured
+without `excludeDefaultComponents` the same turn costs 1,997 input tokens, while
+`tools: []` changes nothing once the former is set — it is kept as an explicit
+statement of intent, not as a saving.
+
+Two guards run at **zero token cost**, because read-only slash commands are
+answered by the CLI itself (measured `input_tokens` 0, `num_turns` 0):
+
+* **agent presence** — `agy -p /agents` is checked before the turn. An
+  unresolvable `--agent` is not an error at all: the *default* agent answers, at
+  ~40x the cost, and the input ceiling would catch that only after paying for it;
+* **transient handshake** — `Eligibility check failed` happens before a turn
+  starts and costs nothing (six in a row were observed during one burst), so it
+  is retried instead of being reported as a delivery failure.
+
+Failure classes are the codex transport's, with one measured deviation:
+`--effort low` leaves thinking to the model's discretion (identical invocations
+measured 0 and 34 thinking tokens), so thinking is *reported* and not *policed*.
+What proves the profile is intact is the **input** side, which is structural. A
+functional failure (non-zero exit, a non-`SUCCESS` status, a reply that is not
+`1`, a missing agent) or a cost regression (input ≥
+`QUOTA_SENTINEL_AGY_INPUT_CEILING`, default 1500, or a runaway reply ≥
+`QUOTA_SENTINEL_AGY_OUTPUT_CEILING`, default 200) hands the attempt to Pi.
+
+```bash
+QUOTA_SENTINEL_TRANSPORT="antigravity=agy" quota-sentinel run antigravity  # agy primary (shipped)
+QUOTA_SENTINEL_TRANSPORT="antigravity=pi"  quota-sentinel run antigravity  # Pi primary
+```
+
+This transport writes no quota snapshot: the Pi capture file is normalized as a
+*Pi* document, and rebuilding that shape out of the CLI's own output would be a
+different client's claim in Pi's clothing. Antigravity's tier-① native probe
+reads the same `/usage` payload for free in the same tick, so the reading is not
+lost — only the redundant copy is.
+
+## Probe-only providers
+
+`QUOTA_SENTINEL_PROBE_ONLY=antigravity` (comma/space separated) switches one or
+more providers' **model trigger** off without touching anything else. A
+probe-only provider:
+
+- still has its quota probed on every check, so the `/usage` card, the tier
+  ladder and freshness reporting are unchanged;
+- still has its deadline calibrated — `reanchor_probe_only` follows the freshly
+  observed reset with the same `reset + 4m` arithmetic a run would have
+  produced, so removing the switch lands on exactly the deadline the provider
+  would have had;
+- is never executed: it cannot enter a run roster and its retry debt is cleared
+  rather than repaid, because a provider that cannot run can never repay it;
+- never enters a task card, because there was no delivery to report.
+
+Nothing is deleted to make this work: the transport, its roster entry and its
+tests stay in place, and the deadline is kept strictly in the future so neither
+the precision timer nor the watchdog grid can spin on a matured deadline.
+
+Why Antigravity is the first candidate: every Antigravity reset-anchor
+transition in the run logs is exactly `+5h00m00s` — 12 of 12 over two days —
+and independent of when the trigger actually ran (the 2026-09-27 14:08:24 ping
+produced `18:45:18`, not `19:08:24`), while Codex is usage-anchored (the
+14:08:17 ping produced exactly `19:08:17`). The Antigravity 5-hour window is
+therefore a fixed grid that no message can start, and the native
+`agy -p /usage` tier already supplies its numbers for free.
 
 ## Run Log (`logs/`)
 

@@ -29,7 +29,12 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from quota_sentinel.scheduler import policy, service
-from quota_sentinel.scheduler.models import Decision, QuotaObservation, SyncAction
+from quota_sentinel.scheduler.models import (
+    NO_OBSERVATION,
+    Decision,
+    QuotaObservation,
+    SyncAction,
+)
 from quota_sentinel.scheduler.observation import (
     observation_for,
     read_normalized_quota,
@@ -510,6 +515,50 @@ class PurePolicyTests(unittest.TestCase):
         self.assertIsNone(policy.min_next_due({}))
         self.assertIsNone(
             policy.min_next_due({"codex": state(next_due_at=5, retry_pending=True)})
+        )
+
+    # ---- probe-only: the trigger is off, the deadline still lives ---------
+    def test_probe_only_never_runs_even_with_a_matured_deadline(self):
+        """The whole point of the switch: a matured deadline stays a WAIT."""
+        before = state(next_due_at=1, last_known_reset=self.NOW + 600)
+        transition = policy.reanchor_probe_only(before, fresh(self.NOW + 600), self.NOW)
+        self.assertEqual(transition.decision, Decision.WAIT)
+        # Same arithmetic a run would have produced, so removing the switch
+        # lands on exactly the deadline the provider would have had.
+        self.assertEqual(
+            transition.after.next_due_at,
+            self.NOW + 600 + policy.RESET_BUFFER_SECONDS,
+        )
+        self.assertIn("trigger disabled (probe-only)", transition.reason)
+
+    def test_probe_only_deadline_is_always_ahead_of_now(self):
+        """No spin: the timer grid must never see a permanently past deadline."""
+        for obs in (fresh(self.NOW + 1), STALE, NO_OBSERVATION):
+            with self.subTest(observation=obs.source):
+                transition = policy.reanchor_probe_only(
+                    state(next_due_at=self.NOW - 10_000), obs, self.NOW
+                )
+                self.assertGreater(transition.after.next_due_at, self.NOW)
+
+    def test_probe_only_clears_debt_it_could_never_repay(self):
+        """A provider that cannot run can never repay debt, so it holds none."""
+        before = state(retry_pending=True, next_due_at=1, reset_candidate=None)
+        transition = policy.reanchor_probe_only(before, STALE, self.NOW)
+        self.assertFalse(transition.after.retry_pending)
+        self.assertIsNone(transition.after.reset_candidate)
+        self.assertEqual(
+            transition.after.next_due_at, self.NOW + policy.RUN_INTERVAL_SECONDS
+        )
+
+    def test_probe_only_without_fresh_quota_keeps_a_future_deadline(self):
+        before = state(next_due_at=self.NOW + 99, retry_pending=True)
+        transition = policy.reanchor_probe_only(before, NO_OBSERVATION, self.NOW)
+        self.assertGreaterEqual(transition.after.next_due_at, before.next_due_at)
+        self.assertEqual(
+            policy.reanchor_probe_only(
+                state(next_due_at=1), STALE, self.NOW
+            ).after.next_due_at,
+            self.NOW + policy.RUN_INTERVAL_SECONDS,
         )
 
 

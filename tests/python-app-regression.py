@@ -116,6 +116,71 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(self.collector.collect_calls, 1)
         self.assertEqual(self.notifier.events, [])
 
+    def _probe_only_app(self, providers):
+        """The same application, with one provider's model trigger switched off."""
+        return Application(
+            self.state_dir, self.runner, lambda workspace: self.collector,
+            self.notifier, clock=lambda: 1000, sleep=lambda seconds: None,
+            config=AppConfig(
+                initial_attempts=1, watchdog_attempts=1, quota_wait=0,
+                probe_only=frozenset(providers),
+            ),
+            workspace_parent=Path(self.temp.name),
+        )
+
+    def test_probe_only_provider_is_probed_but_never_run(self):
+        """The switch costs the model turn, not the measurement or the card."""
+        store = FileStateStore(self.state_dir)
+        for provider in PROVIDERS:
+            future = 2000 if provider != "antigravity" else 1
+            store.commit(provider, ProviderState(), ProviderState(next_due_at=future))
+        self.collector.readings = no_readings()
+        self.collector.readings["antigravity"] = fresh_reading(5000)
+
+        self._probe_only_app(["antigravity"]).check()
+
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.collector.collect_calls, 1)
+        state = FileStateStore(self.state_dir).load("antigravity")
+        # Exactly the deadline a run would have produced from that reading.
+        self.assertEqual(state.next_due_at, 5000 + 240)
+        self.assertFalse(state.retry_pending)
+        self.assertEqual(self.notifier.events, [])
+
+    def test_probe_only_clears_debt_it_could_never_repay(self):
+        """A disabled provider never enters a watchdog retry burst."""
+        store = FileStateStore(self.state_dir)
+        for provider in PROVIDERS:
+            if provider == "antigravity":
+                store.commit(
+                    provider, ProviderState(),
+                    ProviderState(next_due_at=1, retry_pending=True),
+                )
+            else:
+                store.commit(
+                    provider, ProviderState(), ProviderState(next_due_at=2000)
+                )
+        self.collector.readings = no_readings()
+
+        self._probe_only_app(["antigravity"]).check()
+
+        self.assertEqual(self.runner.calls, [])
+        state = FileStateStore(self.state_dir).load("antigravity")
+        self.assertFalse(state.retry_pending)
+        # No fresh reset available: the deadline advances a whole run interval,
+        # so the timer can never spin on a permanently matured deadline.
+        self.assertEqual(state.next_due_at, 1000 + 18060)
+
+    def test_probe_only_switch_is_env_driven_and_rejects_typos(self):
+        from quota_sentinel.app import AppConfig as _AppConfig
+        self.assertEqual(
+            set(_AppConfig.from_env({"QUOTA_SENTINEL_PROBE_ONLY": "antigravity"}).probe_only),
+            {"antigravity"},
+        )
+        self.assertEqual(set(_AppConfig.from_env({}).probe_only), set())
+        with self.assertRaises(ValueError):
+            _AppConfig.from_env({"QUOTA_SENTINEL_PROBE_ONLY": "antigravty"})
+
     def test_due_run_records_debt_before_model_and_commits_success(self):
         self.app.run(("codex",))
         self.assertEqual(self.runner.calls, [("codex", "initial", 1, 1)])

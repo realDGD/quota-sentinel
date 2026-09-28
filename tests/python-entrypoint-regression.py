@@ -108,6 +108,11 @@ class EntrypointCase(unittest.TestCase):
             "QUOTA_SENTINEL_LOG_DIR": str(self.root / "logs"),
             "QUOTA_SENTINEL_PI_BIN": str(self.pi),
             "QUOTA_SENTINEL_PI_AUTH_FILE": str(self.auth),
+            # This suite exercises the Pi transport end to end, so it pins the
+            # codex provider back onto Pi: the shipped default is the official
+            # Codex CLI, and a suite must never start a real one (nor spend a
+            # real token) just because it drives `run codex`.
+            "QUOTA_SENTINEL_TRANSPORT": "codex=pi",
             "QS_CAPTURE_PATH": str(self.capture),
             # Never push, and never touch the Keychain: the dry-run client
             # validates every credential and prints the payload it WOULD send.
@@ -179,14 +184,14 @@ class EntrypointCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.capture.read_text().strip().splitlines()
         self.assertEqual(len(calls), 1, calls)
-        self.assertIn("gpt-5.6-luna", calls[0])
+        self.assertIn("gpt-6-luna", calls[0])
         state = self.store().load("codex")
         self.assertFalse(state.retry_pending)
         self.assertIsNotNone(state.last_task_at)
         # The dry-run notifier prints the envelope it would have delivered.
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(payload["receive_id"], "cli-user-id")
-        self.assertIn("GPT-5.6 Luna", payload["content"])
+        self.assertIn("GPT-6 Luna", payload["content"])
 
     # ---- E5: one run at a time -------------------------------------------
     def test_e5_run_refuses_while_another_run_holds_the_lock(self):
@@ -215,7 +220,7 @@ class EntrypointCase(unittest.TestCase):
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         content = json.loads(payload["content"])
         text = json.dumps(content, ensure_ascii=False)
-        for title in ("GPT-5.6 Luna", "Gemini 3.7 Flash · Low",
+        for title in ("GPT-6 Luna", "Gemini 3.7 Flash · Low",
                       "DeepSeek V4.1 Flash · OpenCode Go",
                       "DeepSeek V4.1 Flash · ClinePass"):
             self.assertIn(title, text)

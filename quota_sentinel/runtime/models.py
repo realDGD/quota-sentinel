@@ -80,7 +80,7 @@ class AttemptResult:
 
 
 _PI_PROVIDER = {
-    "codex": ("openai-codex", "gpt-5.6-luna", "off", "PI_CODEX_QUOTA_FILE"),
+    "codex": ("openai-codex", "gpt-6-luna", "off", "PI_CODEX_QUOTA_FILE"),
     "antigravity": ("antigravity", "gemini-3.7-flash", "low", "PI_ANTIGRAVITY_QUOTA_FILE"),
     # OpenCode Go is delivered by runtime/direct.py in production; this row
     # stays because the Pi transport remains selectable, and the model is kept
@@ -149,16 +149,29 @@ def _redact_secrets(summary: str) -> str:
 
 
 class ModelRunner:
+    """The Pi transport.
+
+    ``fallback_for`` is the cheap-path-first policy: a provider listed there is
+    delivered by Pi, and when Pi cannot deliver it the attempt is handed to the
+    named transport instead of being reported as a failure. The fallback runner
+    is expected to be terminal (no fallback of its own), so a chain can never
+    loop, and it may be a different transport entirely.
+    """
+
+    TRANSPORT = "pi"
+
     def __init__(
         self,
         config: ModelRunnerConfig,
         *,
         logger: Optional[Callable[[str], None]] = None,
+        fallback_for: Optional[Mapping[str, object]] = None,
     ) -> None:
         self.config = config
         # Mirrors the quota probe's seam: an injected logger, else the config's,
         # else a no-op so existing callers keep working unchanged.
         self.logger = logger or config.logger or (lambda _message: None)
+        self.fallback_for = dict(fallback_for or {})
         self._prepared: dict[tuple[str, Path], PreparedPaths] = {}
 
     def _base_environment(self) -> dict[str, str]:
@@ -276,6 +289,20 @@ class ModelRunner:
             error_summary="" if success else _safe_error_summary(paths.stderr_path),
         )
         self._log_attempt(provider, phase, attempt, limit, result)
+        fallback = self.fallback_for.get(provider)
+        if not success and fallback is not None:
+            # Pi is the cheap path, not the only one: when it cannot deliver,
+            # the configured transport takes the attempt rather than the window
+            # being reported as a failure. The target is terminal by
+            # construction, so this can never bounce back here.
+            self.logger(
+                "model %s transport=pi -> fallback=%s reason=%s"
+                % (provider, getattr(fallback, "TRANSPORT", type(fallback).__name__),
+                   "timeout" if result.timed_out else
+                   ("exit=%s" % result.exit_code if result.exit_code else "reply!=1"))
+            )
+            fallback.prepare(provider, workspace)
+            return fallback.run(provider, workspace, phase, attempt, limit)
         return result
 
     def _log_attempt(

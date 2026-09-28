@@ -215,7 +215,7 @@ class ModelRunnerTests(unittest.TestCase):
             "--system-prompt", "忽略上下文",
         ]
         cases = {
-            "codex": ("openai-codex", "gpt-5.6-luna", "off",
+            "codex": ("openai-codex", "gpt-6-luna", "off",
                       [str(REPO / "capture-codex-quota.ts")], "PI_CODEX_QUOTA_FILE"),
             "antigravity": ("antigravity", "gemini-3.7-flash", "low",
                             [str(self.root / "antigravity-provider.ts"),
@@ -455,6 +455,67 @@ class ModelRunnerTests(unittest.TestCase):
         self.assertNotIn("truncated-secret-xyz", result.error_summary)
         self.assertNotIn("truncat", result.error_summary)
         self.assertLessEqual(len(result.error_summary), 300)
+
+    # ---- the shipped priority: Pi is the cheap path, not the only one -----
+    def _stub_fallback(self):
+        class _StubFallback:
+            TRANSPORT = "codex"
+
+            def __init__(self):
+                self.prepared = []
+                self.runs = []
+
+            def prepare(self, provider, workspace):
+                self.prepared.append(provider)
+
+            def run(self, provider, workspace, phase, attempt, limit):
+                self.runs.append((provider, phase, attempt, limit))
+                return type("Result", (), {
+                    "success": True, "exit_code": 0, "timed_out": False,
+                    "elapsed": 0.5,
+                    "stdout_path": Path(workspace) / "fb-stdout",
+                    "stderr_path": Path(workspace) / "fb-stderr",
+                    "quota_path": Path(workspace) / "fb-quota.json",
+                    "error_summary": "",
+                })()
+
+        return _StubFallback()
+
+    def test_pi_failure_hands_the_attempt_to_the_configured_fallback(self) -> None:
+        """A failed Pi attempt is delivered by the fallback, not reported lost."""
+        stub = self._stub_fallback()
+        lines: list = []
+        runner = ModelRunner(self.config, logger=lines.append, fallback_for={"codex": stub})
+        self.env["QS_FAKE_MODE"] = "nonzero"  # the fake Pi exits 7
+        result = runner.run("codex", self.workspace, "initial", 1, 3)
+        self.assertTrue(result.success)
+        self.assertEqual(stub.prepared, ["codex"])
+        self.assertEqual(stub.runs, [("codex", "initial", 1, 3)])
+        self.assertIn("transport=pi -> fallback=codex", " ".join(lines))
+        self.assertIn("reason=exit=7", " ".join(lines))
+
+    def test_without_a_fallback_a_pi_failure_stays_a_failure(self) -> None:
+        self.env["QS_FAKE_MODE"] = "nonzero"
+        result = self.runner.run("codex", self.workspace, "initial", 1, 3)
+        self.assertFalse(result.success)
+        self.assertEqual(result.exit_code, 7)
+
+    def test_a_provider_outside_the_mapping_never_delegates(self) -> None:
+        stub = self._stub_fallback()
+        runner = ModelRunner(self.config, fallback_for={"codex": stub})
+        self.env["QS_FAKE_MODE"] = "nonzero"
+        result = runner.run("antigravity", self.workspace, "initial", 1, 3)
+        self.assertFalse(result.success)
+        self.assertEqual(stub.runs, [])
+
+    def test_timeout_is_reported_as_the_fallback_reason(self) -> None:
+        stub = self._stub_fallback()
+        lines: list = []
+        runner = ModelRunner(self.config, logger=lines.append, fallback_for={"codex": stub})
+        self.env["QS_FAKE_MODE"] = "timeout"
+        result = runner.run("codex", self.workspace, "initial", 1, 3)
+        self.assertTrue(result.success)
+        self.assertIn("reason=timeout", " ".join(lines))
 
 
 if __name__ == "__main__":

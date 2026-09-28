@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Mapping, Optional, Sequence
+from typing import Callable, Dict, FrozenSet, Mapping, Optional, Sequence
 
 from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.scheduler import policy, service
@@ -31,6 +31,12 @@ class AppConfig:
     watchdog_retry_gap: int = 780
     quota_wait: int = 20
     timer_recheck: int = 60
+    # Providers whose MODEL TRIGGER is switched off while everything around it
+    # keeps running: the quota probe (free, metadata only), the deadline
+    # calibration, the run log and the /usage card. Nothing is deleted — the
+    # transport, its tests and its roster entry stay in place, so removing the
+    # name (or `QUOTA_SENTINEL_PROBE_ONLY`) restores the old behaviour exactly.
+    probe_only: FrozenSet[str] = frozenset()
 
     def __post_init__(self) -> None:
         for name in ("initial_attempts", "watchdog_attempts", "retry_interval"):
@@ -39,6 +45,12 @@ class AppConfig:
         for name in ("watchdog_retry_gap", "quota_wait", "timer_recheck"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
+        unknown = sorted(set(self.probe_only) - set(PROVIDERS))
+        if unknown:
+            # A typo would otherwise look like a working switch that silently
+            # keeps spending quota, which is the one failure mode this option
+            # exists to prevent.
+            raise ValueError(f"unknown probe-only provider(s): {', '.join(unknown)}")
 
     @classmethod
     def from_env(cls, environment: Optional[Mapping[str, str]] = None) -> "AppConfig":
@@ -57,11 +69,19 @@ class AppConfig:
                 return default
             return int(raw)
 
+        raw_probe_only = env.get("QUOTA_SENTINEL_PROBE_ONLY", "")
+        probe_only = frozenset(
+            name.strip().lower()
+            for name in raw_probe_only.replace(" ", ",").split(",")
+            if name.strip()
+        )
+
         return cls(
             initial_attempts=env_int("QUOTA_SENTINEL_INITIAL_ATTEMPTS", 3),
             watchdog_attempts=env_int("QUOTA_SENTINEL_WATCHDOG_ATTEMPTS", 2),
             retry_interval=env_int("QUOTA_SENTINEL_RETRY_INTERVAL", 30),
             watchdog_retry_gap=env_int("QUOTA_SENTINEL_WATCHDOG_RETRY_GAP", 780),
+            probe_only=probe_only,
         )
 
 
@@ -217,7 +237,17 @@ class Application:
 
     def _sync(self, provider: str, reading: object, now: int) -> None:
         state = service.load_state(self.state_dir, provider)
-        transition, _ = policy.sync_deadline(state, _observation(reading), now)
+        if provider in self.config.probe_only:
+            # /usage recalibrates deadlines the same way a check does, so it
+            # must honour the probe-only contract too: a disabled provider's
+            # deadline follows the observation and never lingers matured.
+            transition = policy.reanchor_probe_only(
+                state, _observation(reading), now
+            )
+        else:
+            transition, _ = policy.sync_deadline(
+                state, _observation(reading), now
+            )
         service.apply_transition(self.state_dir, provider, transition)
         # The policy already computes WHY the deadline did or did not move;
         # writing its own words down is what makes the window boundary
@@ -297,6 +327,13 @@ class Application:
                     self.state_dir, PROVIDERS, now,
                     self.config.watchdog_retry_gap,
                 )
+                # A probe-only provider is never executed, so it must never
+                # enter a retry burst either: its debt is cleared by the
+                # probe-only transition below, not repaid with a model turn.
+                retry = [
+                    provider for provider in retry
+                    if provider not in self.config.probe_only
+                ]
                 retry_results: Dict[str, str] = {}
                 pi_raw: Mapping[str, Path] = {}
                 if retry:
@@ -329,6 +366,22 @@ class Application:
                     )
                     due = []
                     for provider in PROVIDERS:
+                        if provider in self.config.probe_only:
+                            # Switched off, but still measured: the probe above
+                            # already read its quota, and this transition keeps
+                            # the deadline ahead of now so neither the timer
+                            # nor the watchdog grid can spin on a matured
+                            # deadline that will never be executed.
+                            result = service.reanchor_probe_only(
+                                self.state_dir, provider, now,
+                                _observation(readings.get(provider)),
+                            )
+                            logger.info("sched %s: %s", provider, result.reason)
+                            self._log_anchor(
+                                provider, result.before_state.last_known_reset,
+                                result.state.last_known_reset,
+                            )
+                            continue
                         if provider in pending:
                             logger.info(
                                 "check: %s pending (debt unpaid); normal due "
