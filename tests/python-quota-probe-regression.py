@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from quota_sentinel.quota import Tier
+from quota_sentinel.runtime import factory as factory_module
+from quota_sentinel.runtime import probe_budget
 from quota_sentinel.runtime.factory import quota_probe_options
 from quota_sentinel.runtime.quota_probe import QuotaCollector, _run_bounded
 
@@ -371,6 +373,120 @@ time.sleep(30)
         self.assertTrue(pid_file.exists())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
+
+
+class FactoryProbeBudgetAgreement(unittest.TestCase):
+    """The collector's options and the derived probe bound are ONE table.
+
+    They were two copies once: `factory.quota_probe_options` owned the eight
+    names and defaults, while `task_orchestrator` bounded one probe phase with a
+    fixed 300s and a comment claiming an operator's per-tier override was
+    unknowable. Raising `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` to 4000 then moved the
+    collector's real budget while the outer `check` bound stayed put, which is
+    how a legal probe gets killed by its own watchdog. These pins fail the day
+    the two sides disagree again.
+    """
+
+    # One DISTINCT value per budget, so a name that silently moves from one
+    # option to another cannot pass by coincidence.
+    CRAFTED = {
+        "QUOTA_SENTINEL_CODEXBAR_TIMEOUT": "1.5",
+        "QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT": "2.5",
+        "QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT": "3.5",
+        "QUOTA_SENTINEL_CLINEPASS_CODEXBAR_TIMEOUT": "3.75",
+        "QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT": "4.5",
+        "QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT": "5.5",
+        "QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT": "5.75",
+        "QUOTA_SENTINEL_CODEXBAR_KILL_GRACE": "0.5",
+    }
+
+    def test_pb1_every_timeout_is_the_same_value_on_both_sides(self):
+        options = quota_probe_options(self.CRAFTED)
+        timeouts = probe_budget.quota_probe_timeouts(self.CRAFTED)
+        self.assertEqual(
+            sorted(timeouts),
+            sorted(spec.option for spec in probe_budget.PROBE_TIMEOUTS),
+        )
+        for spec in probe_budget.PROBE_TIMEOUTS:
+            with self.subTest(option=spec.option):
+                self.assertIn(spec.option, options)
+                self.assertEqual(options[spec.option], timeouts[spec.option])
+                # ...and the crafted value is the one the operator wrote, so a
+                # renamed variable on either side cannot hide behind a default.
+                self.assertEqual(
+                    options[spec.option],
+                    float(self.CRAFTED[spec.env]),
+                    "%s no longer configures %s" % (spec.env, spec.option),
+                )
+
+    def test_pb2_every_operator_name_moves_both_sides(self):
+        """The eight names are a contract: each moves options AND the bound."""
+        baseline = probe_budget.worst_case_probe_phase_seconds({})
+        for spec in probe_budget.PROBE_TIMEOUTS:
+            raw = "%.5f" % (float(spec.default) + 3.25)
+            env = {spec.env: raw}
+            with self.subTest(variable=spec.env):
+                self.assertEqual(quota_probe_options(env)[spec.option], float(raw))
+                self.assertEqual(
+                    probe_budget.quota_probe_timeouts(env)[spec.option], float(raw)
+                )
+                # A one-phase bound that ignores the raised budget is exactly
+                # the defect these pins exist for.
+                self.assertGreaterEqual(
+                    probe_budget.worst_case_probe_phase_seconds(env) - baseline,
+                    3.25,
+                )
+
+    def test_pb3_the_tolerance_is_the_shared_one(self):
+        """`${VAR:-default}`: empty, junk, negative, non-finite → default."""
+        raws = ("", "abc", "-5", "inf", "nan", "  ", "0", "12.5")
+        crafted = {
+            spec.env: raw
+            for spec, raw in zip(probe_budget.PROBE_TIMEOUTS, raws)
+        }
+        expected = (
+            ("codexbar_timeout", 20),                # empty → default
+            ("antigravity_codexbar_timeout", 35),    # junk → default
+            ("opencode_codexbar_timeout", 20),       # negative → default
+            ("clinepass_codexbar_timeout", 20),      # +inf → default
+            ("antigravity_native_timeout", 20),      # nan → default
+            ("opencode_native_timeout", 15),         # whitespace → default
+            ("clinepass_native_timeout", 15),        # zero: NOT allowed here
+            ("codexbar_kill_grace", 12.5),           # the one accepted value
+        )
+        # The zip above is positional; keep the two orders locked together.
+        self.assertEqual(
+            [option for option, _ in expected],
+            [spec.option for spec in probe_budget.PROBE_TIMEOUTS],
+        )
+        options = quota_probe_options(crafted)
+        timeouts = probe_budget.quota_probe_timeouts(crafted)
+        for option, value in expected:
+            with self.subTest(option=option):
+                self.assertEqual(options[option], value)
+                self.assertEqual(timeouts[option], value)
+        # Zero is a real value for the kill grace alone, on both sides.
+        zero = {"QUOTA_SENTINEL_CODEXBAR_KILL_GRACE": "0"}
+        self.assertEqual(quota_probe_options(zero)["codexbar_kill_grace"], 0.0)
+        self.assertEqual(
+            probe_budget.quota_probe_timeouts(zero)["codexbar_kill_grace"], 0.0
+        )
+        # The composition root does not own a second table: building the
+        # options asks `probe_budget` for all eight budgets in one call, and its
+        # own single-budget reader delegates to the shared parser.
+        with mock.patch.object(
+            probe_budget, "quota_probe_timeouts",
+            wraps=probe_budget.quota_probe_timeouts,
+        ) as shared:
+            quota_probe_options(crafted)
+        self.assertEqual(shared.call_count, 1)
+        with mock.patch.object(
+            probe_budget, "seconds_override", wraps=probe_budget.seconds_override
+        ) as parser:
+            self.assertEqual(
+                factory_module._seconds_override({"X": "2.5"}, "X", 1.0), 2.5
+            )
+        self.assertEqual(parser.call_count, 1)
 
 
 class InstrumentationTests(unittest.TestCase):

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quota_sentinel.app import AppConfig
 from quota_sentinel.quota.adapters import PROVIDERS
-from quota_sentinel.runtime import agy_exec, codex_exec
+from quota_sentinel.runtime import agy_exec, codex_exec, models, probe_budget
 from quota_sentinel.runtime.models import ModelRunnerConfig
 from quota_sentinel.state import bootstrap_legacy_authority
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
@@ -35,15 +35,19 @@ from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 from task_orchestrator import (
     CHECK_COMMAND_TIMEOUT_SECONDS,
     CHECK_TIMEOUT_SAFETY_FRACTION,
+    PI_PREPARE_BURSTS_PER_CHECK,
+    QUOTA_PROBE_PHASES_PER_CHECK,
     CommandResult,
     ScheduleState,
     SubprocessRunner,
     TaskOrchestrator,
     TaskStore,
     check_command_timeout,
+    pi_auth_timeout_seconds,
     worst_case_attempt_seconds,
     worst_case_burst_seconds,
     worst_case_check_seconds,
+    worst_case_prepare_seconds,
 )
 
 
@@ -491,6 +495,7 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
         # The margin is what makes the default strictly exceed the bound.
         derived = bound * (1.0 + CHECK_TIMEOUT_SAFETY_FRACTION)
         self.assertEqual(check_command_timeout(self.ENV), derived)
+        self.assertGreater(check_command_timeout(self.ENV), bound)
         # The module constant is that default unless an operator overrode it in
         # this process's environment; with no override the shipped value must
         # clear the bound.
@@ -550,6 +555,138 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
         self.assertGreater(worst_case_check_seconds(more_rounds), baseline)
         longer_gap = dict(self.ENV, QUOTA_SENTINEL_RETRY_INTERVAL="300")
         self.assertGreater(worst_case_check_seconds(longer_gap), baseline)
+
+    # ---- the probe term: derived from the collector, never a literal -------
+
+    def test_probe_phase_bound_keeps_the_retired_300s_floor(self) -> None:
+        """The new derivation can only ever RAISE the bound it replaced.
+
+        300s was the fixed per-phase allowance. It is now a documented floor
+        under a bound derived from the collector's own structure, so a phase
+        bound that is somehow cheaper than the old literal is a bug, not a
+        tightening.
+        """
+        self.assertEqual(probe_budget.PROBE_PHASE_FLOOR_SECONDS, 300.0)
+        bound = probe_budget.worst_case_probe_phase_seconds(self.ENV)
+        self.assertGreaterEqual(bound, probe_budget.PROBE_PHASE_FLOOR_SECONDS)
+        # On the shipped defaults the floor is a NET, not the answer: if it had
+        # to do the work, the structural growth measured below would be hidden
+        # by it (a raised budget would move the sum without moving the bound).
+        self.assertGreater(bound, probe_budget.PROBE_PHASE_FLOOR_SECONDS)
+
+    def test_bound_follows_a_raised_codexbar_timeout(self) -> None:
+        """The exact override that broke the retired fixed allowance.
+
+        `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` configures codex's CodexBar budget,
+        and `QuotaCollector._codexbar` walks TWO sources for codex — `cli`
+        then `oauth` — so one phase pays the raised budget twice, while a check
+        runs two phases. With the old 300s literal this environment left the
+        derived bound at 5490s even though one codexbar call could legally run
+        for 4000s.
+        """
+        spec = probe_budget.PROBE_TIMEOUTS_BY_OPTION["codexbar_timeout"]
+        calls = probe_budget.codexbar_calls("codex")
+        self.assertEqual(calls, 2, "codex tries cli and oauth; recount _codexbar")
+        before = probe_budget.quota_probe_timeouts(self.ENV)[spec.option]
+        added = (4000.0 - float(before)) * calls       # growth of ONE phase
+        env = dict(self.ENV, **{spec.env: "4000"})
+        baseline = worst_case_check_seconds(self.ENV)
+        raised = worst_case_check_seconds(env)
+        delta = raised - baseline
+        self.assertGreaterEqual(delta, QUOTA_PROBE_PHASES_PER_CHECK * added)
+        self.assertAlmostEqual(delta, QUOTA_PROBE_PHASES_PER_CHECK * added)
+        # The default cap follows the bound: the operator's own value must never
+        # be capped by a number derived for the DEFAULT budgets.
+        self.assertGreater(check_command_timeout(env), raised)
+
+    def test_bound_follows_a_raised_native_timeout(self) -> None:
+        """One native helper per provider per phase: +300s moves a phase +300s."""
+        spec = probe_budget.PROBE_TIMEOUTS_BY_OPTION["opencode_native_timeout"]
+        before = probe_budget.quota_probe_timeouts(self.ENV)[spec.option]
+        added = 300.0
+        env = dict(self.ENV, **{spec.env: str(float(before) + added)})
+        delta = worst_case_check_seconds(env) - worst_case_check_seconds(self.ENV)
+        self.assertAlmostEqual(delta, QUOTA_PROBE_PHASES_PER_CHECK * added)
+
+    def test_bound_follows_a_raised_codexbar_kill_grace(self) -> None:
+        """The kill grace is paid by EVERY CodexBar call in the phase."""
+        spec = probe_budget.PROBE_TIMEOUTS_BY_OPTION["codexbar_kill_grace"]
+        before = probe_budget.quota_probe_timeouts(self.ENV)[spec.option]
+        added = 7.0
+        calls = probe_budget.codexbar_calls_per_phase()
+        self.assertEqual(calls, 5, "recount _codexbar sources per provider")
+        env = dict(self.ENV, **{spec.env: str(float(before) + added)})
+        delta = worst_case_check_seconds(env) - worst_case_check_seconds(self.ENV)
+        self.assertAlmostEqual(
+            delta, QUOTA_PROBE_PHASES_PER_CHECK * calls * added
+        )
+
+    def test_probe_phase_bound_is_monotone_in_every_override(self) -> None:
+        """Every budget, raised, can only grow the phase — by at least its cost.
+
+        The multipliers are hand-derived from the collector (and cross-checked
+        against `codexbar_calls_per_phase`): a native timeout is paid once per
+        phase because one helper serves the provider; a CodexBar timeout once
+        per source that provider walks (`cli`+`oauth` for codex, one source for
+        the others); the kill grace once per CodexBar call.
+        """
+        per_phase = {
+            "codexbar_timeout": 2,                # codex: cli, then oauth
+            "antigravity_codexbar_timeout": 1,    # one cli source
+            "opencode_codexbar_timeout": 1,       # one api source
+            "clinepass_codexbar_timeout": 1,      # one api source
+            "antigravity_native_timeout": 1,      # one uv helper
+            "opencode_native_timeout": 1,         # one python helper
+            "clinepass_native_timeout": 1,        # one python helper
+            "codexbar_kill_grace": 5,             # every CodexBar call
+        }
+        self.assertEqual(
+            sorted(per_phase),
+            sorted(spec.option for spec in probe_budget.PROBE_TIMEOUTS),
+            "an override exists that this monotonicity test does not cover",
+        )
+        self.assertEqual(
+            per_phase["codexbar_kill_grace"],
+            probe_budget.codexbar_calls_per_phase(),
+        )
+        baseline = probe_budget.worst_case_probe_phase_seconds(self.ENV)
+        for option, multiplier in per_phase.items():
+            spec = probe_budget.PROBE_TIMEOUTS_BY_OPTION[option]
+            before = probe_budget.quota_probe_timeouts(self.ENV)[option]
+            added = 60.0
+            env = dict(self.ENV, **{spec.env: str(float(before) + added)})
+            with self.subTest(override=spec.env):
+                raised = probe_budget.worst_case_probe_phase_seconds(env)
+                self.assertGreaterEqual(raised, baseline)
+                self.assertGreaterEqual(raised - baseline, multiplier * added)
+
+    # ---- the Pi credential refresh: one prepare pass per burst ------------
+
+    def test_pi_prepare_term_moves_the_bound(self) -> None:
+        """The bounded credential refresh is paid once per burst, twice a check.
+
+        `Application._burst` prepares every provider before its rounds, and the
+        codex prepare asks Pi for a bearer token under `auth_timeout` plus the
+        runner's kill grace. `getattr(config, "auth_timeout", None)` seeded from
+        `models.PI_AUTH_TIMEOUT_SECONDS` is the seam that works whether or not
+        the dataclass field has landed yet, so the test raises the module
+        constant — the accessor reads both sources and keeps the larger.
+        """
+        baseline = worst_case_check_seconds(self.ENV)
+        before = pi_auth_timeout_seconds(self.ENV)
+        self.assertGreater(before, 0)
+        added = 600.0
+        raised_seed = before + added
+        with patch.object(models, "PI_AUTH_TIMEOUT_SECONDS", raised_seed, create=True):
+            after = pi_auth_timeout_seconds(self.ENV)
+            raised = worst_case_check_seconds(self.ENV)
+            prepared = worst_case_prepare_seconds(self.ENV)
+        self.assertAlmostEqual(after - before, added)
+        self.assertAlmostEqual(raised - baseline, PI_PREPARE_BURSTS_PER_CHECK * added)
+        # The refresh is bounded by the auth budget PLUS the runner's own kill
+        # grace, so the prepare term is never just the auth timeout.
+        grace = ModelRunnerConfig.from_env(self.ENV).kill_grace
+        self.assertAlmostEqual(prepared, after + grace)
 
     def test_env_override_still_wins(self) -> None:
         self.assertEqual(

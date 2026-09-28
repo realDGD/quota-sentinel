@@ -35,8 +35,11 @@ from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 # `quota_sentinel.runtime.factory` is deliberately NOT imported here: it is the
 # composition root, a module this one has no business depending on, and its own
 # graph already carries urllib and the probe plumbing.
+# The light `runtime/probe_budget.py` IS imported: it is stdlib-only, it owns
+# the per-tier probe budgets the composition root now reads from it too, and it
+# derives the per-phase probe bound from the collector's own structure.
 from quota_sentinel.app import AppConfig
-from quota_sentinel.runtime import agy_exec, codex_exec
+from quota_sentinel.runtime import agy_exec, codex_exec, models, probe_budget
 from quota_sentinel.runtime.direct import DIRECT_TIMEOUT_SECONDS
 from quota_sentinel.runtime.models import ModelRunnerConfig
 from quota_sentinel.state import AuthoritativeStateStore, StateStoreError
@@ -85,7 +88,9 @@ LOOP_ERROR_BACKOFF_SECONDS = 60
 #
 #   one agy attempt = (AGY_TRANSIENT_RETRIES + 1) turns x (AGY_EXEC_TIMEOUT_SECONDS
 #                     + agy kill grace)          = 4 x 130 = 520s
-#                   + the agent-listing guard, bounded by the same timeout
+#                   + the agent-listing guard (its wrapper's deadline plus the
+#                     grace it needs to reap the CLI, plus a 1s parent margin;
+#                     always <= AGY_EXEC_TIMEOUT_SECONDS + kill grace)
 #                                                = 130s
 #                   + one Pi fallback (ModelRunnerConfig.timeout + kill grace)
 #                                                = 310s
@@ -98,9 +103,27 @@ LOOP_ERROR_BACKOFF_SECONDS = 60
 #
 #   watchdog burst  = 2 x 960 + 1 x 30 (retry_interval between rounds) = 1950s
 #   initial burst   = 3 x 960 + 2 x 30                                 = 2940s
-#   quota probes    = 2 phases x 300                                   =  600s
+#   Pi prepare      = 2 bursts x (auth_timeout + kill grace) = 2 x 40  =   80s
+#   quota probes    = 2 phases x 307 (the probe bound below)           =  614s
 #   ------------------------------------------------------------------------
-#   legal worst case                                                   = 5490s
+#   legal worst case                                                   = 5584s
+#
+# The last two terms are DERIVED, not literals, and both used to be missing:
+#
+#   * the probe term comes from `runtime/probe_budget.py`, which walks the
+#     collector's real structure (providers SEQUENTIALLY, each ladder's native
+#     and CodexBar rungs, the Keychain reads, the process start-up and the
+#     bounded reap every spawned probe owes) and reads the SAME per-tier
+#     budgets `factory.quota_probe_options` builds its options from. A fixed
+#     300s allowance could not do that: with QUOTA_SENTINEL_CODEXBAR_TIMEOUT
+#     set to 4000 the collector's real budget for one CodexBar call became
+#     4000s while this bound stayed at 5490s, so the outer kill could cut down
+#     a probe that was still inside its own rules;
+#   * the prepare term is the bounded Pi credential refresh `ModelRunner.
+#     prepare` runs for codex. `Application._burst` prepares every provider
+#     once per burst, sequentially and BEFORE the rounds, so one burst pays one
+#     refresh (plus its kill grace) — not one per attempt round — and a check
+#     can enter two bursts (watchdog retry, then initial).
 #
 # and the DEFAULT applied below adds CHECK_TIMEOUT_SAFETY_FRACTION on top of
 # that, which is what keeps lock waits (`quota_wait`), Keychain reads, state I/O
@@ -109,21 +132,29 @@ LOOP_ERROR_BACKOFF_SECONDS = 60
 # number falls back to the derived default instead of failing the import.
 # ---------------------------------------------------------------------------
 
-# One quota-probe phase, bounded generously. The README measures the default
-# acquisition at ≈207s, but that measurement leaves out the CodexBar kill grace
-# (10s on up to four calls) and the two Keychain reads (5s each) that a phase can
-# also pay, so the BOUND is higher than the measurement: codex's app-server
-# handshake (two 5s deadlines) + both of codex's CodexBar sources + the
-# antigravity/opencode/clinepass native helpers with their 5s slack + each
-# CodexBar call with its kill grace + the Keychain reads ≈ 250s. It stays a
-# named constant here rather than an import because the per-tier timeouts live
-# in `runtime/factory.py`'s quota_probe_options — the one module this file must
-# not drag into the launchd import graph — and an operator's per-tier override
-# is not a bound this module can know. 300s is that sum with room to spare.
-QUOTA_PROBE_PHASE_ALLOWANCE_SECONDS = 300
+# One quota-probe phase is bounded by `runtime.probe_budget`, never typed here.
+# The retired 300s literal carried a comment claiming an operator's per-tier
+# override "is not a bound this module can know" — but the composition root
+# hands exactly those overrides to the collector, so the claim was false and the
+# bound it produced could be too small. The derived bound keeps a documented
+# floor of that same 300s, so this change can only ever raise the bound.
 # `Application.check` runs the probe once before deciding what is due and once
 # after the initial burst, to calibrate the deadlines it just moved.
 QUOTA_PROBE_PHASES_PER_CHECK = 2
+# `Application._burst` calls `model_runner.prepare()` once per provider per
+# burst, sequentially, before the rounds. Only the codex prepare spends a
+# deadline (the bounded Pi credential refresh); every other provider's prepare
+# is private-directory work. A check can enter two bursts — the watchdog retry
+# burst when debt is due and the initial burst — and even a burst whose attempt
+# limit is zero still prepares, so the term is TWO refresh budgets, not one per
+# attempt round.
+PI_PREPARE_BURSTS_PER_CHECK = 2
+# Last-resort value for the Pi prepare term, used only when neither
+# `ModelRunnerConfig.auth_timeout` nor `models.PI_AUTH_TIMEOUT_SECONDS` exists
+# on the tree being imported. It exists so the term — and with it a real part of
+# the bound — cannot silently vanish on a checkout where the credential fix has
+# not landed; the moment either source exists, its value is what counts.
+PI_AUTH_TIMEOUT_FALLBACK_SECONDS = 30.0
 # Applied where the default is formed, not inside the worst case: the callers
 # that assert the default covers the bound must be able to compare the two.
 CHECK_TIMEOUT_SAFETY_FRACTION = 0.10
@@ -168,9 +199,9 @@ def worst_case_attempt_seconds(
       that one hop is part of the Pi budget too.
     * Codex — one bounded turn (``CODEX_EXEC_TIMEOUT_SECONDS``) plus its kill
       grace, plus Pi as its one-hop fallback.
-    * agy — the agent-listing guard and every turn run under the same timeout,
-      so its budget is ``AGY_TRANSIENT_RETRIES + 1`` turns (plus the guard while
-      ``preflight`` is on), plus Pi as its one-hop fallback.
+    * agy — the agent-listing guard and every turn run under the same channel
+      timeout, so its budget is ``AGY_TRANSIENT_RETRIES + 1`` turns (plus the
+      guard while ``preflight`` is on), plus Pi as its one-hop fallback.
     * direct — one bounded HTTP attempt (``DIRECT_TIMEOUT_SECONDS``, or the
       operator's override of it) and no fallback at all.
 
@@ -189,9 +220,10 @@ def worst_case_attempt_seconds(
     pi_turn = pi.timeout + pi.kill_grace
     codex_turn = codex.timeout + codex.kill_grace
     agy_turn = agy.timeout + agy.kill_grace
-    # The free guard runs BEFORE the turn and is bounded by the same timeout; it
-    # is a real subprocess, so leaving it out would understate a legal agy
-    # attempt by a whole turn.
+    # The free guard runs BEFORE the turn and is a real subprocess, so leaving
+    # it out would understate a legal agy attempt by a whole turn. Its own
+    # deadline is `wrapper (timeout - grace)` + `grace` + a 1s parent margin,
+    # which stays inside the `timeout + kill_grace` reserved here.
     agy_guard = agy_turn if agy.preflight else 0.0
 
     return max(
@@ -200,6 +232,50 @@ def worst_case_attempt_seconds(
         agy_guard + (agy.transient_retries + 1) * agy_turn + pi_turn,
         direct,                           # direct: one attempt, no fallback
     )
+
+
+def pi_auth_timeout_seconds(
+    environment: Mapping[str, str] | None = None,
+) -> float:
+    """The ceiling of ONE bounded Pi credential refresh, in seconds.
+
+    `ModelRunner.prepare` for codex asks Pi for a fresh bearer token
+    (``pi auth print-bearer-token``) before it copies the credential into the
+    attempt's private agent directory. That call is the one prepare step that
+    can spend a deadline, and it is bounded by
+    ``ModelRunnerConfig.auth_timeout`` plus the runner's kill grace.
+
+    Two sources are read and the LARGER wins. The configured value is the
+    runtime contract (`from_env` reads whatever name the models module chose);
+    the module constant is what that field is seeded from, so reading it too
+    keeps the term alive on a checkout where the field has not landed yet. A
+    bound may over-state, never under-state: an operator who lowers the runtime
+    value below its own ceiling leaves the bound where the ceiling was.
+    """
+    config = ModelRunnerConfig.from_env(environment)
+    configured = getattr(config, "auth_timeout", None)
+    seeded = getattr(models, "PI_AUTH_TIMEOUT_SECONDS", None)
+    candidates = [
+        float(value)
+        for value in (configured, seeded)
+        if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+    ]
+    return max(candidates) if candidates else PI_AUTH_TIMEOUT_FALLBACK_SECONDS
+
+
+def worst_case_prepare_seconds(
+    environment: Mapping[str, str] | None = None,
+) -> float:
+    """One burst's sequential prepare pass, in seconds.
+
+    `Application._burst` prepares every provider once per burst, before any
+    round runs, so this is a per-BURST cost, not a per-attempt one. Only the
+    codex prepare can spend a deadline (the Pi credential refresh above); the
+    other providers' prepares are private-directory work bounded by nothing
+    worth adding here.
+    """
+    pi = ModelRunnerConfig.from_env(environment)
+    return pi_auth_timeout_seconds(environment) + pi.kill_grace
 
 
 def worst_case_burst_seconds(
@@ -225,6 +301,15 @@ def worst_case_check_seconds(
     bounded by the Application's own attempt limits, read from `AppConfig`
     (the same object `create_application` builds) so an operator override moves
     the bound too.
+
+    Three terms, each read where it is spent:
+
+    * the model rounds, from the channel configs and the attempt limits;
+    * one prepare pass per burst — the codex prepare's bounded Pi credential
+      refresh, plus its kill grace;
+    * one probe phase per phase, from `runtime/probe_budget`, which reads the
+      same per-tier budgets the composition root hands the collector. Raising
+      ANY of the eight ``QUOTA_SENTINEL_*`` probe budgets moves this number.
     """
     limits = config if config is not None else AppConfig.from_env(environment)
     per_attempt = worst_case_attempt_seconds(environment)
@@ -236,10 +321,13 @@ def worst_case_check_seconds(
             limits.initial_attempts, per_attempt, limits.retry_interval
         )
     )
-    return (
-        model_phase
-        + QUOTA_PROBE_PHASES_PER_CHECK * QUOTA_PROBE_PHASE_ALLOWANCE_SECONDS
+    prepare_phase = PI_PREPARE_BURSTS_PER_CHECK * worst_case_prepare_seconds(
+        environment
     )
+    probe_phase = QUOTA_PROBE_PHASES_PER_CHECK * (
+        probe_budget.worst_case_probe_phase_seconds(environment)
+    )
+    return model_phase + prepare_phase + probe_phase
 
 
 def check_command_timeout(

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import time
 from pathlib import Path
@@ -24,7 +23,7 @@ from typing import (
 
 from quota_sentinel.app import AppConfig, Application
 from quota_sentinel.quota.adapters import PROVIDERS, adapter_for
-from quota_sentinel.runtime import keychain, runlog
+from quota_sentinel.runtime import keychain, probe_budget, runlog
 from quota_sentinel.runtime.cards import (
     format_reset_time, render_progress_test_card, render_task_card,
     render_usage_card,
@@ -103,23 +102,29 @@ def create_notifier(
 def _seconds_override(
     env: Mapping[str, str], name: str, default: float, *, allow_zero: bool = False
 ) -> float:
-    """Read an optional probe budget without allowing an invalid duration."""
-    raw = env.get(name, "")
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
-        return default
-    return value
+    """Read an optional budget without allowing an invalid duration.
+
+    The tolerance — unset/empty/non-numeric/non-finite/negative means the
+    default, and zero only where `allow_zero` says so — lives in
+    ``runtime/probe_budget.py`` now, together with the eight probe budgets that
+    also derive the orchestrator's per-phase bound. This wrapper stays because
+    the direct runner's timeout (``QUOTA_SENTINEL_DIRECT_TIMEOUT``) is the same
+    ``${VAR:-default}`` shape without being part of the probe table.
+    """
+    return probe_budget.seconds_override(env, name, default, allow_zero=allow_zero)
 
 
 def quota_probe_options(environment: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
-    """The same overridable boundaries the shell exposed to its suites."""
+    """The same overridable boundaries the shell exposed to its suites.
+
+    The eight budget options are NOT typed here any more: they come from
+    ``runtime/probe_budget.py``, the module that also derives the outer
+    ``check`` bound from them. When both halves owned a copy, an operator could
+    raise a probe timeout that the derived bound did not know about — and the
+    watchdog would kill a probe still inside its own rules.
+    """
     env = _env(environment)
-    return {
+    options: Dict[str, Any] = {
         "codex_bin": _path_override(env, "QUOTA_SENTINEL_CODEX_BIN",
                                     Path("/opt/homebrew/bin/codex")),
         "agy_bin": _path_override(env, "QUOTA_SENTINEL_AGY_BIN",
@@ -138,29 +143,9 @@ def quota_probe_options(environment: Optional[Mapping[str, str]] = None) -> Dict
             REPO_DIR / "clinepass_usage.py",
         ),
         "curl_bin": _path_override(env, "QUOTA_SENTINEL_CURL_BIN", DEFAULT_CURL_BIN),
-        "codexbar_timeout": _seconds_override(env, "QUOTA_SENTINEL_CODEXBAR_TIMEOUT", 20),
-        "antigravity_codexbar_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT", 35
-        ),
-        "opencode_codexbar_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT", 20
-        ),
-        "clinepass_codexbar_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_CLINEPASS_CODEXBAR_TIMEOUT", 20
-        ),
-        "antigravity_native_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT", 20
-        ),
-        "opencode_native_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT", 15
-        ),
-        "clinepass_native_timeout": _seconds_override(
-            env, "QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT", 15
-        ),
-        "codexbar_kill_grace": _seconds_override(
-            env, "QUOTA_SENTINEL_CODEXBAR_KILL_GRACE", 10, allow_zero=True
-        ),
     }
+    options.update(probe_budget.quota_probe_timeouts(env))
+    return options
 
 
 def require_ready(
@@ -286,9 +271,14 @@ def create_application(
         environment=env,
     )
     # Selecting the codex transport inverts the priority for A/B runs, and
-    # keeps its own fallback: when the minimal profile stops applying (a
-    # renamed feature flag, a server-side model change) the attempt is
-    # delivered by Pi instead of quietly costing five times as much.
+    # keeps its own fallback for a FUNCTIONAL failure: when the minimal profile
+    # stops applying (a renamed feature flag, a server-side model change) the
+    # attempt is delivered by Pi instead of quietly costing five times as much.
+    # A COST regression is a different thing and is NOT re-delivered: a turn
+    # that completed and merely reports more tokens than the minimal profile
+    # allows is ACCEPTED as the delivery it already is — `CodexExecRunner`
+    # logs it as `cost-regression` and returns success, because Pi has nothing
+    # left to deliver and re-running the work would spend the quota twice.
     codex_runner = CodexExecRunner(
         codex_config, logger=logging.getLogger("quota_sentinel.codex").info,
         fallback=pi_terminal,
