@@ -429,17 +429,17 @@ Every external process is bounded so a hang can never hold the scheduler:
 
 | Operation | Bound | After the bound |
 | --- | --- | --- |
-| Model task, codex transport (Codex) | `QUOTA_SENTINEL_CODEX_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_CODEX_KILL_GRACE` (10s) | The attempt falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_CODEX_INPUT_CEILING`, default 2500, or output ≥ 50) does the same and is logged as `cost-regression` |
-| Model task, agy transport (antigravity) | `QUOTA_SENTINEL_AGY_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_AGY_KILL_GRACE` (10s) | The attempt falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_AGY_INPUT_CEILING`, default 1500, or a runaway reply) does the same, and a missing agent is refused **before** any token is spent |
+| Model task, codex transport (Codex) | `QUOTA_SENTINEL_CODEX_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_CODEX_KILL_GRACE` (10s) | A functional failure falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_CODEX_INPUT_CEILING`, default 2500, or output ≥ `QUOTA_SENTINEL_CODEX_OUTPUT_CEILING`, default 50) is **accepted** — the reply was already delivered — logged as `cost-regression`, and not recorded as a verified profile |
+| Model task, agy transport (antigravity) | `QUOTA_SENTINEL_AGY_TIMEOUT` (default 120s) + kill grace `QUOTA_SENTINEL_AGY_KILL_GRACE` (10s) | A functional failure falls back to Pi; a cost regression (input ≥ `QUOTA_SENTINEL_AGY_INPUT_CEILING`, default 1500, or output ≥ `QUOTA_SENTINEL_AGY_OUTPUT_CEILING`, default 200) is **accepted** and logged as `cost-regression`; a missing agent is refused **before** any token is spent |
 | Model task, Pi transport (codex; antigravity fallback) | `QUOTA_SENTINEL_MODEL_TIMEOUT` (default 300s) + kill grace `QUOTA_SENTINEL_MODEL_KILL_GRACE` (10s) | Provider marked 失败 (🔴), card shows red, scheduler keeps the seeded fallback |
 | Model task, direct transport (opencode / clinepass) | `QUOTA_SENTINEL_DIRECT_TIMEOUT` (default 120s) | Same; a missing Keychain key fails in milliseconds with `credential missing` before any token is spent |
-| Transport A/B override | `QUOTA_SENTINEL_TRANSPORT="opencode=pi"` | Moves one provider back onto the Pi agent for comparison |
+| Transport A/B override | `QUOTA_SENTINEL_TRANSPORT="opencode=pi"` | Moves one provider back onto the Pi agent for comparison. A name that is simply unknown is ignored; a real provider paired with a transport that cannot serve it (`opencode=agy`, `codex=agy`) is refused **at the configuration entry** — `invalid argument: provider 'opencode' does not run on the 'agy' transport …`, exit 3 — instead of aborting the run mid-burst |
 | Antigravity Native `/usage` | `QUOTA_SENTINEL_ANTIGRAVITY_NATIVE_TIMEOUT` (default 20s, including version check) + cleanup up to 1s | Tier ① failed → CodexBar Live; fixed reason code logged |
 | OpenCode Go Native `/usage` API | `QUOTA_SENTINEL_OPENCODE_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Tier ① failed → CodexBar Live; fixed reason code logged, never a response body |
 | ClinePass Native `/plan/usage-limits` API | `QUOTA_SENTINEL_CLINEPASS_NATIVE_TIMEOUT` (default 15s, incl. connect timeout) | Same; an idle account (no `resetsAt`) logs `missing_reset_time` and falls through |
 | CodexBar Live query | Codex: `QUOTA_SENTINEL_CODEXBAR_TIMEOUT` (20s); Antigravity: `QUOTA_SENTINEL_ANTIGRAVITY_CODEXBAR_TIMEOUT` (35s); OpenCode: `QUOTA_SENTINEL_OPENCODE_CODEXBAR_TIMEOUT` (20s); + kill grace 10s | Tier ② treated as failed → Cache → Pi Snapshot |
 | Feishu WebSocket listener outer bound | 480s | Subprocess group terminated (default quota acquisition ≈ 207s + existing Feishu auth/send retries ≈ 183s + margin) |
-| Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT` (default 2100s) | The `check` process and every nested detached process group are terminated |
+| Local orchestrator `check` outer bound | `QUOTA_SENTINEL_CHECK_TIMEOUT`; the default is **derived**, not typed: the longest legal attempt over the four transports (Pi→Codex, Codex→Pi, agy's guard + 4 turns → Pi, direct) × the Application's attempt limits, + the two quota-probe phases + 10% — ≈6,039s today, and it moves in the same commit as any channel timeout, retry count or `QUOTA_SENTINEL_*_ATTEMPTS` override | The `check` process and every nested detached process group are terminated |
 
 Model and CodexBar timeouts run through `run_with_timeout.py`: the child gets its own session,
 SIGTERM goes to the whole process group, escalates to SIGKILL after the grace
@@ -474,8 +474,11 @@ The priority chain is one hop deep in both directions:
 
 ```text
 shipped   Pi ──fails──▶ Codex (terminal)
-opt-in    Codex ──fails or regresses──▶ Pi (terminal)
+opt-in    Codex ──fails──▶ Pi (terminal)
 ```
+
+A cost regression is not a hand-over in either direction: the turn that already
+delivered stays the answer.
 
 The composition root builds each counterpart as a terminal instance, so an
 attempt can be handed over exactly once and can never bounce back.
@@ -483,14 +486,21 @@ attempt can be handed over exactly once and can never bounce back.
 Two failure classes are handled differently, because they mean different
 things:
 
-* **functional** — non-zero exit, no `turn.completed`, a reply other than `1`,
-  or reasoning tokens above zero: the attempt is handed to the counterpart
-  transport;
-* **cost regression** — the run succeeded but reports more than the measured
-  profile (`QUOTA_SENTINEL_CODEX_INPUT_CEILING`, default 2500 input, or 50
-  output): the attempt is still delivered (by Pi), logged as
-  `result=cost-regression`, and **not** recorded as a verified profile, so the
-  next cycle tests again instead of trusting a regression.
+* **functional** — non-zero exit, no `turn.completed` event, a completion whose
+  usage reports no input tokens at all (`usage=unverified`), a reply other than
+  `1`, or reasoning tokens above zero: nothing was verified as delivered, so the
+  attempt is handed to the counterpart transport;
+* **cost regression** — the turn replied `1`, has no functional problem, and
+  reports more than the measured profile (`QUOTA_SENTINEL_CODEX_INPUT_CEILING`,
+  default 2500 input, or `QUOTA_SENTINEL_CODEX_OUTPUT_CEILING`, default 50
+  output): it is **accepted** as a success, because the message was already
+  delivered and the window already anchored. Re-delivering the same attempt
+  through Pi would spend more quota for a fact that is already true, and a Pi
+  failure on top would turn a delivered message into a reported failure that the
+  scheduler then retries — spending a third time. The turn is logged as
+  `result=cost-regression` with a warning and is **not** recorded as a verified
+  profile, so the ceiling stays an operator alarm that re-fires on every attempt
+  until the profile is fixed.
 
 The profile is one canonical list (`PROFILE_OVERRIDES`, `PROFILE_DISABLED_FEATURES`)
 whose hash is stored next to the state; a CLI version change *or* a profile edit
@@ -507,10 +517,15 @@ QUOTA_SENTINEL_TRANSPORT="codex=codex" quota-sentinel run codex   # official CLI
 
 ## The agy transport (official Antigravity CLI)
 
-Antigravity's five-hour window is anchored by the first real request in it — a
-read-only `/usage` probe costs 0 tokens and does **not** anchor anything — so the
-provider needs one model turn per window cycle. Antigravity therefore ships the
-opposite priority to codex: **`agy` first, Pi as its one-hop fallback.**
+Antigravity's five-hour boundary is not set by the turn this transport sends: a
+read-only `/usage` probe costs 0 tokens, and a model turn does not move the
+boundary either. Across 35 Antigravity reset-anchor movements in `logs/`
+(2026-09-23 11:23:05 → 2026-09-28 07:56:43), 19 are exactly `+5h00m00s`, and in
+the clean runs the probe reported the next boundary *before* the turn that then
+reproduced it unchanged — so the deadline never depends on a turn of ours. The
+full measurement, its counter-examples and what still needs live verification
+are in **Probe-only providers**. Antigravity therefore ships the opposite
+priority to codex: **`agy` first, Pi as its one-hop fallback.**
 
 `agy` is an agent, and a stock turn carries its scaffolding. Measured on
 2026-09-27 against agy 1.2.12, model `gemini-3.8-flash-low`, `--effort low`:
@@ -539,16 +554,27 @@ answered by the CLI itself (measured `input_tokens` 0, `num_turns` 0):
   ~40x the cost, and the input ceiling would catch that only after paying for it;
 * **transient handshake** — `Eligibility check failed` happens before a turn
   starts and costs nothing (six in a row were observed during one burst), so it
-  is retried instead of being reported as a delivery failure.
+  is retried instead of being reported as a delivery failure. The retry is
+  narrow on purpose: the marker must come from the **current turn's own** stderr
+  (the file is read from the byte offset where that turn started, so an old
+  marker is never read again) *and* that turn must have reported no tokens at
+  all. A turn that reported tokens was a real turn, not a handshake, and is
+  never replayed for free.
 
 Failure classes are the codex transport's, with one measured deviation:
 `--effort low` leaves thinking to the model's discretion (identical invocations
 measured 0 and 34 thinking tokens), so thinking is *reported* and not *policed*.
-What proves the profile is intact is the **input** side, which is structural. A
-functional failure (non-zero exit, a non-`SUCCESS` status, a reply that is not
-`1`, a missing agent) or a cost regression (input ≥
+What proves the profile is intact is the **input** side, which is structural.
+A functional failure (non-zero exit, a non-`SUCCESS` status, a reply that is not
+`1`, a missing agent, or a `SUCCESS` turn whose usage cannot show
+`input_tokens ≥ 1`) hands the attempt to Pi — the input count is the only proof
+that the 564-token minimal profile and not the 22,311-token stock agent
+answered, and a missing reading cannot be turned into a zero: an unverifiable
+ignition is a functional failure, not a free one. A cost regression (input ≥
 `QUOTA_SENTINEL_AGY_INPUT_CEILING`, default 1500, or a runaway reply ≥
-`QUOTA_SENTINEL_AGY_OUTPUT_CEILING`, default 200) hands the attempt to Pi.
+`QUOTA_SENTINEL_AGY_OUTPUT_CEILING`, default 200) with no functional problem is
+**accepted** exactly as the codex one is: delivered, logged as
+`cost-regression`, and not recorded as a verified profile.
 
 ```bash
 QUOTA_SENTINEL_TRANSPORT="antigravity=agy" quota-sentinel run antigravity  # agy primary (shipped)
@@ -573,21 +599,65 @@ probe-only provider:
   observed reset with the same `reset + 4m` arithmetic a run would have
   produced, so removing the switch lands on exactly the deadline the provider
   would have had;
-- is never executed: it cannot enter a run roster and its retry debt is cleared
-  rather than repaid, because a provider that cannot run can never repay it;
+- is never executed: `check` — timer tick and watchdog alike — skips it, it
+  cannot enter a run roster, and its retry debt is cleared rather than repaid,
+  because a provider that cannot run can never repay it;
 - never enters a task card, because there was no delivery to report.
+
+The `run` verb has two shapes and both are explicit. Naming a probe-only
+provider on the command line — `quota-sentinel run antigravity` with
+`QUOTA_SENTINEL_PROBE_ONLY=antigravity` — is **refused before any attempt**: the
+run lock is not taken, no probe runs and no token is spent, the CLI reports
+`invalid argument: probe-only provider(s) cannot be run: …` and exits 3. The
+default whole-roster `run` (no explicit target) instead drops probe-only
+providers from the roster, logs the omission, and sends a card for the
+providers that actually ran — a switched-off provider is never carded for a
+delivery nobody made. Unsetting `QUOTA_SENTINEL_PROBE_ONLY` restores the
+previous behaviour exactly.
 
 Nothing is deleted to make this work: the transport, its roster entry and its
 tests stay in place, and the deadline is kept strictly in the future so neither
 the precision timer nor the watchdog grid can spin on a matured deadline.
 
-Why Antigravity is the first candidate: every Antigravity reset-anchor
-transition in the run logs is exactly `+5h00m00s` — 12 of 12 over two days —
-and independent of when the trigger actually ran (the 2026-09-27 14:08:24 ping
-produced `18:45:18`, not `19:08:24`), while Codex is usage-anchored (the
-14:08:17 ping produced exactly `19:08:17`). The Antigravity 5-hour window is
-therefore a fixed grid that no message can start, and the native
-`agy -p /usage` tier already supplies its numbers for free.
+Why Antigravity is the first candidate: the boundary it reports does not track
+our turns. Measured over the same 35 reset-anchor movements as above
+(2026-09-23 11:23:05 → 2026-09-28 07:56:43), 19 are exactly `+5h00m00s`, and in
+the clean runs the boundary was already in place before the turn that was
+supposed to set it:
+
+* 2026-09-23 11:21:49 — the probe reports the next boundary `16:17:39` while the
+  current window is still on `11:17:39`; the 11:22:56 turn then produces the
+  same `16:17:39`. Four more turns that day reproduce `+5h00m00s` from a
+  boundary they did not set (observations 16:22:06, 21:30:25, 02:22:28,
+  07:22:19), holding the phase at `:17:39` while the observation time drifts by
+  minutes;
+* 2026-09-27 14:08:12 — the probe reports `18:45:18`; the 14:08:24 turn produces
+  `18:45:18` again, not `19:08:24`. Codex is the contrast in the same tick: its
+  14:08:17 turn produced exactly `19:08:17`, five hours after the turn.
+
+The counter-examples are real and are not messages. Three long jumps
+(`+7h27m25s` on 2026-09-24 14:45:52, `+8h30m00s` on 2026-09-25 09:15:24,
+`+7h30m14s` on 2026-09-26 09:11:11) install a **new** phase after a long gap in
+observations — the 2026-09-26 09:11:11 tick moved codex (`+7h18m14s`), opencode
+(`+8h00m35s`) and clinepass (`+8h00m34s`) in the same second, so it is a
+machine-wake artefact, not a trigger. And on 2026-09-27 19:30:17 → 22:00:16 the
+boundary moved 13 times in steps of `+0h00m49s` … `+0h44m57s`, each new value
+landing 2–9 seconds before that tick's own clock plus five hours, on both the
+`native` and `codexbar-live` tiers — with the provider probe-only, 37
+`trigger disabled (probe-only): not executed` lines that day and no Antigravity
+model turn between 14:08:24 and 23:14:47.
+
+So the settled position is: **the boundary is provider-side, and no message this
+scheduler sends starts or moves it.** `reanchor_probe_only` derives the deadline
+from the reported reset, which does not depend on a turn of ours, so switching
+the trigger off cannot strand the schedule: what the switch costs is the
+delivery and its card, not the boundary and not the deadline. What the
+repository cannot settle, and a live check has to: whether the provider's rule
+is a strict grid or a relative "5 h from now" answer whenever no window is open
+(both fit the log), what caused the three phase shifts after wake gaps, and
+whether any read — or an external session — can open a window. Until then the
+`+5h00m00s` steps are the measured shape of the boundary, not a proof of its
+mechanism.
 
 ## Run Log (`logs/`)
 

@@ -450,6 +450,26 @@ never moving the anchor, and require two stable far observations before
 promotion. The anchor is what closes the cumulative-near-movement loophole: a
 sequence of individually-small movements cannot walk the deadline forward.
 
+That anchor is OUR bookkeeping of a generation's boundary, not a claim about what
+opens the provider's window. Measured on Antigravity, the reported boundary does
+not track our turns: across 35 reset-anchor movements in `logs/` (2026-09-23
+11:23:05 → 2026-09-28 07:56:43), 19 are exactly `+5h00m00s`, and in the clean
+runs the probe reported the next boundary *before* the turn that then reproduced
+it unchanged. The boundary is therefore provider-side, which is what lets
+`reanchor_probe_only` hold a correct deadline for a provider whose model trigger
+is switched off; the provider's exact rule still needs a live check
+(README, **Probe-only providers**, carries the measurement and its
+counter-examples).
+
+A probe-only provider (`QUOTA_SENTINEL_PROBE_ONLY`) is the one case where the
+deadline is deliberately not the product of a run: `check` skips it, clears
+retry debt it could never repay and follows the observed reset instead of a
+committed obligation, while `run` either refuses an explicitly named probe-only
+provider (a typed CLI error, exit 3, before the run lock) or drops it from the
+default whole-roster run and logs the omission. The transport, the roster entry
+and the tests stay in place, so unsetting the variable restores the previous
+behaviour exactly.
+
 Transitions exist as first-class values, each individually proven:
 `begin_attempt`, `record_attempt`, `commit_success`, `record_last_window`,
 `sync_deadline` (7 branches), `evaluate_due`, `retry_blocked`.
@@ -577,11 +597,16 @@ plus `turn.completed` usage) instead of reading a log format, so every attempt
 writes its own cost into the run log.
 
 Two failure classes are separated on purpose. A **functional** failure (non-zero
-exit, no completion event, a reply that is not `1`, reasoning tokens above zero)
-and a **cost regression** (the run succeeded but the profile no longer applies —
-a renamed feature flag, or a server-side metadata change) both fall back to Pi,
-and the second one is announced with its measured numbers. A regression is never
-recorded as a verified profile, so the next attempt tests again. The
+exit, no completion event, a completion whose usage reports no input tokens, a
+reply that is not `1`, reasoning tokens above zero) falls back to Pi: nothing was
+verified as delivered. A **cost regression** (the turn replied `1`, has no
+functional problem, and the profile no longer applies — a renamed feature flag,
+or a server-side metadata change) is **accepted**, not handed over: the message
+was already delivered and the window already anchored, so re-delivering the same
+attempt through Pi would spend more quota for a fact that is already true, and a
+Pi failure on top would turn a delivered message into a reported failure the
+scheduler then retries. The regression is announced with its measured numbers and
+is never recorded as a verified profile, so the next attempt tests again. The
 `CODEX_EXEC_PROFILE` fingerprint covers the local half of "did the profile
 change"; the per-attempt token ceilings cover the half nobody can see.
 
@@ -602,7 +627,14 @@ by the CLI itself (`input_tokens` 0, `num_turns` 0): `agy -p /agents` confirms
 the agent resolves *before* the turn (an unresolvable `--agent` silently falls
 back to the default agent at ~40x, which the input ceiling would catch only after
 paying for it), and the pre-turn `Eligibility check failed` handshake is retried
-rather than reported as a delivery failure. Thinking tokens are reported and not
+rather than reported as a delivery failure — but only when the marker is in the
+CURRENT turn's own stderr *and* that turn reported no tokens, because a turn that
+spent tokens is a real turn and is never replayed for free. A `SUCCESS` turn that
+cannot show `input_tokens >= 1` is functional, not free: the input count is the
+only structural proof that the 564-token profile and not the 22,311-token stock
+agent answered, and the ceiling cannot be evaluated without it. A cost regression
+with no functional problem is accepted and logged, exactly as on the codex
+transport. Thinking tokens are reported and not
 policed — at `--effort low` the model decides (0 and 34 were both measured on
 identical input), so the integrity signal is the structural input side. This
 transport writes no quota snapshot: the Pi capture file is normalized as a *Pi*
