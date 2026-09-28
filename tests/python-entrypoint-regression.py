@@ -17,7 +17,9 @@ What is pinned here:
   E9  the installed LaunchAgents invoke Python only — no shell anywhere;
   E10 the entrypoint works from launchd's foreign working directory, offline;
   E11 the runtime import graph stays stdlib-only on the system interpreter,
-      which is what keeps `requires-python = ">=3.9"` honest.
+      which is what keeps `requires-python = ">=3.9"` honest;
+  E12 a transport override the chosen transport cannot serve is an argument
+      error (exit 3), refused before any state, lock or model work.
 """
 from __future__ import annotations
 
@@ -303,6 +305,109 @@ class EntrypointCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "third=",
                          "the runtime graph gained a third-party import")
+
+    # ---- E12: a bad transport override is refused before any work ---------
+    def test_e12_unservable_transport_override_is_refused_up_front(self):
+        """`opencode=agy` must be an argument error, not a mid-run abort.
+
+        The pair used to be accepted here and refused later by
+        ``AgyExecRunner.prepare`` — after the operator had committed to the run
+        — so every verb that builds the runtime has to hit the refusal first,
+        report it as one operator-facing line and exit 3 without touching the
+        state, the locks or a model.
+        """
+        for verb in (("status",), ("run", "opencode"), ("check",)):
+            with self.subTest(verb=verb):
+                result = self.cli(*verb, env={
+                    "QUOTA_SENTINEL_TRANSPORT": "opencode=agy",
+                })
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("invalid argument", result.stderr)
+                self.assertIn("'opencode'", result.stderr)
+                self.assertIn("'agy'", result.stderr)
+                self.assertIn("direct, pi", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.capture.exists(), "a model was started anyway")
+        self.assertIsNone(self.store().load("opencode").last_task_at)
+
+    def test_e12b_unknown_names_are_still_ignored(self):
+        """The documented tolerance survives: unknown != unservable."""
+        result = self.cli("status", env={
+            "QUOTA_SENTINEL_TRANSPORT": "nosuch=agy,opencode=nosuch,=agy",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "ready")
+
+
+class TransportOverrideTest(unittest.TestCase):
+    """DEFECT 2 at the configuration entry: no CLI, no state, no I/O.
+
+    The capability sets are read from the channels themselves (the runners
+    declare the provider they serve), so this pins both halves: an unservable
+    pair is refused with an actionable message, and the pairs a channel declares
+    for itself are accepted, while names that are simply unknown stay ignored.
+    """
+
+    def mapping(self, value: str):
+        from quota_sentinel.runtime.factory import provider_transports
+        return provider_transports({"QUOTA_SENTINEL_TRANSPORT": value})
+
+    def test_unservable_pairs_are_refused_with_their_real_options(self):
+        for value, provider, transport, supported in (
+            ("opencode=agy", "opencode", "agy", "direct, pi"),
+            ("codex=agy", "codex", "agy", "codex, pi"),
+            ("antigravity=codex", "antigravity", "codex", "agy, pi"),
+            ("clinepass=codex", "clinepass", "codex", "direct, pi"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as caught:
+                    self.mapping(value)
+                message = str(caught.exception)
+                self.assertIn(repr(provider), message)
+                self.assertIn(repr(transport), message)
+                self.assertIn(supported, message)
+
+    def test_servable_pairs_are_accepted(self):
+        for value, provider, transport in (
+            ("opencode=direct", "opencode", "direct"),
+            ("codex=codex", "codex", "codex"),
+            ("antigravity=agy", "antigravity", "agy"),
+            ("codex=pi", "codex", "pi"),
+            ("antigravity=pi", "antigravity", "pi"),
+            ("opencode=pi", "opencode", "pi"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self.mapping(value)[provider], transport)
+
+    def test_unknown_provider_and_unknown_transport_stay_ignored(self):
+        from quota_sentinel.runtime.factory import provider_transports
+        default = provider_transports({})
+        for value in ("nosuch=agy", "opencode=nosuch", "opencode", "=agy", " "):
+            with self.subTest(value=value):
+                self.assertEqual(self.mapping(value), default)
+
+    def test_the_capability_map_comes_from_the_channels_themselves(self):
+        """A channel must be able to serve the provider it ships for.
+
+        The map is built from `CODEX_PROVIDER`, `AGY_PROVIDER` and
+        `DIRECT_PROVIDERS`; this is the guard that catches a new channel (or a
+        renamed provider constant) that forgets to declare itself, which would
+        otherwise make the shipped default look unservable.
+        """
+        from quota_sentinel.runtime.agy_exec import AGY_PROVIDER
+        from quota_sentinel.runtime.codex_exec import CODEX_PROVIDER
+        from quota_sentinel.runtime.direct import DIRECT_PROVIDERS
+        from quota_sentinel.runtime.factory import (
+            TRANSPORTS, TRANSPORT_PROVIDERS, supported_transports, transport_for,
+        )
+
+        self.assertEqual(sorted(TRANSPORT_PROVIDERS), sorted(TRANSPORTS))
+        self.assertEqual(TRANSPORT_PROVIDERS["codex"], frozenset({CODEX_PROVIDER}))
+        self.assertEqual(TRANSPORT_PROVIDERS["agy"], frozenset({AGY_PROVIDER}))
+        self.assertEqual(TRANSPORT_PROVIDERS["direct"], frozenset(DIRECT_PROVIDERS))
+        for provider in PROVIDERS:
+            self.assertIn(transport_for(provider), supported_transports(provider))
+            self.assertIn("pi", supported_transports(provider))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,9 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import (
+    Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence,
+)
 
 from quota_sentinel.app import AppConfig, Application
 from quota_sentinel.quota.adapters import PROVIDERS, adapter_for
@@ -27,8 +29,12 @@ from quota_sentinel.runtime.cards import (
     format_reset_time, render_progress_test_card, render_task_card,
     render_usage_card,
 )
-from quota_sentinel.runtime.agy_exec import AgyExecConfig, AgyExecRunner
-from quota_sentinel.runtime.codex_exec import CodexExecConfig, CodexExecRunner
+from quota_sentinel.runtime.agy_exec import (
+    AGY_PROVIDER, AgyExecConfig, AgyExecRunner,
+)
+from quota_sentinel.runtime.codex_exec import (
+    CODEX_PROVIDER, CodexExecConfig, CodexExecRunner,
+)
 from quota_sentinel.runtime.direct import (
     DIRECT_PROVIDERS, DIRECT_TIMEOUT_SECONDS, DirectRunner,
 )
@@ -48,6 +54,22 @@ DRY_RUN_ENV = "FEISHU_DRY_RUN"
 TRANSPORT_ENV = "QUOTA_SENTINEL_TRANSPORT"
 DEFAULT_CURL_BIN = Path("/usr/bin/curl")
 TRANSPORTS = ("pi", "direct", "codex", "agy")
+
+# Which providers each transport can actually SERVE — the capability the
+# runners themselves declare, read here instead of re-typed:
+#   * `pi` is the universal fallback and serves the whole roster;
+#   * `direct` serves exactly the providers in its own roster;
+#   * the codex CLI serves only CODEX_PROVIDER, the agy CLI only AGY_PROVIDER
+#     (both refuse anything else in `prepare`/`run`).
+# This map exists so an operator override can be refused at the configuration
+# entry instead of aborting a run that has already started: the mismatch would
+# otherwise surface as a `ValueError` from the runner mid-burst.
+TRANSPORT_PROVIDERS: Dict[str, FrozenSet[str]] = {
+    "pi": frozenset(PROVIDERS),
+    "direct": frozenset(DIRECT_PROVIDERS),
+    "codex": frozenset({CODEX_PROVIDER}),
+    "agy": frozenset({AGY_PROVIDER}),
+}
 
 
 class NotReadyError(RuntimeError):
@@ -164,22 +186,53 @@ def transport_for(provider: str) -> str:
     return adapter_for(provider).transport
 
 
+def supported_transports(provider: str) -> List[str]:
+    """The transports that can actually deliver `provider`, sorted.
+
+    Read from ``TRANSPORT_PROVIDERS``, so this answer and the refusal below can
+    never disagree with what the runners themselves accept.
+    """
+    return sorted(
+        name for name in TRANSPORTS if provider in TRANSPORT_PROVIDERS[name]
+    )
+
+
 def provider_transports(environment: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     """The declared transports, with an operator override for A/B runs.
 
     ``QUOTA_SENTINEL_TRANSPORT="opencode=pi"`` (comma-separated) moves one
     provider back onto the Pi agent without editing code, so a transport change
     can be compared against the path it replaced and reverted by unsetting one
-    variable. Unknown providers and unknown transports are ignored rather than
-    fatal: this is a diagnostic seam, not a configuration file.
+    variable.
+
+    TOLERANCE, and its limit. A name that is simply unknown — a provider that
+    is not in the roster, a transport that does not exist — is ignored rather
+    than fatal: this is a diagnostic seam, not a configuration file, and a
+    half-typed line must not take a scheduler tick down. A pair whose two names
+    are both real but that the chosen transport cannot serve is a different
+    thing entirely: ``opencode=agy`` would be accepted here and then abort the
+    whole run from ``AgyExecRunner.prepare`` once the operator had already
+    committed to it, so it is refused NOW, at the configuration entry, before
+    any state, lock, credential or model work. The refusal names the provider,
+    the rejected transport and the transports that would work instead.
     """
     env = _env(environment)
     mapping = {provider: transport_for(provider) for provider in PROVIDERS}
     for item in env.get(TRANSPORT_ENV, "").split(","):
         provider, separator, transport = item.partition("=")
         provider, transport = provider.strip(), transport.strip()
-        if separator and provider in mapping and transport in TRANSPORTS:
-            mapping[provider] = transport
+        if not separator or provider not in mapping or transport not in TRANSPORTS:
+            # Unknown provider or unknown transport: documented as ignored.
+            continue
+        if provider not in TRANSPORT_PROVIDERS[transport]:
+            raise ValueError(
+                "provider %r does not run on the %r transport, which serves "
+                "only: %s; %s supports: %s"
+                % (provider, transport,
+                   ", ".join(sorted(TRANSPORT_PROVIDERS[transport])) or "nothing",
+                   provider, ", ".join(supported_transports(provider)) or "nothing")
+            )
+        mapping[provider] = transport
     return mapping
 
 
@@ -192,6 +245,12 @@ def create_application(
 ) -> Application:
     env = _env(environment)
     state_dir = Path(state_dir)
+    # FIRST, before any config object, runner, workspace or state work: an
+    # override that names a transport which cannot serve the provider is a
+    # configuration error, and it must be reported as one (the CLI turns the
+    # ValueError into `quota_sentinel: invalid argument: ...`, exit 3) instead
+    # of aborting a run after the operator committed to it.
+    transports = provider_transports(env)
     options = quota_probe_options(env)
     logger = logging.getLogger("quota_sentinel.model").info
     # Two transports, one surface. The Pi runner's per-attempt lines carry
@@ -246,7 +305,7 @@ def create_application(
     runner = TransportRouter(
         {"pi": pi_runner, "direct": direct_runner, "codex": codex_runner,
          "agy": agy_runner},
-        provider_transports(env),
+        transports,
     )
     notifier = create_notifier(environment=env, dry_run_flag=dry_run_flag)
 
