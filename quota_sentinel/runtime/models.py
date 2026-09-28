@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+
+__all__ = [
+    "PI_AUTH_TIMEOUT_SECONDS",
+    "AttemptResult",
+    "ModelRunner",
+    "ModelRunnerConfig",
+    "PreparedPaths",
+]
 
 
 def _env_value(env: Mapping[str, str], key: str, default: str) -> str:
@@ -29,6 +40,29 @@ def _env_float(env: Mapping[str, str], key: str, default: float) -> float:
         return default
 
 
+def _env_positive_float(env: Mapping[str, str], key: str, default: float) -> float:
+    """``${VAR:-default}`` for a value that is used as a wall-clock bound.
+
+    Unset, empty, non-numeric, non-positive, NaN and infinite values all fall
+    back: a bound of zero, of a negative number or of infinity is not a bound,
+    and this one is what keeps the Pi credential refresh from waiting forever.
+    """
+    value = _env_float(env, key, default)
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return value
+
+
+# The Pi credential refresh -- ``pi auth print-bearer-token`` -- is a provider
+# call in its own right and runs before every codex attempt on this transport,
+# so it is bounded on its own clock. Its inner deadline is this many seconds;
+# prepare() adds a parent-side guard of ``kill_grace`` on top, which makes
+# ``auth_timeout + kill_grace`` the most one codex prepare() can legally cost.
+# The orchestrator's worst-case attempt bound reads that sum -- it takes
+# ``auth_timeout`` from the config below -- so the two move together.
+PI_AUTH_TIMEOUT_SECONDS = 30
+
+
 @dataclass
 class ModelRunnerConfig:
     pi_bin: Path
@@ -37,6 +71,11 @@ class ModelRunnerConfig:
     antigravity_provider_extension: Path
     timeout: float = 300
     kill_grace: float = 10
+    # The credential refresh runs before every codex attempt, hangs for reasons
+    # of its own (a locked keyring, a wedged network stack) and is the one call
+    # a manual `run` cannot reach an outer guard for, so it carries a bound of
+    # its own rather than sharing the attempt's.
+    auth_timeout: float = PI_AUTH_TIMEOUT_SECONDS
     environment: Optional[Mapping[str, str]] = None
     # Optional run-log seam; ``None`` keeps every existing caller silent.
     logger: Optional[Callable[[str], None]] = None
@@ -55,6 +94,9 @@ class ModelRunnerConfig:
             antigravity_provider_extension=home / ".pi/agent/npm/node_modules/pi-antigravity/src/index.ts",
             timeout=_env_float(env, "QUOTA_SENTINEL_MODEL_TIMEOUT", 300),
             kill_grace=_env_float(env, "QUOTA_SENTINEL_MODEL_KILL_GRACE", 10),
+            auth_timeout=_env_positive_float(
+                env, "QUOTA_SENTINEL_PI_AUTH_TIMEOUT", PI_AUTH_TIMEOUT_SECONDS
+            ),
             environment=environment,
         )
 
@@ -148,6 +190,101 @@ def _redact_secrets(summary: str) -> str:
     return _SHELL_SECRET_RE.sub(r"\1***", summary)
 
 
+# run_with_timeout.py's GNU-timeout convention: the helper ran the child, hit
+# its own deadline, reaped the group and reported the expiry with this code.
+_HELPER_TIMEOUT_EXIT = 124
+
+# The last-resort reap reads the process table once; `ps` is bounded too, so a
+# wedged reader cannot outlive the guard it serves.
+_PROCESS_TABLE_TIMEOUT_SECONDS = 2
+
+
+def _auth_refresh_timeout_line(seconds: float) -> bytes:
+    """The one diagnostic a cut-short credential refresh leaves behind.
+
+    It carries the deadline and nothing else: never a traceback and never the
+    bearer token (which is read from the child's discarded stdout anyway).
+    """
+    return (
+        "Pi auth refresh timed out after %gs; continuing without a fresh credential\n"
+        % seconds
+    ).encode()
+
+
+def _sigkill(pid: int) -> None:
+    """SIGKILL one process, and the group it leads when it leads one.
+
+    The refresh helper gives its child its own session, so a survivor is a
+    group leader whose group is exactly the tree below it -- signalling that
+    group is what reaches grandchildren the walk has not named. The helper's
+    own fail-safe is repeated here: never signal this process's group, even if
+    a victim is reported to share it.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return
+    if pgid == pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _process_descendants(root: int) -> list[int]:
+    """Every live process below ``root``, parents before children.
+
+    ``ps`` is the portable process-table reader on both targets; a table that
+    cannot be read (or holds nothing) only means the guard below has nothing
+    extra to name, never an exception out of prepare(). The read is bounded like
+    every other external process here: a wedged ``ps`` must not turn a
+    last-resort reap into the very hang it exists to end.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True,
+            check=False, timeout=_PROCESS_TABLE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, ppid = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    found: list[int] = []
+    queue = [root]
+    while queue:
+        for child in children.get(queue.pop(0), ()):
+            found.append(child)
+            queue.append(child)
+    return found
+
+
+def _reap_wedged_helper(pid: int) -> None:
+    """Last resort for a refresh helper that outlived its own deadline.
+
+    The parent-side guard is a real last resort, so it cannot assume the helper
+    is alive enough to escalate for itself, and it cannot signal the helper's
+    group either: the helper puts the refresh child in a session of its own.
+    The tree is therefore read from the process table first, killed
+    deepest-first, and the helper is signalled last so nothing is reparented
+    before it is named.
+    """
+    for survivor in reversed(_process_descendants(pid)):
+        _sigkill(survivor)
+    _sigkill(pid)
+
+
 class ModelRunner:
     """The Pi transport.
 
@@ -210,13 +347,13 @@ class ModelRunner:
             # Pi may refresh OAuth here. Its bearer token must never enter a log.
             with open(os.devnull, "wb") as discard, _open_private(paths.stderr_path) as stderr:
                 try:
-                    subprocess.run(
-                        [str(self.config.pi_bin), "auth", "print-bearer-token", "--provider", "openai-codex"],
-                        stdout=discard,
-                        stderr=stderr,
-                        env=self._base_environment(),
-                        check=False,
-                    )
+                    self._refresh_pi_credentials(discard, stderr)
+                except subprocess.TimeoutExpired:
+                    # The parent-side guard fired, so the helper itself wedged
+                    # and the refresh has been cut short. That stays non-fatal,
+                    # exactly like the refresh's own timeout: one diagnosable
+                    # line, then the credential already on disk is copied.
+                    stderr.write(_auth_refresh_timeout_line(self.config.auth_timeout))
                 except OSError as exc:
                     stderr.write(f"Pi auth refresh could not start: {exc.strerror or type(exc).__name__}\n".encode())
         try:
@@ -236,6 +373,69 @@ class ModelRunner:
             dest.write(settings.encode())
         self._prepared[(provider, workspace)] = paths
         return paths
+
+    def _refresh_pi_credentials(self, discard, stderr) -> None:
+        """Run the Pi credential refresh under the shared timeout helper.
+
+        The refresh is the one provider call this module makes outside an
+        attempt, and it used to run with no bound at all: a ``pi`` waiting on a
+        locked keyring or a wedged network stack blocked prepare(), and with it
+        every codex attempt -- including a manual ``run``, which has no outer
+        guard to be rescued by. ``run_with_timeout.py`` gives the child a
+        session of its own, SIGTERMs the whole group at ``auth_timeout``,
+        escalates to SIGKILL after ``kill_grace`` and reaps it; the parent-side
+        guard at ``auth_timeout + kill_grace`` repeats that deadline as a real
+        last resort, and is the legal cost of one codex prepare() that the
+        orchestrator's worst-case bound is built from.
+
+        A refresh that is cut short is not an error for this call site: the
+        caller reports the one bounded line and the attempt continues with the
+        credential already on disk. The bearer token is never read -- the
+        child's stdout is discarded, exactly as before.
+        """
+        helper = Path(self.config.repo_dir) / "run_with_timeout.py"
+        command = [
+            sys.executable, str(helper),
+            "--timeout", str(self.config.auth_timeout),
+            "--kill-grace", str(self.config.kill_grace),
+            "--", str(self.config.pi_bin), "auth", "print-bearer-token",
+            "--provider", "openai-codex",
+        ]
+        guard = self.config.auth_timeout + self.config.kill_grace
+        # The helper's stderr is captured, not inherited: on either expiry path
+        # the prepared stderr file must carry exactly one line, and on every
+        # other path the bytes are copied through unchanged below, so the
+        # child's own diagnostics still land where a direct invocation put
+        # them. The capture is a private temporary file rather than a pipe: a
+        # child that leaked a background process holding stderr could stall a
+        # pipe read, while nothing here reads until the helper is gone.
+        with tempfile.TemporaryFile() as captured:
+            with subprocess.Popen(
+                command,
+                stdout=discard,
+                stderr=captured,
+                env=self._base_environment(),
+            ) as process:
+                try:
+                    process.wait(timeout=guard)
+                except subprocess.TimeoutExpired:
+                    # The helper wedged before it could escalate, so the guard
+                    # reaps the tree here; the caller writes the single line.
+                    _reap_wedged_helper(process.pid)
+                    process.kill()
+                    process.wait()
+                    raise
+            if process.returncode == _HELPER_TIMEOUT_EXIT:
+                # The helper timed out and reaped the group itself; its own
+                # diagnostics are replaced by the one line the caller's
+                # contract promises, so the file never grows two lines about a
+                # single expiry.
+                stderr.write(_auth_refresh_timeout_line(self.config.auth_timeout))
+                return
+            captured.seek(0)
+            captured_bytes = captured.read()
+        if captured_bytes:
+            stderr.write(captured_bytes)
 
     def _command(self, provider: str) -> list[str]:
         pi_provider, model, thinking, _ = _PI_PROVIDER[provider]

@@ -7,16 +7,23 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from quota_sentinel.runtime.models import ModelRunner, ModelRunnerConfig
+from quota_sentinel.runtime.models import (
+    PI_AUTH_TIMEOUT_SECONDS,
+    ModelRunner,
+    ModelRunnerConfig,
+    PreparedPaths,
+)
 
 
 class _ReadCounter:
@@ -516,6 +523,243 @@ class ModelRunnerTests(unittest.TestCase):
         result = runner.run("codex", self.workspace, "initial", 1, 3)
         self.assertTrue(result.success)
         self.assertIn("reason=timeout", " ".join(lines))
+
+
+class PiAuthRefreshBoundTests(unittest.TestCase):
+    """The codex credential refresh is bounded, and it stays non-fatal.
+
+    ``prepare("codex")`` runs ``pi auth print-bearer-token`` before every codex
+    attempt. That call used to have no timeout at all, so a wedged ``pi`` (a
+    locked keyring, a hung network stack) blocked prepare() -- and with it every
+    codex attempt, including a manual ``run``, which has no outer guard to be
+    rescued by. The refresh now runs under the repo's ``run_with_timeout.py``
+    with an inner deadline of ``auth_timeout``, plus a parent-side guard of
+    ``auth_timeout + kill_grace``; both paths leave exactly one diagnosable line
+    in the prepared stderr file and then continue to the auth copy.
+    """
+
+    AUTH_TIMEOUT = 1.0
+    KILL_GRACE = 0.2
+
+    # A refresh that never answers and will not be asked politely: SIGTERM is
+    # ignored, so only the SIGKILL escalation can end it, and the child it
+    # leaves behind can only be reached through the process group.
+    HANGING_PI = """\
+    import json, os, signal, subprocess, sys, time
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(os.environ['QS_CAPTURE_PATH'], 'a') as out:
+        out.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')
+    grandchild = subprocess.Popen(
+        [sys.executable, '-c',
+         'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)'])
+    with open(os.environ['QS_GRANDCHILD_PID'], 'w') as out:
+        out.write(str(grandchild.pid))
+    # The bearer token goes to stdout, which this call discards: it must never
+    # turn up in the prepared stderr file.
+    print('secret-bearer-token')
+    sys.stdout.flush()
+    while True:
+        time.sleep(0.05)
+    """
+
+    FAST_PI = """\
+    import json, os, sys
+    with open(os.environ['QS_CAPTURE_PATH'], 'a') as out:
+        out.write(json.dumps({'argv': sys.argv[1:],
+                              'env': {key: os.environ.get(key) for key in (
+                                  'PI_OFFLINE', 'PI_CODEX_QUOTA_FILE')}}) + '\\n')
+    print('secret-bearer-token')
+    sys.exit(0)
+    """
+
+    CHATTY_PI = """\
+    import os, sys
+    with open(os.environ['QS_CAPTURE_PATH'], 'a') as out:
+        out.write('call\\n')
+    print('pi: refreshed the bearer token', file=sys.stderr)
+    sys.exit(0)
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="quota-sentinel-auth-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.workspace = self.root / "work"
+        self.auth = self.root / "auth.json"
+        self.auth.write_text('{"openai-codex":{"token":"secret-auth"}}')
+        self.auth.chmod(0o600)
+        self.capture = self.root / "calls.jsonl"
+        self.grandchild_pid = self.root / "grandchild.pid"
+
+    def _fake_pi(self, template: str) -> Path:
+        path = self.root / "pi"
+        path.write_text("#!" + sys.executable + "\n" + textwrap.dedent(template))
+        path.chmod(0o755)
+        return path
+
+    def _config(self, pi: Path) -> ModelRunnerConfig:
+        return ModelRunnerConfig(
+            pi_bin=pi,
+            auth_file=self.auth,
+            repo_dir=REPO,
+            antigravity_provider_extension=self.root / "antigravity-provider.ts",
+            timeout=5,
+            kill_grace=self.KILL_GRACE,
+            auth_timeout=self.AUTH_TIMEOUT,
+            environment={
+                "QS_CAPTURE_PATH": str(self.capture),
+                "QS_GRANDCHILD_PID": str(self.grandchild_pid),
+            },
+        )
+
+    def _runner(self, pi: Path) -> ModelRunner:
+        return ModelRunner(self._config(pi))
+
+    def _calls(self) -> list:
+        if not self.capture.exists():
+            return []
+        return [json.loads(line) for line in self.capture.read_text().splitlines()]
+
+    def _lines(self, paths: PreparedPaths) -> list:
+        return paths.stderr_path.read_text().splitlines()
+
+    def _survivors(self, pattern: str) -> list:
+        """`pgrep -f`: everything still carrying the fixture's path."""
+        listed = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+        return listed.stdout.split()
+
+    def _wait_until_gone(self, pattern: str, timeout: float = 2.0) -> list:
+        deadline = time.monotonic() + timeout
+        while True:
+            survivors = self._survivors(pattern)
+            if not survivors or time.monotonic() >= deadline:
+                return survivors
+            time.sleep(0.05)
+
+    def _assert_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                self.fail("process %d survived the bounded refresh" % pid)
+            time.sleep(0.05)
+
+    def test_a_hanging_pi_is_bounded_and_leaves_one_diagnosable_line(self) -> None:
+        """prepare() returns on its own deadline instead of blocking forever."""
+        pi = self._fake_pi(self.HANGING_PI)
+        started = time.monotonic()
+        paths = self._runner(pi).prepare("codex", self.workspace)
+        elapsed = time.monotonic() - started
+        # The refresh really was waited for (its deadline cannot fire early) and
+        # the call came back within the legal cost of one prepare(): the inner
+        # deadline plus the guard, plus the guard's own tree reap -- one process
+        # table read -- whenever the guard is the path that has to escalate.
+        self.assertGreaterEqual(elapsed, self.AUTH_TIMEOUT)
+        self.assertLess(elapsed, self.AUTH_TIMEOUT + self.KILL_GRACE + 1.0)
+        # Exactly one line, never a traceback, and never the bearer token that
+        # the fixture printed on the stdout this call discards.
+        lines = self._lines(paths)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Pi auth refresh timed out after 1s", lines[0])
+        self.assertIn("continuing without a fresh credential", lines[0])
+        self.assertNotIn("secret-bearer-token", lines[0])
+        # The refreshing command is unchanged...
+        self.assertEqual(self._calls(), [
+            {"argv": ["auth", "print-bearer-token", "--provider", "openai-codex"]},
+        ])
+        # ...and a cut-short refresh is not fatal: the credential already on
+        # disk is copied and the provider settings are written as usual.
+        self.assertEqual((paths.agent_dir / "auth.json").read_bytes(), self.auth.read_bytes())
+        self.assertEqual((paths.agent_dir / "settings.json").read_text(), '{"transport":"sse"}\n')
+
+    def test_the_bounded_refresh_leaves_no_orphan_behind(self) -> None:
+        """A fixture that ignores SIGTERM can only end through the SIGKILL."""
+        pi = self._fake_pi(self.HANGING_PI)
+        paths = self._runner(pi).prepare("codex", self.workspace)
+        self.assertEqual(len(self._lines(paths)), 1)
+        # The fake pi is gone shortly after the call returns...
+        self.assertEqual(self._wait_until_gone(str(pi)), [])
+        # ...and so is the child it spawned: the group was reaped, not merely
+        # the one process this call happened to know about.
+        self._assert_gone(int(self.grandchild_pid.read_text()))
+
+    def test_a_well_behaved_pi_still_refreshes_without_a_new_stderr_line(self) -> None:
+        pi = self._fake_pi(self.FAST_PI)
+        paths = self._runner(pi).prepare("codex", self.workspace)
+        call = self._calls()[0]
+        self.assertEqual(call["argv"], ["auth", "print-bearer-token", "--provider", "openai-codex"])
+        # The bound did not move the refresh: it still runs in the base
+        # environment, with no quota file and no offline flag of its own.
+        self.assertIsNone(call["env"]["PI_OFFLINE"])
+        self.assertIsNone(call["env"]["PI_CODEX_QUOTA_FILE"])
+        self.assertEqual((paths.agent_dir / "auth.json").read_bytes(), self.auth.read_bytes())
+        self.assertEqual((paths.agent_dir / "settings.json").read_text(), '{"transport":"sse"}\n')
+        # Nothing about the refresh reaches the prepared stderr file, exactly
+        # like a direct invocation that printed nothing.
+        self.assertEqual(self._lines(paths), [])
+
+    def test_a_child_diagnostic_still_reaches_the_prepared_stderr_file(self) -> None:
+        """The bound must not swallow what ``pi`` itself prints to stderr."""
+        paths = self._runner(self._fake_pi(self.CHATTY_PI)).prepare("codex", self.workspace)
+        self.assertEqual(self._lines(paths), ["pi: refreshed the bearer token"])
+
+    def test_a_pi_that_cannot_start_is_still_not_fatal(self) -> None:
+        """A refresh that never ran leaves a diagnostic, not an exception."""
+        paths = self._runner(self.root / "missing-pi").prepare("codex", self.workspace)
+        lines = self._lines(paths)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("missing-pi", lines[0])
+        self.assertNotIn("Traceback", lines[0])
+        self.assertEqual((paths.agent_dir / "auth.json").read_bytes(), self.auth.read_bytes())
+
+    def test_auth_timeout_env_is_honoured_and_unusable_values_fall_back(self) -> None:
+        import quota_sentinel.runtime.models as models
+
+        self.assertEqual(PI_AUTH_TIMEOUT_SECONDS, 30)
+        self.assertIn("PI_AUTH_TIMEOUT_SECONDS", models.__all__)
+        # The dataclass default is the module constant...
+        self.assertEqual(
+            ModelRunnerConfig(
+                pi_bin=self.root / "pi",
+                auth_file=self.auth,
+                repo_dir=REPO,
+                antigravity_provider_extension=self.root / "antigravity-provider.ts",
+            ).auth_timeout,
+            PI_AUTH_TIMEOUT_SECONDS,
+        )
+        # ...every unusable spelling falls back to it, and never raises...
+        for value in ("", "later", "0", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    ModelRunnerConfig.from_env(
+                        {"QUOTA_SENTINEL_PI_AUTH_TIMEOUT": value}
+                    ).auth_timeout,
+                    PI_AUTH_TIMEOUT_SECONDS,
+                )
+        # ...while a usable value is taken as given.
+        self.assertEqual(
+            ModelRunnerConfig.from_env({"QUOTA_SENTINEL_PI_AUTH_TIMEOUT": "2.5"}).auth_timeout,
+            2.5,
+        )
+        # A junk value must not fail the import or the run either: a runner
+        # built from that environment still prepares, and still refreshes.
+        config = ModelRunnerConfig.from_env({
+            "HOME": str(self.root),
+            "QUOTA_SENTINEL_PI_BIN": str(self._fake_pi(self.FAST_PI)),
+            "QUOTA_SENTINEL_PI_AUTH_FILE": str(self.auth),
+            "QUOTA_SENTINEL_PI_AUTH_TIMEOUT": "whenever",
+            "QUOTA_SENTINEL_MODEL_TIMEOUT": "5",
+            "QUOTA_SENTINEL_MODEL_KILL_GRACE": str(self.KILL_GRACE),
+            "QS_CAPTURE_PATH": str(self.capture),
+        })
+        self.assertEqual(config.auth_timeout, PI_AUTH_TIMEOUT_SECONDS)
+        paths = ModelRunner(config).prepare("codex", self.workspace)
+        self.assertEqual(len(self._calls()), 1)
+        self.assertEqual((paths.agent_dir / "auth.json").read_bytes(), self.auth.read_bytes())
+        self.assertEqual(self._lines(paths), [])
 
 
 if __name__ == "__main__":
