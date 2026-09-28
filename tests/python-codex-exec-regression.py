@@ -8,11 +8,14 @@ scenario, so every claim the transport makes can be checked:
   * the minimal profile is byte-for-byte the one measured at ~1,687 tokens
     (a renamed feature flag or a dropped override must fail here, not in
     production at 5x the cost);
-  * success is read from the parsed stream (final message, turn.completed,
-    reasoning) rather than from the log format;
-  * a functional failure falls back to Pi, and so does a cost regression —
-    the second one without recording the profile as verified, so the next
-    attempt re-tests instead of trusting a regression;
+  * success is read from the parsed stream (final message, turn.completed and
+    its usage, reasoning) rather than from the log format: a turn that never
+    completed, or completed without reporting input tokens, is a functional
+    failure even when its reply was exactly right;
+  * a functional failure falls back to Pi; a cost regression does not — the
+    reply was already delivered and the window anchored, so it is accepted as
+    success, logged as a regression, and *not* recorded as a verified profile,
+    which keeps the next attempt testing instead of trusting the regression;
   * the attempt environment carries the CLI's own CODEX_HOME and none of the
     API keys that would silently route a ChatGPT model to the platform API.
 
@@ -78,10 +81,27 @@ usage = {{
     "reasoning_output_tokens": 7 if mode == "reasoning" else 0,
 }}
 reply = {{"success": "1", "reasoning": "1", "regression-input": "1",
-          "regression-output": "1"}}.get(mode, "Could you clarify what you'd like me to do?")
+          "regression-output": "1", "no-completion": "1"}}.get(
+    mode, "Could you clarify what you'd like me to do?")
 if mode == "no-completion":
+    # A correct reply and no turn.completed: the stream a killed or truncated
+    # CLI leaves behind. Only the completion event says the turn finished.
     print(json.dumps({{"type": "item.completed",
                        "item": {{"type": "agent_message", "text": reply}}}}))
+    raise SystemExit(0)
+if mode == "unverified-usage":
+    # A finished turn whose usage omits the one number the ceilings are about.
+    print(json.dumps({{"type": "item.completed",
+                       "item": {{"type": "agent_message", "text": "1"}}}}))
+    print(json.dumps({{"type": "turn.completed", "usage": {{"output_tokens": 5}}}}))
+    raise SystemExit(0)
+if mode == "zero-input-usage":
+    # The same, with the field present but zero: a reported nothing, not a
+    # measurement of nothing.
+    print(json.dumps({{"type": "item.completed",
+                       "item": {{"type": "agent_message", "text": "1"}}}}))
+    print(json.dumps({{"type": "turn.completed",
+                       "usage": {{"input_tokens": 0, "output_tokens": 5}}}}))
     raise SystemExit(0)
 print(json.dumps({{"type": "thread.started", "thread_id": "t"}}))
 print("not json at all")
@@ -111,6 +131,32 @@ class _FakePi:
             stderr_path=Path(workspace) / "pi-stderr",
             quota_path=Path(workspace) / "pi-quota.json",
             error_summary="",
+        )
+
+
+class _FailingPi:
+    """A Pi runner that fails on purpose.
+
+    Used to prove a delegation that must not happen: if the transport hands an
+    already-delivered attempt to Pi, a failing stub turns the whole run into a
+    reported failure, so the bug cannot hide behind a successful fallback.
+    """
+
+    def __init__(self):
+        self.prepared = []
+        self.calls = []
+
+    def prepare(self, provider, workspace):
+        self.prepared.append((provider, Path(workspace)))
+
+    def run(self, provider, workspace, phase, attempt, limit):
+        self.calls.append((provider, phase, attempt, limit))
+        return AttemptResult(
+            success=False, exit_code=1, timed_out=False, elapsed=0.5,
+            stdout_path=Path(workspace) / "pi-stdout",
+            stderr_path=Path(workspace) / "pi-stderr",
+            quota_path=Path(workspace) / "pi-quota.json",
+            error_summary="pi-failed-on-purpose",
         )
 
 
@@ -216,7 +262,7 @@ class CodexExecTests(unittest.TestCase):
 
     def test_stale_then_final_message_uses_the_last_one(self):
         # The fake prints a stale agent_message before the real reply.
-        final, usage, events = parse_events(
+        final, usage, events, completed = parse_events(
             '{"type":"item.completed","item":{"type":"agent_message","text":"stale"}}\n'
             '{"type":"item.completed","item":{"type":"agent_message","text":"1"}}\n'
             '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n'
@@ -224,7 +270,27 @@ class CodexExecTests(unittest.TestCase):
         self.assertEqual(final, "1")
         self.assertEqual(usage, {"input_tokens": 1, "output_tokens": 2})
         self.assertEqual(events, 3)
+        self.assertTrue(completed)
         self.assertTrue(self.runner().run("codex", self.workspace, "initial", 1, 3).success)
+
+    def test_parser_reports_completion_separately_from_usage(self):
+        # The two facts are independent, and the verdict needs both: a turn can
+        # finish without reporting tokens, and a stream can report tokens
+        # (from a thread event, say) without ever finishing.
+        final, usage, events, completed = parse_events(
+            '{"type":"item.completed","item":{"type":"agent_message","text":"1"}}\n'
+            '{"type":"turn.completed"}\n'
+        )
+        self.assertEqual(final, "1")
+        self.assertIsNone(usage)
+        self.assertEqual(events, 2)
+        self.assertTrue(completed)
+        final, usage, events, completed = parse_events(
+            '{"type":"item.completed","item":{"type":"agent_message","text":"1"}}\n'
+        )
+        self.assertEqual(final, "1")
+        self.assertIsNone(usage)
+        self.assertFalse(completed)
 
     def test_wrong_reply_falls_back_to_pi(self):
         result = self.runner(mode="wrong-reply", fallback=self.pi).run(
@@ -245,12 +311,55 @@ class CodexExecTests(unittest.TestCase):
         self.assertIn("functional:exit=3", " ".join(self.lines))
 
     def test_missing_turn_completed_is_a_functional_failure(self):
-        self.runner(mode="no-completion", fallback=self.pi).run(
+        # The reply is exactly `1`, so the wrong-reply rule cannot be what fails
+        # this attempt: the missing completion event alone has to. A stream that
+        # ends after an agent message is a killed, truncated or reworded CLI,
+        # and judging it a success would certify a turn nobody saw finish.
+        result = self.runner(mode="no-completion", fallback=self.pi).run(
             "codex", self.workspace, "initial", 1, 3
         )
         joined = " ".join(self.lines)
-        self.assertIn("functional:", joined)
+        self.assertIn("functional:no turn.completed", joined)
+        self.assertNotIn("reply=", joined)  # the reply itself was right
         self.assertIn("input=0", joined)  # no usage was reported at all
+        self.assertIn("fallback=pi", joined)
+        self.assertTrue(result.success)  # the Pi attempt's own verdict
+        # An unverified turn must not be written down as a verified profile.
+        self.assertEqual(self.smoke_record(), {})
+
+    def test_completion_without_input_usage_is_usage_unverified(self):
+        # `input_tokens` is the number CODEX_INPUT_CEILING is stated against.
+        # A completion that reports none — absent, or present and zero — cannot
+        # be checked against it, so it is a functional failure, not a free run.
+        for mode in ("unverified-usage", "zero-input-usage"):
+            self.lines.clear()
+            before = len(self.pi.calls)
+            result = self.runner(mode=mode, fallback=self.pi).run(
+                "codex", self.workspace, "initial", 1, 3
+            )
+            joined = " ".join(self.lines)
+            self.assertIn("functional:usage=unverified", joined, mode)
+            self.assertNotIn("reply=", joined, mode)  # the reply itself was right
+            self.assertIn("input=0", joined, mode)
+            self.assertIn("fallback=pi", joined, mode)
+            self.assertTrue(result.success, mode)  # the Pi attempt's own verdict
+            self.assertEqual(len(self.pi.calls), before + 1, mode)
+        self.assertEqual(self.smoke_record(), {})
+
+    def test_functional_failures_still_hand_the_attempt_to_pi(self):
+        # The cost-regression change must not touch the functional path: these
+        # attempts verified nothing as delivered, so Pi still owns the attempt.
+        for mode in ("wrong-reply", "no-completion", "unverified-usage",
+                     "reasoning", "exit1"):
+            self.lines.clear()
+            before = len(self.pi.calls)
+            self.runner(mode=mode, fallback=self.pi).run(
+                "codex", self.workspace, "initial", 1, 3
+            )
+            joined = " ".join(self.lines)
+            self.assertIn("functional:", joined, mode)
+            self.assertIn("fallback=pi", joined, mode)
+            self.assertEqual(len(self.pi.calls), before + 1, mode)
 
     def test_timeout_falls_back(self):
         self.runner(mode="timeout", fallback=self.pi, timeout=1).run(
@@ -267,18 +376,51 @@ class CodexExecTests(unittest.TestCase):
         self.assertIn("result=cost-regression", joined)
         self.assertIn("cost regression", joined)
         self.assertIn("input=%s>=%s" % (3200, CODEX_INPUT_CEILING), joined)
-        self.assertIn("fallback=pi", joined)
-        self.assertTrue(result.success)  # delivered by Pi
+        # Accepted, not re-delivered: the reply was already returned and the
+        # window already anchored, so a Pi run would spend a second window on a
+        # turn that already succeeded.
+        self.assertNotIn("fallback=pi", joined)
+        self.assertEqual(self.pi.calls, [])
+        self.assertTrue(result.success)
+        self.assertEqual(result.error_summary, "")
         # A regression must never be written down as a verified profile: the
         # next attempt has to test again.
         self.assertEqual(self.smoke_record(), {})
 
     def test_output_cost_regression_warns(self):
-        self.runner(mode="regression-output", fallback=self.pi).run(
+        result = self.runner(mode="regression-output", fallback=self.pi).run(
             "codex", self.workspace, "initial", 1, 3
         )
         joined = " ".join(self.lines)
         self.assertIn("output=%s>=%s" % (60, CODEX_OUTPUT_CEILING), joined)
+        # The output ceiling is an alarm about the profile too, not a second
+        # delivery, and not a verified-profile record.
+        self.assertIn("result=cost-regression", joined)
+        self.assertNotIn("fallback=pi", joined)
+        self.assertEqual(self.pi.calls, [])
+        self.assertTrue(result.success)
+        self.assertEqual(self.smoke_record(), {})
+
+    def test_cost_regression_is_not_re_delivered_even_when_pi_would_fail(self):
+        # The regression defect in one assertion: the codex turn replied `1` and
+        # exited 0, so handing the same attempt to a Pi runner that fails would
+        # report the whole attempt as a failure — and the scheduler would then
+        # retry the provider, spending a third window on work already delivered.
+        failing = _FailingPi()
+        result = self.runner(mode="regression-input", fallback=failing).run(
+            "codex", self.workspace, "initial", 1, 3
+        )
+        self.assertTrue(result.success)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.error_summary, "")
+        self.assertEqual(failing.calls, [])
+        self.assertEqual(failing.prepared, [])
+        joined = " ".join(self.lines)
+        self.assertIn("result=cost-regression", joined)
+        self.assertIn("input=3200", joined)  # the accepted turn's own numbers
+        self.assertNotIn("fallback=pi", joined)
+        self.assertEqual(self.smoke_record(), {})
 
     def test_success_still_records_below_the_ceilings(self):
         self.runner().run("codex", self.workspace, "initial", 1, 3)
@@ -316,10 +458,13 @@ class CodexExecTests(unittest.TestCase):
             runner.run("antigravity", self.workspace, "initial", 1, 3)
 
     def test_events_parser_ignores_noise(self):
-        final, usage, events = parse_events("garbage\n\n[1,2]\n{\"type\":\"turn.started\"}\n")
+        final, usage, events, completed = parse_events(
+            "garbage\n\n[1,2]\n{\"type\":\"turn.started\"}\n"
+        )
         self.assertIsNone(final)
         self.assertIsNone(usage)
         self.assertEqual(events, 1)
+        self.assertFalse(completed)
 
 
 class TransportPriorityTests(unittest.TestCase):

@@ -22,17 +22,24 @@ invalidates the smoke record automatically.
 Two failure classes are treated differently, because they mean different
 things:
 
-* **functional** — non-zero exit, no ``turn.completed``, a final message that
-  is not ``1``, or reasoning tokens above zero: the attempt failed and the Pi
-  transport is used instead;
+* **functional** — non-zero exit, no ``turn.completed``, a completed turn whose
+  usage reports no input tokens, a final message that is not ``1``, or
+  reasoning tokens above zero: nothing was verified as delivered, so the
+  attempt failed and the Pi transport is used instead;
 * **cost regression** — the run succeeded but reports more input or output
   than the measured profile (a renamed feature flag, or a server-side change
-  to the model metadata, silently reintroduces the scaffolding): the attempt
-  is *still usable*, but it is reported as a regression and the Pi transport
-  is used instead, so a regression can never quietly burn 5x the quota.
+  to the model metadata, silently reintroduces the scaffolding): the attempt is
+  *still usable*, and by the time the numbers are known it is already used —
+  the reply was delivered and the window anchored — so it is accepted as a
+  success, logged as a regression, and **not** written down as a verified
+  profile. Handing the same attempt to Pi would spend a second window on a turn
+  that already succeeded and could only convert a success into a failure, so the
+  ceiling stays an alarm rather than a second delivery.
 
 The token counts come from the stream itself, so every attempt writes its own
-cost into the run log. Nothing here has to be trusted to be observed.
+cost into the run log. Nothing here has to be trusted to be observed — and no
+verdict is ever read from an invented zero: a turn that reported no usage is
+a functional failure (``usage=unverified``), not a free one.
 """
 from __future__ import annotations
 
@@ -129,16 +136,25 @@ def profile_fingerprint() -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def parse_events(raw: str) -> Tuple[Optional[str], Optional[dict], int]:
-    """The final assistant text, the ``turn.completed`` usage, event count.
+def parse_events(raw: str) -> Tuple[Optional[str], Optional[dict], int, bool]:
+    """The final assistant text, the ``turn.completed`` usage, event count, and
+    whether a ``turn.completed`` event was seen at all.
 
     ``codex exec --json`` writes one JSON object per line. Nothing about the
     product's success criterion is read from the raw stream: the caller decides
     what the parsed values mean.
+
+    Presence is returned separately from the usage on purpose. ``turn.completed``
+    is the only event that says the turn actually finished, and its usage is the
+    only measurement of what the turn cost; folding the two into one optional
+    dict would make "the turn never completed" indistinguishable from "the turn
+    completed without reporting tokens", and the caller has to tell those apart
+    to name the failure (``no turn.completed`` versus ``usage=unverified``).
     """
     final: Optional[str] = None
     usage: Optional[dict] = None
     events = 0
+    completed = False
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -158,10 +174,11 @@ def parse_events(raw: str) -> Tuple[Optional[str], Optional[dict], int]:
                 if isinstance(text, str):
                     final = text
         elif kind == "turn.completed":
+            completed = True
             value = event.get("usage")
             if isinstance(value, dict):
                 usage = value
-    return final, usage, events
+    return final, usage, events, completed
 
 
 def _env_value(env: Mapping[str, str], key: str, default: str) -> str:
@@ -220,7 +237,14 @@ class CodexExecConfig:
 
 @dataclass(frozen=True)
 class _Attempt:
-    """One parsed ``codex exec --json`` run, before any policy is applied."""
+    """One parsed ``codex exec --json`` run, before any policy is applied.
+
+    ``turn_completed`` and ``usage_verified`` are carried next to ``usage``
+    rather than derived from it, because ``usage`` has to invent a zero for
+    every number the stream did not report, and a verdict must not be read from
+    an invention: the two booleans are what says whether a number is a
+    measurement at all.
+    """
 
     final_response: Optional[str]
     usage: Dict[str, int]
@@ -228,6 +252,8 @@ class _Attempt:
     exit_code: int
     timed_out: bool
     elapsed: float
+    turn_completed: bool
+    usage_verified: bool
 
 
 class CodexExecRunner:
@@ -339,7 +365,7 @@ class CodexExecRunner:
             )
         elapsed = time.monotonic() - started
         raw = paths.stdout_path.read_bytes().decode("utf-8", "replace")
-        final, usage, events = parse_events(raw)
+        final, usage, events, turn_completed = parse_events(raw)
         numbers = {
             "input": int(usage.get("input_tokens") or 0) if usage else 0,
             "cached": int(usage.get("cached_input_tokens") or 0) if usage else 0,
@@ -354,6 +380,13 @@ class CodexExecRunner:
             exit_code=completed.returncode,
             timed_out=completed.returncode == 124,
             elapsed=elapsed,
+            turn_completed=turn_completed,
+            # ``input_tokens`` is the number every ceiling in this module is
+            # stated against, so a completion that does not report it cannot be
+            # checked against any of them. Such a turn is not a verified success
+            # however good its reply looks: the zeros in ``numbers`` are the
+            # absence of a measurement, not a measurement of zero.
+            usage_verified=turn_completed and numbers["input"] >= 1,
         )
 
     # ------------------------------------------------------------- smoke state
@@ -393,6 +426,18 @@ class CodexExecRunner:
             problems.append("timeout")
         elif attempt.exit_code != 0:
             problems.append("exit=%s" % attempt.exit_code)
+        # A reply is only evidence of a finished turn when the turn says it
+        # finished: a stream that ends after an agent message can be a killed
+        # process, a truncated pipe, or a CLI that changed its event names, and
+        # all three look like a perfect answer.
+        if not attempt.turn_completed:
+            problems.append("no turn.completed")
+        elif not attempt.usage_verified:
+            # The turn finished but reported no input tokens. The profile's whole
+            # claim is a number of input tokens, so a turn that reports none is
+            # unverifiable rather than free: treating the missing value as zero
+            # would silently certify an unmeasured run.
+            problems.append("usage=unverified")
         if attempt.final_response is None:
             problems.append("no agent message")
         elif attempt.final_response.strip() != USER_PROMPT:
@@ -402,6 +447,11 @@ class CodexExecRunner:
         return problems
 
     def _cost_regressions(self, attempt: _Attempt) -> list:
+        # Only a verified usage can be above a ceiling. An unverified one is
+        # already a functional failure, and its invented zeros must not be the
+        # thing that decides whether the profile regressed.
+        if not attempt.usage_verified:
+            return []
         problems = []
         if attempt.usage.get("input", 0) >= self.config.input_ceiling:
             problems.append(
@@ -475,20 +525,38 @@ class CodexExecRunner:
                 error_summary="",
             )
 
-        reason = "functional:" + ",".join(functional) if functional else \
-            "cost-regression:" + ",".join(regression)
-        if functional:
-            self._log_attempt(provider, phase, attempt, limit, result, "failed")
-        else:
-            # Measured, not guessed: the run worked, so this is information
-            # about the profile, not about the network.
+        if not functional:
+            # Cost regression on an otherwise good turn: accepted, never
+            # re-delivered. The reply was already handed to the caller and the
+            # window already anchored, so Pi can only add a second charge for
+            # the same work — and, when it fails, turn a delivered message into
+            # a reported failure that makes the scheduler retry the provider and
+            # spend a third time. The ceiling therefore stays an alarm about the
+            # profile, not a second delivery.
             self._log_attempt(provider, phase, attempt, limit, result, "cost-regression")
             self.logger(
-                "model %s transport=codex cost regression (%s); "
-                "expected input<%s output<%s — the minimal profile no longer applies"
+                "model %s transport=codex cost regression (%s); the delivery is accepted, "
+                "and the profile needs attention: expected input<%s output<%s — "
+                "the minimal profile no longer applies"
                 % (provider, ",".join(regression),
                    self.config.input_ceiling, self.config.output_ceiling)
             )
+            # Deliberately no ``_write_smoke``: a regressed profile is not a
+            # verified one, so the next attempt must measure again instead of
+            # trusting a number that just proved wrong.
+            return AttemptResult(
+                success=True,
+                exit_code=result.exit_code,
+                timed_out=False,
+                elapsed=result.elapsed,
+                stdout_path=paths.stdout_path,
+                stderr_path=paths.stderr_path,
+                quota_path=paths.quota_path,
+                error_summary="",
+            )
+
+        reason = "functional:" + ",".join(functional)
+        self._log_attempt(provider, phase, attempt, limit, result, "failed")
         fallback = self._fallback_to_pi(provider, workspace, phase, attempt, limit, reason)
         if fallback is not None:
             return fallback
