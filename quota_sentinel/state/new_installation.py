@@ -9,5 +9,7 @@ def initialize_new_installation(state_dir,config):
  except FileExistsError as e:raise ConfigurationError('new installation requires a nonexistent state directory') from e
  # Publish authority last. Any earlier failure leaves a visibly incomplete install.
  save_config(d/'config.json',config,expected_revision=None)
+ from .migration import migrate_all
+ migrate_all(d)
  authority=BackendAuthority('json',0);write_authority(d,authority)
  return authority

@@ -189,7 +189,11 @@ class QuotaCollector:
         opencode_native_timeout: float = 15,
         clinepass_native_timeout: float = 15,
         codexbar_kill_grace: float = 10,
+        providers: Sequence[str] = PROVIDERS,
+        tier_chains=None,
     ) -> None:
+        self.providers = tuple(providers)
+        self.tier_chains = {p: tuple(Tier(t) for t in (tier_chains[p] if tier_chains is not None else tier_plan(p))) for p in self.providers}
         self.state_dir = Path(state_dir)
         self.workspace = Path(workspace)
         self.codex_bin = Path(codex_bin)
@@ -490,7 +494,7 @@ class QuotaCollector:
             return quota
         return None
 
-    def collect(self, pi_raw: Optional[Mapping[str, Path]] = None) -> Dict[str, QuotaReading]:
+    def collect(self, pi_raw: Optional[Mapping[str, Path]] = None, *, purpose: str = "display") -> Dict[str, QuotaReading]:
         """Resolve each provider by its declared ladder; no stale carry-over.
 
         Each rung is an ISOLATION boundary. The shell gets that for free —
@@ -500,11 +504,13 @@ class QuotaCollector:
         cache file would take the whole roster's readings with it, and the
         caller would see an exception instead of a degraded collection.
         """
+        if purpose not in ("display", "schedule"):
+            raise ValueError("unknown quota purpose")
         readings: Dict[str, QuotaReading] = {}
-        for provider in PROVIDERS:
+        for provider in self.providers:
             quota = None
             selected = None
-            for tier in tier_plan(provider):
+            for tier in self.tier_chains[provider]:
                 if tier not in _TIERS:
                     # The shell dies on an unknown tier rather than serving
                     # something else, and a silent fallback here would make a
@@ -533,7 +539,7 @@ class QuotaCollector:
                     "ok" if quota is not None else "none",
                     time.monotonic() - started,
                 ))
-                if quota is not None:
+                if quota is not None and (purpose == "display" or tier in (Tier.NATIVE, Tier.CODEXBAR_LIVE) and quota.fresh):
                     selected = tier
                     break
             if selected is None:
@@ -541,7 +547,7 @@ class QuotaCollector:
                             % provider)
                 readings[provider] = QuotaReading(None, None, False, "all tiers unavailable")
                 continue
-            fresh = selected in (Tier.NATIVE, Tier.CODEXBAR_LIVE)
+            fresh = selected in (Tier.NATIVE, Tier.CODEXBAR_LIVE) and quota.fresh
             self.logger("quota %s: selected %s (fresh=%d)" % (
                 provider, selected.value, 1 if fresh else 0,
             ))

@@ -58,7 +58,7 @@ def load_state(state_dir: Path, provider: str) -> ProviderState:
 def load_roster(
     state_dir: Path, providers: Optional[Sequence[str]] = None
 ) -> Dict[str, ProviderState]:
-    roster = list(providers) if providers else list(DEFAULT_PROVIDERS)
+    roster = list(providers) if providers is not None else list(DEFAULT_PROVIDERS)
     return router(state_dir).load_all(roster)
 
 
@@ -215,3 +215,11 @@ __all__ = [
     "pending_providers",
     "next_due",
 ]
+
+
+def resume_provider(state_dir, provider, observation, now):
+    """Clear disabled-period debt only after a verified current window."""
+    state = load_state(state_dir, provider)
+    if policy.valid_reset_at(observation, now) is None:
+        return DecisionResult(provider, Decision.WAIT, 'resume needs live quota', False, state, state, router(state_dir).authority().backend)
+    return reanchor_probe_only(state_dir, provider, now, observation)

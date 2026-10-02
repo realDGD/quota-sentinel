@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import tempfile
 import time
@@ -136,6 +137,9 @@ class Application:
     ) -> None:
         self.state_dir = Path(state_dir)
         self.runtime_plan = runtime_plan
+        self.activation_path = self.state_dir / "config.activations.json"
+        self.active_providers = runtime_plan.active_providers if runtime_plan is not None else PROVIDERS
+        self.opening_providers = runtime_plan.opening_providers if runtime_plan is not None else PROVIDERS
         self.model_runner = model_runner
         self.quota_collector_factory = quota_collector_factory
         self.notifier = notifier
@@ -144,6 +148,41 @@ class Application:
         self.config = config
         self.workspace_parent = workspace_parent
         self.preflight = preflight
+
+    def _collect(self, collector, raw=None, *, purpose):
+        if self.runtime_plan is None:
+            return collector.collect(raw) if raw is not None else collector.collect()
+        return collector.collect(raw, purpose=purpose)
+
+    def _write_active_transitions(self, awaiting):
+        from quota_sentinel.state.store import _publish_atomic
+        payload = json.dumps({'schema_version': 1, 'enabled': list(self.opening_providers), 'awaiting_resume': sorted(awaiting)}).encode()
+        _publish_atomic(self.state_dir / 'runtime-providers.json', payload)
+        if self.activation_path.exists():
+            record = json.loads(self.activation_path.read_bytes())
+            record['pending'] = sorted(set(record['pending']) - (set(self.opening_providers) - set(awaiting)))
+            _publish_atomic(self.activation_path, json.dumps(record).encode())
+
+    def _active_transitions(self):
+        if self.runtime_plan is None:
+            return set()
+        path = self.state_dir / 'runtime-providers.json'
+        journal_pending = set()
+        if self.activation_path.exists():
+            record = json.loads(self.activation_path.read_bytes())
+            if record.get('schema_version') != 1 or not isinstance(record.get('pending'), list):
+                raise ValueError('invalid activation journal')
+            journal_pending = set(record['pending'])
+        try:
+            previous = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            self._write_active_transitions(journal_pending)
+            return journal_pending
+        if not isinstance(previous, dict) or previous.get('schema_version') != 1 or not isinstance(previous.get('enabled'), list) or not isinstance(previous.get('awaiting_resume'), list):
+            raise ValueError('invalid provider activation metadata')
+        awaiting = journal_pending | set(previous['awaiting_resume']) | (set(self.opening_providers) - set(previous['enabled']))
+        self._write_active_transitions(awaiting)
+        return awaiting
 
     def _require_ready(self, providers: Sequence[str]) -> None:
         """Refuse to spend model quota on a run that cannot be delivered.
@@ -162,8 +201,8 @@ class Application:
         return int(self.clock())
 
     def _providers(self, providers: Sequence[str]) -> tuple[str, ...]:
-        names = tuple(providers) or PROVIDERS
-        if len(set(names)) != len(names) or any(p not in PROVIDERS for p in names):
+        names = tuple(providers) if providers else self.opening_providers
+        if len(set(names)) != len(names) or any(p not in self.opening_providers for p in names):
             raise ValueError(f"invalid provider roster: {names!r}")
         return names
 
@@ -291,7 +330,7 @@ class Application:
         readings: Mapping[str, object] = {}
         try:
             with acquire_quota_lock(self.state_dir, timeout=self.config.quota_wait):
-                readings = collector.collect(pi_raw)
+                readings = self._collect(collector, pi_raw, purpose="schedule")
                 now = self._now()
                 for provider in names:
                     if results[provider] != "发送成功":
@@ -365,8 +404,9 @@ class Application:
                 workspace = Path(temp)
                 collector = self.quota_collector_factory(workspace)
                 now = self._now()
+                awaiting_resume = self._active_transitions()
                 retry = service.retry_due_providers(
-                    self.state_dir, PROVIDERS, now,
+                    self.state_dir, self.opening_providers, now,
                     self.config.watchdog_retry_gap,
                 )
                 # A probe-only provider is never executed, so it must never
@@ -374,7 +414,7 @@ class Application:
                 # probe-only transition below, not repaid with a model turn.
                 retry = [
                     provider for provider in retry
-                    if provider not in self.config.probe_only
+                    if provider not in self.config.probe_only and provider not in awaiting_resume
                 ]
                 retry_results: Dict[str, str] = {}
                 pi_raw: Mapping[str, Path] = {}
@@ -416,7 +456,7 @@ class Application:
                         )
                     return ()
                 with quota_lock:
-                    readings = collector.collect(pi_raw)
+                    readings = self._collect(collector, pi_raw, purpose="schedule")
                     now = self._now()
                     # Phase C decides only providers WITHOUT a pending debt,
                     # read LIVE here rather than from the gap-filtered retry
@@ -425,10 +465,16 @@ class Application:
                     # deciding it would start a fresh three-attempt initial
                     # burst on every tick of the wait loop and card each one.
                     pending = set(
-                        service.pending_providers(self.state_dir, PROVIDERS)
+                        service.pending_providers(self.state_dir, self.opening_providers)
                     )
                     due = []
-                    for provider in PROVIDERS:
+                    for provider in self.opening_providers:
+                        if provider in awaiting_resume:
+                            resumed = service.resume_provider(self.state_dir, provider, _observation(readings.get(provider)), now)
+                            if resumed.changed or policy.valid_reset_at(_observation(readings.get(provider)), now) is not None:
+                                awaiting_resume.discard(provider)
+                                self._write_active_transitions(awaiting_resume)
+                            continue
                         if provider in self.config.probe_only:
                             # Switched off, but still measured: the probe above
                             # already read its quota, and this transition keeps
@@ -488,9 +534,9 @@ class Application:
 
     def _deadline_summary(self) -> str:
         """The shell's readable form: a Shanghai wall clock, not an epoch."""
-        states = service.load_roster(self.state_dir, PROVIDERS)
+        states = service.load_roster(self.state_dir, self.active_providers)
         rendered = []
-        for provider in PROVIDERS:
+        for provider in self.opening_providers:
             next_due = states[provider].next_due_at
             rendered.append("%s next %s" % (
                 provider,
@@ -509,7 +555,7 @@ class Application:
                 with acquire_quota_lock(
                     self.state_dir, timeout=self.config.quota_wait
                 ):
-                    readings = collector.collect()
+                    readings = self._collect(collector, purpose="display")
             except LockError:
                 # A broken lock is indistinguishable from a busy one at this
                 # boundary, and the operator's /usage must still get an
@@ -524,7 +570,7 @@ class Application:
             try:
                 with acquire_run_lock(self.state_dir, timeout=0):
                     now = self._now()
-                    for provider in PROVIDERS:
+                    for provider in (self.opening_providers if self.runtime_plan is None or self.runtime_plan.start_scheduler or self.runtime_plan.command in ("check", "wait", "run") else ()) :
                         self._sync(provider, readings.get(provider), now)
             except RunLockBusyError:
                 logger.info("usage: scheduler busy; deadline sync skipped")
@@ -533,19 +579,19 @@ class Application:
 
     def status(self) -> Mapping[str, object]:
         read_authority(self.state_dir)
-        return service.load_roster(self.state_dir, PROVIDERS)
+        return service.load_roster(self.state_dir, self.active_providers)
 
     def wait(self) -> None:
         logger.info("timer: watching deadlines (recheck every %ss)",
                     self.config.timer_recheck)
         while True:
             now = self._now()
-            next_due = service.next_due(self.state_dir, PROVIDERS)
+            next_due = service.next_due(self.state_dir, self.opening_providers)
             if next_due is not None and now < next_due:
                 self.sleep(min(next_due - now, self.config.timer_recheck))
                 continue
             self.check()
-            next_due = service.next_due(self.state_dir, PROVIDERS)
+            next_due = service.next_due(self.state_dir, self.opening_providers)
             if next_due is not None and self._now() < next_due:
                 self.sleep(1)
             else:

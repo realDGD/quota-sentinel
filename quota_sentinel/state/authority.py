@@ -37,7 +37,8 @@ Properties, each one deliberate:
   probably cut over already". See ``read_authority``.
 
 * ALWAYS PRESENT once the deployment has an owner. The manifest is
-  materialized by exactly ONE thing: an operator asserting that this
+  materialized by an explicit new-installation operation in a newly created
+  directory, or an operator asserting that this
   deployment predates the authority protocol
   (``bootstrap-authority --assume-legacy``, whose library primitive is
   ``bootstrap_legacy_authority``). From then on absence is a LOUD FAILURE

@@ -61,6 +61,18 @@ def save_config(path,config,*,expected_revision):
  with configuration_lock(path.parent/'configuration.lock'):
   current=hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
   if current!=expected_revision:raise ConfigurationError('configuration changed; reload before saving')
+  if current is not None:
+   old=read_config(path).settings
+   old_active={p for p,v in old.providers.items() if v.enabled and v.opening_enabled}
+   new_active={p for p,v in c.providers.items() if v.enabled and v.opening_enabled}
+   disabled=old_active-new_active
+   if disabled:
+    journal=path.with_suffix('.activations.json')
+    record=json.loads(journal.read_bytes()) if journal.exists() else {'schema_version':1,'pending':[]}
+    if record.get('schema_version')!=1 or not isinstance(record.get('pending'),list):raise ConfigurationError('invalid activation journal')
+    record['pending']=sorted(set(record['pending'])|disabled)
+    from quota_sentinel.state.store import _publish_atomic
+    _publish_atomic(journal,json.dumps(record).encode())
   fd,name=tempfile.mkstemp(dir=path.parent,prefix='config.tmp.')
   try:
    with os.fdopen(fd,'wb') as out:out.write(raw);out.flush();os.fsync(out.fileno())

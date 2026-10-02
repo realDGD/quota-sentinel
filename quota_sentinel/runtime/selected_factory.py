@@ -55,4 +55,6 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
     except ConfigurationError as e:errors.append(str(e))
    else:raise ConfigurationError('; '.join(errors))
   notifier.validate_ready()
- return Application(state_dir,runner,collector,notifier,config=AppConfig(**settings.app),clock=clock,sleep=sleep,preflight=preflight,runtime_plan=plan)
+ app=Application(state_dir,runner,collector,notifier,config=AppConfig(**settings.app),clock=clock,sleep=sleep,preflight=preflight,runtime_plan=plan)
+ app.activation_path=Path(env.get("QUOTA_SENTINEL_CONFIG",str(Path(state_dir)/"config.json"))).with_suffix(".activations.json")
+ return app
