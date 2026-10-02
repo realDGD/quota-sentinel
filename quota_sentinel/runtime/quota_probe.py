@@ -193,7 +193,7 @@ class QuotaCollector:
         tier_chains=None,
     ) -> None:
         self.providers = tuple(providers)
-        self.tier_chains = {p: tuple(Tier(t) for t in (tier_chains[p] if tier_chains is not None else tier_plan(p))) for p in self.providers}
+        self.tier_chains = {p: tuple(Tier(t) for t in tier_chains[p]) for p in self.providers} if tier_chains is not None else None
         self.state_dir = Path(state_dir)
         self.workspace = Path(workspace)
         self.codex_bin = Path(codex_bin)
@@ -510,7 +510,7 @@ class QuotaCollector:
         for provider in self.providers:
             quota = None
             selected = None
-            for tier in self.tier_chains[provider]:
+            for tier in (self.tier_chains[provider] if self.tier_chains is not None else tier_plan(provider)):
                 if tier not in _TIERS:
                     # The shell dies on an unknown tier rather than serving
                     # something else, and a silent fallback here would make a
