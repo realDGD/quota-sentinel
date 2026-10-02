@@ -3,7 +3,7 @@ import {resolve,join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
 import {createHash} from 'node:crypto';
-import {MetadataError,withinDeadline} from './network.mjs';
+import {MetadataError,withinDeadline,metadataRequest} from './network.mjs';
 
 export async function loadSelectedSdk(options) {
   try {
@@ -31,6 +31,27 @@ function tokenAccount(token) {
     const decoded=JSON.parse(Buffer.from(token.split('.')[1],'base64url').toString('utf8'));
     return decoded['https://api.openai.com/auth']?.chatgpt_account_id;
   } catch { return undefined; }
+}
+async function refreshAntigravity(runtime,stored,plugin,owner,deadline) {
+  if (stored.type!=='oauth' || !Number.isFinite(stored.expires)) throw new MetadataError('auth_unavailable');
+  if (stored.expires>deadline) return stored;
+  if (owner!=='pi') throw new MetadataError('auth_expired');
+  if (typeof runtime.credentials.modify!=='function' || plugin.TOKEN_URL!=='https://oauth2.googleapis.com/token'
+      || typeof plugin.CLIENT_ID!=='string' || typeof plugin.CLIENT_SECRET!=='string') throw new MetadataError('unsupported_pi_plugin');
+  const signal=AbortSignal.timeout(Math.max(1,deadline-Date.now()));
+  return runtime.credentials.modify('antigravity',async current=>{
+    if (current?.type!=='oauth' || typeof current.refresh!=='string' || !current.refresh) throw new MetadataError('auth_unavailable');
+    if (current.expires>deadline) return undefined;
+    const raw=await metadataRequest(plugin.TOKEN_URL,{method:'POST',signal,
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({client_id:plugin.CLIENT_ID,client_secret:plugin.CLIENT_SECRET,
+        refresh_token:current.refresh,grant_type:'refresh_token'}).toString()},deadline);
+    if (typeof raw.access_token!=='string' || !raw.access_token || typeof raw.expires_in!=='number'
+        || !Number.isFinite(raw.expires_in) || raw.expires_in<=300 || raw.expires_in>86400) throw new MetadataError('auth_unavailable');
+    if (raw.refresh_token!==undefined && (typeof raw.refresh_token!=='string' || !raw.refresh_token)) throw new MetadataError('auth_unavailable');
+    return {...current,access:raw.access_token,refresh:raw.refresh_token??current.refresh,
+      expires:Date.now()+(raw.expires_in-300)*1000};
+  },{signal});
 }
 export async function resolvePiAuth(provider,options,deadline) {
   if (!['codex','antigravity','opencode'].includes(provider)) throw new MetadataError('unsupported_provider');
@@ -62,14 +83,14 @@ export async function resolvePiAuth(provider,options,deadline) {
       try { plugin=await (options.loadPlugin??loadSelectedPlugin)(options,'src/auth/index.ts'); }
       catch { throw new MetadataError('unsupported_pi_plugin'); }
       if (typeof plugin?.getApiKey!=='function') throw new MetadataError('unsupported_pi_plugin');
-      // The installed plugin's OAuth refresh currently uses an independent
-      // Undici transport. Fail closed instead of bypassing the metadata guard.
-      if (stored.type!=='oauth' || !Number.isFinite(stored.expires) || stored.expires<=deadline) throw new MetadataError('auth_expired');
-      const raw=plugin.getApiKey(stored);let key;
+      // Use the selected plugin's verified owner constants and Pi store lock;
+      // its independent Undici refresh function never bypasses our guard.
+      const active=await refreshAntigravity(runtime,stored,plugin,owner,deadline);
+      const raw=plugin.getApiKey(active);let key;
       try { key=JSON.parse(raw); } catch { throw new MetadataError('auth_unavailable'); }
       if (!key?.token || typeof key.projectId!=='string' || !key.projectId) throw new MetadataError('auth_unavailable');
       return {provider,kind:'oauth',owner,apiKey:raw,accessToken:key.token,projectId:key.projectId,
-        accountScope:scope(provider,String(stored.email??key.projectId))};
+        accountScope:scope(provider,String(active.email??key.projectId))};
     }
     let key;
     if (owner==='foreign-readonly') {
