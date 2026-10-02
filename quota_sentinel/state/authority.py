@@ -278,6 +278,10 @@ def read_authority(state_dir: Path) -> BackendAuthority:
     offers no caching hook.
     """
     path = authority_path(state_dir)
+    from quota_sentinel.platform.locks import state_protocol,LockProtocolError,PROTOCOL_FILENAME
+    if path.exists() or (Path(state_dir)/PROTOCOL_FILENAME).exists():
+        try:state_protocol(state_dir)
+        except LockProtocolError as exc:raise AuthorityError(str(exc)) from exc
     try:
         raw = path.read_bytes()
     except FileNotFoundError as exc:

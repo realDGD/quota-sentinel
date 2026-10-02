@@ -82,13 +82,19 @@ class RunLock:
     path: Path
     pid: int
     released: bool = False
+    held: object = None
 
     def release(self) -> None:
         if self.released:
             return
         self.released = True
+        if self.held is not None:
+            try:self.held.release()
+            except OSError as exc:raise RunLockError('could not release run.lock') from exc
+            return
         try:
-            os.unlink(self.path)
+            if self.path.read_text().strip() == str(self.pid):
+                os.unlink(self.path)
         except FileNotFoundError:
             # Already gone. Either we never wrote it or someone cleaned up;
             # never treat this as a reason to keep going loudly.
@@ -153,28 +159,17 @@ def acquire_run_lock(
     default: an in-flight ``check`` finishes, and the cutover runs next
     rather than the operator having to retry by hand.
     """
-    if not _shlock_available():
-        raise RunLockUnsupportedError(
-            f"{SHLOCK_BIN} is not executable; run.lock ownership cannot be "
-            "established with the same protocol the shell uses, and a "
-            "different protocol is not an acceptable substitute"
-        )
-    directory = Path(state_dir)
-    deadline = time.monotonic() + max(0.0, timeout)
-    waited = False
-    while True:
-        if _try_acquire(directory):
-            return RunLock(path=directory / RUN_LOCK_FILENAME, pid=os.getpid())
-        if time.monotonic() >= deadline:
-            raise RunLockBusyError(
-                f"run.lock is held by another live process and stayed held "
-                f"for {timeout:.0f}s; refusing to mutate authoritative state "
-                "without the scheduler's serialization boundary"
-            )
-        if not waited and on_wait is not None:
-            waited = True
-            on_wait()
-        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+    from quota_sentinel.platform.locks import acquire_lock,state_protocol,LockBusy,LockUnavailable,LockError
+    directory=Path(state_dir)
+    try:
+        protocol=state_protocol(directory,allow_empty_init=True)
+        directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        os.chmod(directory,0o700)
+        held=acquire_lock(directory/RUN_LOCK_FILENAME,timeout=timeout,protocol=protocol,poll=poll,on_wait=on_wait)
+    except LockBusy as exc:raise RunLockBusyError('run.lock: '+str(exc)) from exc
+    except LockUnavailable as exc:raise RunLockUnsupportedError(str(exc)) from exc
+    except (LockError,OSError) as exc:raise RunLockError(str(exc)) from exc
+    return RunLock(directory/RUN_LOCK_FILENAME,os.getpid(),held=held)
 
 
 __all__ = [
