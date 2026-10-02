@@ -66,6 +66,29 @@ readonly UV_BIN="${QUOTA_SENTINEL_UV_BIN:-/opt/homebrew/bin/uv}"
   print -ru2 -- "uv not found at $UV_BIN — install it first (brew install uv)"
   exit 1
 }
+# Saved modular profiles use one selected host. Unsaved legacy installations
+# retain the established listener setup until an explicit migration is applied.
+if [[ -f "$STATE_DIR/config.json" ]]; then
+  selected_extras="$(PYTHONPATH="$REPO_DIR" "$PYTHON3_BIN" -S - "$STATE_DIR/config.json" <<'PYCONFIG'
+import sys
+from pathlib import Path
+from quota_sentinel.config import read_config
+from quota_sentinel.install import installation_extras
+print("\n".join(installation_extras(read_config(Path(sys.argv[1])).settings)))
+PYCONFIG
+)"
+  typeset -a selected_sync_args
+  selected_sync_args=(sync --locked --no-default-groups --project "$REPO_DIR")
+  for selected_extra in ${(f)selected_extras}; do
+    [[ -z "$selected_extra" ]] || selected_sync_args+=(--extra "$selected_extra")
+  done
+  "$UV_BIN" "${selected_sync_args[@]}" >/dev/null
+  "$REPO_DIR/.venv/bin/python" -m quota_sentinel --state-dir "$STATE_DIR" service install
+  if [[ "$MODE" == "--load" ]]; then
+    "$REPO_DIR/.venv/bin/python" -m quota_sentinel --state-dir "$STATE_DIR" service start
+  fi
+  exit 0
+fi
 "$UV_BIN" sync --locked --extra feishu --project "$REPO_DIR" >/dev/null || {
   print -ru2 -- "uv sync --locked failed: environment missing, incomplete, or pyproject/uv.lock drifted; fix before installing agents"
   exit 1

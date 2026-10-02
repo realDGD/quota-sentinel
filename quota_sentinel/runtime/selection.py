@@ -23,6 +23,17 @@ def build_runtime_plan(config,command,*,requested=()):
  if notify:deps.add('feishu-push')
  listener=f.feishu_listener and command=='serve'
  if listener:deps.add('feishu-listener')
+ used=set()
+ if notify or listener:used.update(('feishu_app_id','feishu_app_secret','feishu_user_id'))
+ for p,chain in oc.items():
+  if 'direct' in chain:used.add(p)
+ for p,chain in qc.items():
+  if p in ('opencode','clinepass') and 'native' in chain:used.add(p)
+ for name in used:
+  ref=config.credentials.get(name)
+  if ref and ref.kind=='system':
+   for backend in ('secret-service','kwallet'):
+    if ref.locator.startswith(backend+':'):deps.add('credential:'+backend)
  return RuntimePlan(command,active,opening,probes,oc,qc,frozenset(deps),notify,f.automatic_opening and command in ('serve','wait'),listener)
 def selected_extras(plan):
- return ('feishu',) if plan.start_listener else ()
+ return tuple(x for x in ('feishu','secret-service','kwallet') if (x=='feishu' and plan.start_listener) or ('credential:'+x in plan.dependency_ids))

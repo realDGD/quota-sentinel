@@ -28,9 +28,16 @@ def dependency_problems(c):
       plugin=selected_plugin_root(c)
       if plugin is None or not (plugin/'src/usage/usage.ts').is_file():problems.append('Install Pi live quota plugin: pi install npm:pi-antigravity')
  for name in sorted(clients):
-  executable=c.clients.get(name) or shutil.which(name)
-  if not executable or not (shutil.which(executable) or os.access(executable,os.X_OK)):problems.append('Install selected client: '+name)
+  from quota_sentinel.platform.paths import resolve_launcher
+  try:resolve_launcher(name,explicit=c.clients.get(name))
+  except ValueError:problems.append('Install selected client: '+name)
  if c.features.feishu_listener:
   import importlib.util
   if importlib.util.find_spec('lark_oapi') is None:problems.append('Install selected extra: quota-sentinel[feishu]')
+ import sys
+ if sys.platform=='linux':
+  import importlib.util
+  from quota_sentinel.runtime.selection import build_runtime_plan,selected_extras
+  for extra,module in (('secret-service','secretstorage'),('kwallet','dbus')):
+   if extra in selected_extras(build_runtime_plan(c,'serve')) and importlib.util.find_spec(module) is None:problems.append('Install selected extra: quota-sentinel['+extra+']')
  return problems

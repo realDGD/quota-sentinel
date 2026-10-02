@@ -468,6 +468,28 @@ def run_serve(state_dir: Path, args: argparse.Namespace) -> int:
     return run_selected_host(effective.settings, plan, state_dir, path)
 
 
+def run_service(args):
+    from quota_sentinel.install import service_definition, installation_extras
+    from quota_sentinel.platform.services import ServiceManager
+    from quota_sentinel.config.diagnostics import dependency_problems
+    path, effective = _effective_settings(args.state_dir, args)
+    definition = service_definition(effective.settings, args.state_dir, path,
+        name=args.service_name, allow_inactive=args.service_action in ('stop', 'uninstall'))
+    if definition is None:
+        print('No background components selected; use manual commands')
+        return 0
+    if args.service_action in ('install', 'start'):
+        problems = dependency_problems(effective.settings)
+        if problems: raise ValueError('; '.join(problems))
+        extras = installation_extras(effective.settings)
+        if extras: print('Selected dependencies: quota-sentinel[' + ','.join(extras) + ']')
+    manager = ServiceManager()
+    action = 'remove' if args.service_action == 'uninstall' else args.service_action
+    getattr(manager, action)(definition)
+    print('Service ' + args.service_action + ' complete')
+    return 0
+
+
 def run_status(state_dir: Path, args: argparse.Namespace) -> int:
     factory = _runtime(state_dir)
     path, effective = _effective_settings(state_dir, args)
@@ -690,6 +712,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Scheduler-domain verbs (Phase 3C bridge). Registered from their own
     # module so the parser stays a table of contents, not a second API.
+    services = sub.add_parser('service', help='install, start, stop or remove selected current-user components')
+    services.add_argument('service_action', choices=('install','start','stop','uninstall'))
+    services.add_argument('--name', dest='service_name', default='quota-sentinel.service')
+    services.set_defaults(handler=run_service)
     scheduler_cli.register(sub)
     quota_cli.register(sub)
     return parser
