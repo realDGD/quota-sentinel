@@ -458,6 +458,18 @@ def run_usage(state_dir: Path, args: argparse.Namespace) -> int:
     )
 
 
+def run_serve(state_dir: Path, args: argparse.Namespace) -> int:
+    from quota_sentinel.runtime.selection import build_runtime_plan
+    from quota_sentinel.daemon import run_selected_host
+    path, effective = _effective_settings(state_dir, args)
+    if not path.exists():
+        raise ValueError('save and review the configuration before applying a background service')
+    plan = build_runtime_plan(effective.settings, 'serve')
+    if plan.start_scheduler or plan.start_listener:
+        read_authority(state_dir)
+    return run_selected_host(effective.settings, plan, state_dir, path)
+
+
 def run_status(state_dir: Path, args: argparse.Namespace) -> int:
     factory = _runtime(state_dir)
     path, effective = _effective_settings(state_dir, args)
@@ -635,6 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("status",
          "report readiness and the next due time for every provider",
          run_status),
+        ("serve", "run the selected background scheduler and/or bot", run_serve),
     ):
         command = sub.add_parser(name, help=help_text)
         command.set_defaults(

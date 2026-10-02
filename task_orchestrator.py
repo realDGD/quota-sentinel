@@ -459,8 +459,6 @@ class SubprocessRunner:
 
     @classmethod
     def _terminate_group(cls, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
         groups = cls._process_groups_for_tree(process.pid)
         cls._signal_groups(groups, signal.SIGTERM)
 
@@ -965,6 +963,11 @@ class TaskOrchestrator:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=10)
+
+    def wait(self, stop_event: threading.Event) -> None:
+        while not stop_event.wait(0.5):
+            if self._thread is not None and not self._thread.is_alive():
+                raise RuntimeError("scheduler thread stopped unexpectedly")
 
 
 def create_default_orchestrator(

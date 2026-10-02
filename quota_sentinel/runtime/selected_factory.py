@@ -76,9 +76,13 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
   raise ConfigurationError('unsupported opening channel')
  runner=AttemptChainRunner(plan.opening_chains,runner_factory)
  notifier=NullNotifier()
- if plan.notify:
+ reply_user=env.get('QUOTA_SENTINEL_REPLY_USER', '') if plan.command=='usage' and settings.features.feishu_listener else ''
+ if plan.notify or reply_user:
   from .feishu import FeishuClient,FeishuNotifier
   notifier=FeishuNotifier(FeishuClient(environment=env,dry_run=dry_run_flag,total_timeout=settings.budgets["notification"]["timeout"]),roster=plan.active_providers)
+  if reply_user:
+   from quota_sentinel.daemon import ReplyNotifier
+   notifier=ReplyNotifier(notifier.client,reply_user)
  def collector(workspace):
   return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,logger=logging.getLogger('quota_sentinel.quota').info,**options)
  def preflight(providers):

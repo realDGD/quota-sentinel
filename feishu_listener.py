@@ -26,7 +26,14 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
-import lark_oapi as lark
+lark = None
+
+def _load_sdk():
+    global lark
+    if lark is None:
+        import importlib
+        lark = importlib.import_module("lark_oapi")
+    return lark
 from task_orchestrator import TaskOrchestrator, create_default_orchestrator
 
 logging.basicConfig(
@@ -142,25 +149,19 @@ class LRUCache:
 dedup_cache = LRUCache()
 command_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-usage")
 command_slot = threading.BoundedSemaphore(1)
+command_environment = None
+commands_enabled = True
+commands_closing = False
+command_lock = threading.RLock()
+active_processes = set()
+active_futures = set()
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=3)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+    # Reap descendants even when the leader has already returned.
+    if isinstance(process.pid, int) and process.pid > 0:
+        from task_orchestrator import SubprocessRunner
+        SubprocessRunner._terminate_group(process)
 
 
 def setup_file_logging() -> None:
@@ -192,13 +193,15 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
 
     def execute_usage() -> None:
         nonlocal process
-        process = subprocess.Popen(
-            list(USAGE_COMMAND),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        with command_lock:
+            if commands_closing:
+                return
+            options = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, start_new_session=True)
+            if command_environment is not None:
+                options['env'] = dict(command_environment, QUOTA_SENTINEL_REPLY_USER=sender_id)
+            process = subprocess.Popen(list(USAGE_COMMAND), **options)
+            active_processes.add(process)
         _stdout, stderr = process.communicate(timeout=USAGE_COMMAND_TIMEOUT_SECONDS)
         if process.returncode != 0:
             raise subprocess.CalledProcessError(
@@ -221,7 +224,7 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
     except subprocess.CalledProcessError as exc:
         logger.error(
             f"Usage command returned {exc.returncode} after {elapsed()}:"
-            f" {(exc.stderr or '').strip()}"
+            " (details omitted to keep credentials private)"
         )
     except subprocess.TimeoutExpired:
         logger.error(
@@ -233,11 +236,15 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
     finally:
         if process is not None:
             terminate_process_group(process)
+            with command_lock:
+                active_processes.discard(process)
 
 
 def submit_usage_command(sender_id: str, message_id: str) -> bool:
     # The Feishu SDK invokes handlers on its asyncio receive loop. Running the
     # scheduler synchronously there would block ACKs and WebSocket heartbeats.
+    if commands_closing or not commands_enabled:
+        return False
     if not command_slot.acquire(blocking=False):
         # Only the configured recipient can reach this path, and all results go
         # to that same private chat. Let the in-flight result satisfy repeated
@@ -251,7 +258,13 @@ def submit_usage_command(sender_id: str, message_id: str) -> bool:
     except Exception:
         command_slot.release()
         raise
-    future.add_done_callback(lambda _future: command_slot.release())
+    with command_lock:
+        active_futures.add(future)
+    def finished(done):
+        with command_lock:
+            active_futures.discard(done)
+        command_slot.release()
+    future.add_done_callback(finished)
     return True
 
 
@@ -313,8 +326,12 @@ def on_message_receive(data: lark.api.im.v1.P2ImMessageReceiveV1) -> None:
 
 def main() -> None:
     global TASK_ORCHESTRATOR
+    if os.environ.get('QUOTA_SENTINEL_CONFIG'):
+        from quota_sentinel.__main__ import main as cli_main
+        raise SystemExit(cli_main(['serve']))
     logger.info("Starting Feishu WebSocket listener...")
     setup_file_logging()
+    _load_sdk()
     app_id, app_secret = get_credentials()
     if not get_authorized_user_id():
         logger.critical("Authorized Feishu user ID is missing!")
@@ -363,6 +380,74 @@ def main() -> None:
     finally:
         if TASK_ORCHESTRATOR is not None:
             TASK_ORCHESTRATOR.stop()
+
+
+class FeishuListener:
+    """Listener only: the host supplies and owns its scheduler reference."""
+    def __init__(self, config, state_dir, config_path, scheduler):
+        self.config = config
+        self.state_dir, self.config_path = Path(state_dir), Path(config_path)
+        self.scheduler = scheduler
+        self.client = None
+        self._sdk_tasks = set()
+
+    def run(self):
+        global TASK_ORCHESTRATOR, USAGE_COMMAND, USAGE_COMMAND_TIMEOUT_SECONDS
+        global command_environment, commands_enabled, commands_closing, command_executor
+        import asyncio
+        sdk = _load_sdk()
+        app_id, app_secret = get_credentials()
+        if not get_authorized_user_id():
+            raise RuntimeError('Authorized Feishu user ID is missing')
+        TASK_ORCHESTRATOR = self.scheduler
+        commands_enabled = self.config.features.quota_queries
+        commands_closing = False
+        command_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='feishu-usage')
+        command_environment = dict(os.environ, QUOTA_SENTINEL_CONFIG=str(self.config_path))
+        USAGE_COMMAND = (sys.executable, '-m', 'quota_sentinel', '--state-dir',
+                         str(self.state_dir), '--config', str(self.config_path), 'usage')
+        USAGE_COMMAND_TIMEOUT_SECONDS = listener_usage_budget(command_environment, config=self.config)
+        handler = sdk.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(on_message_receive).build()
+        self.client = sdk.ws.Client(app_id=app_id, app_secret=app_secret,
+            event_handler=handler, log_level=sdk.LogLevel.ERROR, auto_reconnect=True)
+        from lark_oapi.ws.client import loop
+        self._before_tasks = asyncio.all_tasks(loop)
+        try:
+            self.client.start()
+        finally:
+            self._sdk_tasks = asyncio.all_tasks(loop) - self._before_tasks
+
+    def stop(self):
+        global commands_closing, TASK_ORCHESTRATOR
+        with command_lock:
+            commands_closing = True
+            processes = tuple(active_processes)
+        for process in processes:
+            terminate_process_group(process)
+        command_executor.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + 6
+        while True:
+            with command_lock:
+                futures = tuple(active_futures)
+            if not futures:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('listener command worker did not stop')
+            time.sleep(0.05)
+        if self.client is not None:
+            import asyncio
+            from lark_oapi.ws.client import loop
+            for task in self._sdk_tasks:
+                task.cancel()
+            async def disconnect():
+                await asyncio.wait_for(self.client._disconnect(), timeout=2)
+                if self._sdk_tasks:
+                    await asyncio.wait(self._sdk_tasks, timeout=2)
+            try:
+                loop.run_until_complete(disconnect())
+            except (asyncio.TimeoutError, OSError):
+                logger.error('WebSocket cleanup exceeded its deadline')
+        TASK_ORCHESTRATOR = None
 
 
 if __name__ == "__main__":

@@ -58,4 +58,5 @@ def listener_usage_budget(environment,*,config=None,plan=None):
  if plan is None:
   from .selection import build_runtime_plan
   plan=build_runtime_plan(config,'usage')
- return usage_budget(config,plan)
+ from dataclasses import replace
+ return usage_budget(config,replace(plan,notify=config.features.feishu_listener or plan.notify))
