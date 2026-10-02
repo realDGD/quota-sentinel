@@ -348,12 +348,15 @@ wheels = [
 name = "quota-sentinel"
 version = "0.1.0"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+feishu = [
     { name = "lark-oapi" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "lark-oapi", specifier = ">=1.4.0" }]
+requires-dist = [{ name = "lark-oapi", marker = "extra == 'feishu'", specifier = ">=1.4.0" }]
+provides-extras = ["feishu"]
 
 [[package]]
 name = "requests"

@@ -899,3 +899,11 @@ MIT — see [LICENSE](LICENSE).
 ### Optional Pi opening plugins
 
 Choosing Pi as a primary or fallback for Antigravity requires `pi install npm:pi-antigravity`; ClinePass requires `pi install npm:pi-clinepass-provider`. Complete the corresponding login inside Pi. The selected plugin entry and provider/model registration are checked before opening. ClinePass Pi opening uses `clinepass` / `cline-pass/deepseek-v4.1-flash` and supplies no quota capture hook. Plugin installation is never performed at runtime.
+
+## Choosing only the features you need
+
+New installations enable only Codex with official Codex opening and native account/rate-limit queries. Both lists have one entry, so fallback and Feishu are off. `quota-sentinel --state-dir /new/state configure --new-installation` previews the choices and provisions only a previously nonexistent directory. Existing directories with a missing authority manifest require recovery; configure never guesses ownership.
+
+Use `quota-sentinel configure` to edit an existing profile, `config show` to inspect effective settings and their sources, and `config validate` for static prerequisites. `--config /path/config.json` selects a saved profile. Opening and quota chains can each be ordered independently; disabled components do not load their optional libraries or check their credentials. Automatic opening still needs its internal live quota observations when the separate query command is disabled. A cache can be displayed first but cannot update a scheduling anchor.
+
+`uv sync --locked` installs core dependencies; add `--extra feishu` only for the Feishu listener. The legacy `install-launchagents.sh` explicitly installs that extra because its active service is the listener. Configuration saving leaves services running with their original choices; applying a new service definition is a separate operation. An unsaved legacy installation retains its existing runtime while migration is previewed.

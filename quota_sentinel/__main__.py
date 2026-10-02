@@ -332,9 +332,68 @@ def _run_runtime(state_dir: Path, action, verb: str) -> int:
     return 0
 
 
+def _effective_settings(state_dir, args):
+    from quota_sentinel.config.migration import resolve_config
+    path = args.config_path or Path(state_dir) / 'config.json'
+    prefs = None
+    evidence = Path(state_dir) / 'migration-evidence/2026-10-02-observed-installation.json'
+    if evidence.is_file() and not Path(path).exists():
+        try:
+            record = json.loads(evidence.read_bytes())
+            if record.get('artifact_kind') == 'migration-evidence-not-active-configuration':
+                prefs = record.get('installed_environment', {})
+        except (OSError, ValueError):
+            raise ValueError('migration observation is unreadable; review it before saving')
+    return Path(path), resolve_config(Path(path), Path(state_dir), os.environ, installed_preferences=prefs)
+
+
+def _application(factory, state_dir, args, command, requested=()):
+    from quota_sentinel.runtime.selection import build_runtime_plan
+    path, effective = _effective_settings(state_dir, args)
+    # Unsaved legacy deployment continues its established entry until the
+    # migration is previewed/saved and its service is explicitly applied.
+    if not path.exists() and effective.settings.origin == 'legacy-migration':
+        return factory.create_application(state_dir)
+    plan = build_runtime_plan(effective.settings, command, requested=requested)
+    env = dict(os.environ); env['QUOTA_SENTINEL_CONFIG'] = str(path)
+    return factory.create_application(state_dir, environment=env, software_config=effective.settings, runtime_plan=plan)
+
+
+def run_config(args):
+    from quota_sentinel.config import to_document
+    from quota_sentinel.config.diagnostics import dependency_problems
+    path, effective = _effective_settings(args.state_dir, args)
+    if args.config_action == 'show':
+        print(json.dumps({'path': str(path), 'settings': to_document(effective.settings), 'sources': dict(effective.sources)}, ensure_ascii=False, indent=2))
+        return 0
+    problems = dependency_problems(effective.settings)
+    print('Configuration format and channels: valid')
+    for problem in problems: print(problem)
+    return 1 if problems else 0
+
+
+def run_configure(args):
+    from quota_sentinel.config import save_config
+    from quota_sentinel.configure import configure
+    from quota_sentinel.state.new_installation import initialize_new_installation
+    path, effective = _effective_settings(args.state_dir, args)
+    candidate = configure(effective)
+    if candidate is None:
+        print('Cancelled; configuration unchanged')
+        return 0
+    if args.new_installation:
+        if path != Path(args.state_dir) / 'config.json':
+            raise ValueError('new installation stores config.json in the new state directory')
+        initialize_new_installation(args.state_dir, candidate)
+    else:
+        save_config(path, candidate, expected_revision=effective.revision)
+    print('Saved '+str(path)+'; service application is separate')
+    return 0
+
+
 def run_check(state_dir: Path, args: argparse.Namespace) -> int:
     return _run_runtime(
-        state_dir, lambda factory: factory.create_application(state_dir).check(),
+        state_dir, lambda factory: _application(factory, state_dir, args, "check").check(),
         "check",
     )
 
@@ -342,7 +401,7 @@ def run_check(state_dir: Path, args: argparse.Namespace) -> int:
 def run_wait(state_dir: Path, args: argparse.Namespace) -> int:
     def watch(factory) -> None:
         try:
-            factory.create_application(state_dir).wait()
+            _application(factory, state_dir, args, "wait").wait()
         except KeyboardInterrupt:
             pass
 
@@ -359,7 +418,7 @@ def run_run(state_dir: Path, args: argparse.Namespace) -> int:
     results: dict = {}
 
     def execute(factory) -> None:
-        results.update(factory.create_application(state_dir).run(providers))
+        results.update(_application(factory, state_dir, args, "run", providers).run(providers))
 
     factory = _runtime(state_dir)
     cli_log = logging.getLogger("quota_sentinel.cli")
@@ -394,13 +453,27 @@ def run_run(state_dir: Path, args: argparse.Namespace) -> int:
 
 def run_usage(state_dir: Path, args: argparse.Namespace) -> int:
     return _run_runtime(
-        state_dir, lambda factory: factory.create_application(state_dir).usage(),
+        state_dir, lambda factory: _application(factory, state_dir, args, "usage").usage(),
         "usage",
     )
 
 
 def run_status(state_dir: Path, args: argparse.Namespace) -> int:
     factory = _runtime(state_dir)
+    path, effective = _effective_settings(state_dir, args)
+    if path.exists() or effective.settings.origin != 'legacy-migration':
+        from quota_sentinel.config.diagnostics import dependency_problems
+        from quota_sentinel.scheduler import service
+        from quota_sentinel.runtime.selection import build_runtime_plan
+        problems = dependency_problems(effective.settings)
+        if problems:
+            for problem in problems: print(problem, file=sys.stderr)
+            return 1
+        plan = build_runtime_plan(effective.settings, 'status')
+        print('ready')
+        for provider, state in service.load_roster(state_dir, plan.active_providers).items():
+            print(provider + ': next ' + str(state.next_due_at))
+        return 0
     problems = factory.readiness_problems(state_dir)
     if problems:
         print("quota_sentinel: not ready: " + "; ".join(problems), file=sys.stderr)
@@ -458,7 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
     # tests/uv-project-regression.py).
     parser = argparse.ArgumentParser(prog="quota-sentinel")
     parser.add_argument("--state-dir", type=Path, default=None)
+    parser.add_argument("--config", dest="config_path", type=Path, default=os.environ.get("QUOTA_SENTINEL_CONFIG"))
     sub = parser.add_subparsers(dest="command", required=True)
+    config = sub.add_parser('config', help='show or validate effective nonsecret settings')
+    config.add_argument('config_action', choices=('show', 'validate'))
+    config.add_argument('--config', dest='config_path', type=Path, default=argparse.SUPPRESS)
+    config.set_defaults(handler=run_config)
+    configure = sub.add_parser('configure', help='preview and save feature/provider/channel choices')
+    configure.add_argument('--config', dest='config_path', type=Path, default=argparse.SUPPRESS)
+    configure.add_argument('--new-installation', action='store_true', help='exclusively provision a nonexistent state directory')
+    configure.set_defaults(handler=run_configure)
     for name, help_text in (
         ("next-due", "print the provider's next_due_at epoch (rc 1 when unset)"),
         ("dump", "print all scheduler-state slots from the legacy slot files"),

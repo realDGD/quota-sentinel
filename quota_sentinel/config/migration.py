@@ -35,7 +35,7 @@ def _overrides(c,env,sources):
   if len(parts)!=2:continue
   p,ch=map(str.strip,parts)
   if p not in PROVIDERS or ch not in ('pi','codex','agy','direct'):continue
-  if ch not in OPENING_CHANNELS[p]:raise ConfigurationError('unsupported transport '+p+'='+ch)
+  if ch not in OPENING_CHANNELS[p]:raise ConfigurationError("provider %r does not run on the %r transport; %s supports: %s" % (p,ch,p,', '.join(sorted(OPENING_CHANNELS[p]))))
   if p in d['providers']:
    chain=[ch]
    if p=='codex':chain.append('codex' if ch=='pi' else 'pi')

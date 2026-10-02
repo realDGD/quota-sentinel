@@ -137,7 +137,7 @@ sys.exit(int(os.environ.get('QS_LAUNCHCTL_RC', '0')))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.rendered(), [])
         self.assertEqual(self.agents(), [])
-        self.assertEqual(self.calls(), [f"uv sync --locked --project {self.repo}"])
+        self.assertEqual(self.calls(), [f"uv sync --locked --extra feishu --project {self.repo}"])
 
     # ---- I3: unknown ownership refuses ----------------------------------
     def test_i3_a_missing_manifest_refuses_before_rendering_or_loading(self):

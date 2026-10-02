@@ -66,7 +66,7 @@ readonly UV_BIN="${QUOTA_SENTINEL_UV_BIN:-/opt/homebrew/bin/uv}"
   print -ru2 -- "uv not found at $UV_BIN — install it first (brew install uv)"
   exit 1
 }
-"$UV_BIN" sync --locked --project "$REPO_DIR" >/dev/null || {
+"$UV_BIN" sync --locked --extra feishu --project "$REPO_DIR" >/dev/null || {
   print -ru2 -- "uv sync --locked failed: environment missing, incomplete, or pyproject/uv.lock drifted; fix before installing agents"
   exit 1
 }
