@@ -51,7 +51,7 @@ TIER_LADDER: Tuple[Tier, ...] = (
 # Tiers that may be treated as a fresh reading: the live probes. A cached
 # document and a Pi snapshot are both "not necessarily current" (`fresh`
 # false in the document), so they only feed the fallback path.
-FRESH_TIERS = frozenset({Tier.NATIVE, Tier.CODEXBAR_LIVE})
+FRESH_TIERS = frozenset({Tier.NATIVE, Tier.CODEXBAR_LIVE, Tier.PI_LIVE})
 
 
 @dataclass(frozen=True)

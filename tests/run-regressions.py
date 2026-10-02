@@ -19,14 +19,14 @@ MACOS = {'python-installer-regression.py', 'python-runtime-lock-regression.py',
          'python-authority-regression.py', 'python-state-cutover-regression.py',
          'python-config-regression.py', 'python-config-cli-regression.py',
          'python-config-migration-regression.py', 'python-feature-pruning-regression.py',
-         'python-config-integration-regression.py'}
+         'python-config-integration-regression.py', 'python-pi-live-integration-regression.py'}
 POSIX = {'python-daemon-regression.py', 'python-model-runner-regression.py',
          'python-codex-exec-regression.py', 'python-agy-exec-regression.py',
          'python-direct-runner-regression.py', 'python-pi-plugin-regression.py',
          'python-quota-probe-regression.py', 'python-app-regression.py',
          'python-entrypoint-regression.py', 'python-feishu-regression.py',
          'feishu-listener-regression.py', 'task-orchestrator-regression.py',
-         'run-with-timeout-regression.py', 'uv-project-regression.py'}
+         'run-with-timeout-regression.py', 'uv-project-regression.py', 'python-pi-live-regression.py'}
 
 def current_platform():
     return 'windows' if os.name == 'nt' else 'macos' if sys.platform == 'darwin' else 'linux'
@@ -46,6 +46,9 @@ def discover(platform, root=ROOT / 'tests'):
         paths.append(path)
     return paths
 
+def discover_node(root=ROOT / 'tests'):
+    return sorted(root.glob('*-regression.mjs'))
+
 def fixture_environment(home):
     allowed = ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG',
                'LC_ALL', 'TMPDIR', 'TEMP', 'TMP', 'SSL_CERT_FILE', 'SSL_CERT_DIR')
@@ -61,7 +64,15 @@ def run_script(path, log, *, timeout=360):
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix='qs-regression-home-') as directory:
         with log.open('wb') as output:
-            process = subprocess.Popen([sys.executable, str(path)], cwd=str(ROOT),
+            command = [sys.executable, str(path)]
+            if path.suffix == '.mjs':
+                import shutil
+                node = shutil.which('node')
+                if not node:
+                    output.write(b'Node is required to verify the optional Pi helper\n')
+                    return 127, time.monotonic()-start
+                command = [node, '--test', str(path)]
+            process = subprocess.Popen(command, cwd=str(ROOT),
                 env=fixture_environment(Path(directory)), stdin=subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=os.name != 'nt')
             try:
@@ -88,7 +99,7 @@ def main(argv=None):
         parser.error('native verification must run on that operating system')
     log_dir = args.log_dir or Path(tempfile.mkdtemp(prefix='qs-regressions-'))
     log_dir.mkdir(parents=True, exist_ok=True)
-    scripts = discover(selected)
+    scripts = discover(selected) + discover_node()
     failed = []
     for script in scripts:
         code, elapsed = run_script(script, log_dir / (script.stem + '.log'))

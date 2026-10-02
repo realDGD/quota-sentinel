@@ -34,6 +34,10 @@ test('testNoSecretOutput',async()=>{
  const response=await handleRequest(request,{resolveAuth:async()=>{throw new Error(token+' fixture-refresh-private');}});
  assert.equal(response.status,'error');assert.equal(response.error_code,'auth_unavailable');assert.ok(!JSON.stringify(response).includes(token));
 });
+test('testInvalidRequestDoesNotEchoUntrustedValues',async()=>{
+ const result=await handleRequest({...request,provider:token,request_id:'fixture-refresh-private'});
+ assert.equal(result.status,'error');assert.ok(!JSON.stringify(result).includes(token));assert.ok(!JSON.stringify(result).includes('fixture-refresh-private'));
+});
 test('testModelEndpointRejected',async()=>{
  let calls=0;
  await assert.rejects(metadataRequest('https://chatgpt.com/backend-api/codex/responses',{transport:async()=>{calls++;}},deadline()),{code:'metadata_route_denied'});assert.equal(calls,0);

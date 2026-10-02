@@ -914,4 +914,14 @@ Use `quota-sentinel configure` to edit an existing profile, `config show` to ins
 
 Save and inspect the configuration before starting the host. Each host keeps its resolved configuration for its lifetime; edit, then explicitly restart to apply. The legacy listener entry and plist remain compatible with unsaved installations. The selected-service plist template is separate; configuration saving does not install it.
 
-The regression dispatcher discovers added Python suites, isolates credentials and home directories, bounds every script, and exits nonzero for any failed suite. `--platform portable` runs the platform-independent subset; native gates run only on their actual OS. Windows/Linux service/process/credential support and Pi live metadata remain in the subsequent approved implementation plans until their gates pass. No supplier smoke tests are part of this dispatcher.
+The regression dispatcher discovers added Python suites, isolates credentials and home directories, bounds every script, and exits nonzero for any failed suite. `--platform portable` runs the platform-independent subset; native gates run only on their actual OS. Windows/Linux service/process/credential support remains in the subsequent approved platform implementation plan until its native gates pass. No supplier smoke tests are part of this dispatcher.
+
+### Optional Pi live quota queries
+
+Add `pi-live` at any position in a supported provider's `quota_chain` to use that selected Pi account. Codex, Antigravity and OpenCode are supported; ClinePass Pi opening does not provide a live Pi quota adapter. New and migrated profiles do not add this tier automatically. A single-entry list has no fallback.
+
+This path imports the installed Pi SDK authentication module, resolves only the selected stored credential, and requests usage metadata. It creates no agent session and sends no prompt, completion or model request. The helper permits enumerated usage and owner-auth URLs, rejects redirects/model URLs, bounds auth/query time and output, and verifies provider/account scope and a unique request identifier before treating a result as fresh. Pi snapshots continue to be stale.
+
+Select Node, the Pi package location (`clients.pi_sdk`) and Pi auth location (`clients.pi_auth`) when automatic package discovery cannot resolve the selected installation. Antigravity additionally needs `pi install npm:pi-antigravity` and its selected plugin entry. Compatible local Pi 0.99.2 and pi-antigravity 0.9.0 were checked using fake credentials and intercepted metadata responses; this does not verify a real account or supplier schema. Missing/unsupported SDKs/plugins and unknown quota groups return unavailable, then continue only to the next configured tier.
+
+Only Pi-owned supported credentials may refresh through guarded owner-auth requests. Foreign credentials are read-only and cannot be copied to official Codex/agy authentication stores.

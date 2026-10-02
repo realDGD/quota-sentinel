@@ -7,7 +7,9 @@ const codes=new Set(['unsupported_pi_sdk','unsupported_pi_plugin','unsupported_p
  'metadata_route_denied','metadata_redirect_denied','metadata_http_error','metadata_invalid_response',
  'metadata_invalid_json','metadata_oversized','invalid_request','invalid_usage']);
 export async function handleRequest(request, dependencies={}) {
-  const base={protocol_version:1,request_id:request?.request_id??null,provider:request?.provider??null};
+  const validId=typeof request?.request_id==='string' && /^[a-f0-9-]{16,80}$/.test(request.request_id);
+  const validProvider=['codex','antigravity','opencode'].includes(request?.provider);
+  const base={protocol_version:1,request_id:validId?request.request_id:null,provider:validProvider?request.provider:null};
   let restore;
   try {
     if (request?.protocol_version!==1 || !/^[a-f0-9-]{16,80}$/.test(request.request_id)

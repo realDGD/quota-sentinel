@@ -26,6 +26,10 @@ class ClientTests(unittest.TestCase):
   r=self.client(lambda r:dict(r,status='error',error_code='fixture-secret')).query('codex');self.assertNotIn('fixture-secret',str(r));self.assertIsNone(r.quota)
  def test_no_helper_on_unselected_tier(self):
   self.assertFalse(self.client(selected=False).query('codex').fresh);self.assertEqual(self.calls,[])
+ def test_relative_auth_and_sdk_references_resolved_before_private_cwd(self):
+  c=self.client();d=to_document(c.config);d['clients'].update(pi_sdk='fixture-sdk',pi_auth='fixture-auth.json');c.config=parse_config(d)
+  self.assertTrue(c.query('codex').fresh);request=self.calls[0][3]
+  self.assertEqual(request['sdk_path'],str(Path('fixture-sdk').resolve()));self.assertEqual(request['auth_path'],str(Path('fixture-auth.json').resolve()))
  def test_hung_helper_no_survivors(self):
   from quota_sentinel.runtime.quota_probe import _run_bounded
   with tempfile.TemporaryDirectory() as t:

@@ -30,6 +30,10 @@ def configure(config,*,input_fn=input,output_fn=print):
     if value:v[key]=[x.strip().lower() for x in value.split(',') if x.strip()]
    if 'pi' in v['opening_chain']:
     for line in plugin_guidance(p):output_fn(line)
+   if 'pi-live' in v['quota_chain']:
+    output_fn('Pi live queries need Node and the selected Pi SDK package; no model is called. Configure clients.pi_sdk if package discovery cannot find it.')
+    if p=='antigravity':
+     for line in plugin_guidance(p):output_fn(line)
   candidate=parse_config(d)
   output_fn('Preview:\n'+json.dumps(to_document(candidate),ensure_ascii=False,indent=2))
   output_fn('Saving does not restart a running service. Apply services explicitly after reviewing the file.')

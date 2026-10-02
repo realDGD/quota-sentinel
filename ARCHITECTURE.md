@@ -844,3 +844,11 @@ user's state is their decision, and the files are harmless once retired.
 Display queries stop at the first usable result; scheduling skips stale results and continues through the same listed chain. No fresh result means no authoritative anchor update. Selected budgets include each sequential query tier, primary preparation, per-attempt fallback preparation, notifications and cleanup.
 
 `daemon.serve` owns scheduler/listener startup, signal handling and shutdown. The listener receives the sole scheduler reference and owns its bounded command workers. Bot replies belong to incoming authorized commands; automatic push is separately selected. Runtime plans are fixed until explicit restart. `tests/run-regressions.py` separates portable and native gates, removes inherited credentials and bounds each script.
+
+## Pi live metadata boundary
+
+`runtime.pi_live.PiLiveQuotaClient` launches an auth-only Node helper with nonsecret selected paths and an unpredictable nonce. The helper imports `ModelRuntime` with no model refresh, never constructs an agent session, and permits only enumerated metadata/owner-auth routes under one deadline. It returns one bounded record with scope, timestamp and provider payload. Python verifies it and normalizes strict live windows; no persisted Pi snapshot is accepted here.
+
+Antigravity uses the selected plugin's metadata function and validates intercepted raw quota-summary fields before the plugin can replace missing fractions with zero. Supported Pi-owner refresh uses the plugin's verified Google OAuth constants and Pi credential-store lock through the guarded request boundary; the plugin's independent Undici refresh is not called. Codex uses Pi-owned OAuth and an account-scoped WHAM usage request. OpenCode uses the selected stored Pi API key and the existing usage endpoint. ClinePass live Pi queries remain unsupported.
+
+`Tier.PI_LIVE` is a live capability but is absent from the legacy/default ladder. Only explicitly saved chains invoke it. A failed live query cannot prepare any model runner or move an anchor.

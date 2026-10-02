@@ -84,7 +84,11 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
    from quota_sentinel.daemon import ReplyNotifier
    notifier=ReplyNotifier(notifier.client,reply_user)
  def collector(workspace):
-  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,logger=logging.getLogger('quota_sentinel.quota').info,**options)
+  live=None
+  if any('pi-live' in chain for chain in plan.quota_chains.values()):
+   from .pi_live import PiLiveQuotaClient
+   live=PiLiveQuotaClient(settings,environment=env)
+  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,pi_live_client=live,logger=logging.getLogger('quota_sentinel.quota').info,**options)
  def preflight(providers):
   # Construct only explicitly listed candidates; preparation is still deferred
   # until the application has a private workspace, before state attempts begin.

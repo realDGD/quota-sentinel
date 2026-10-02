@@ -19,7 +19,14 @@ def dependency_problems(c):
    for tier in v.quota_chain:
     if tier=='native':clients.add({'codex':'codex','antigravity':'agy','opencode':'curl','clinepass':'curl'}[p])
     if tier=='codexbar-live':clients.add('codexbar')
-    if tier=='pi-live':clients.add('node')
+    if tier=='pi-live':
+     clients.add('node')
+     from quota_sentinel.runtime.pi_live import selected_sdk_root,selected_plugin_root
+     sdk=selected_sdk_root(c)
+     if sdk is None or not (sdk/'dist/core/model-runtime.js').is_file():problems.append('Selected Pi SDK unavailable; set clients.pi_sdk to the installed @earendil-works/pi-coding-agent package')
+     if p=='antigravity':
+      plugin=selected_plugin_root(c)
+      if plugin is None or not (plugin/'src/usage/usage.ts').is_file():problems.append('Install Pi live quota plugin: pi install npm:pi-antigravity')
  for name in sorted(clients):
   executable=c.clients.get(name) or shutil.which(name)
   if not executable or not (shutil.which(executable) or os.access(executable,os.X_OK)):problems.append('Install selected client: '+name)

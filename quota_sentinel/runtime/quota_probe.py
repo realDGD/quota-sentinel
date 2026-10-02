@@ -24,6 +24,7 @@ from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 from quota_sentinel.runtime import keychain
 from quota_sentinel.quota import (
     PROVIDERS,
+    FRESH_TIERS,
     Tier,
     ProviderQuota,
     QuotaNormalizationError,
@@ -63,7 +64,7 @@ _MAX_PROBE_BYTES = 1024 * 1024
 # starts. A tight outer bound would SIGTERM probes the shell accepts and
 # silently fall back to CodexBar, so this is deliberately generous.
 _NATIVE_HELPER_SLACK_SECONDS = 5
-_TIERS = (Tier.NATIVE, Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT)
+_TIERS = (Tier.NATIVE, Tier.CODEXBAR_LIVE, Tier.CODEXBAR_CACHE, Tier.PI_SNAPSHOT, Tier.PI_LIVE)
 _OPENCODE_API_KEY_SERVICE = "quota-sentinel.opencode-go-api-key"
 _CLINEPASS_API_KEY_SERVICE = "quota-sentinel.clinepass-api-key"
 
@@ -193,8 +194,10 @@ class QuotaCollector:
         codexbar_kill_grace: float = 10,
         providers: Sequence[str] = PROVIDERS,
         tier_chains=None,
+        pi_live_client=None,
     ) -> None:
         self.providers = tuple(providers)
+        self.pi_live_client = pi_live_client
         self.tier_chains = {p: tuple(Tier(t) for t in tier_chains[p]) for p in self.providers} if tier_chains is not None else None
         self.state_dir = Path(state_dir)
         self.workspace = Path(workspace)
@@ -541,7 +544,7 @@ class QuotaCollector:
                     "ok" if quota is not None else "none",
                     time.monotonic() - started,
                 ))
-                if quota is not None and (purpose == "display" or tier in (Tier.NATIVE, Tier.CODEXBAR_LIVE) and quota.fresh):
+                if quota is not None and (purpose == "display" or tier in FRESH_TIERS and quota.fresh and not quota.cached):
                     selected = tier
                     break
             if selected is None:
@@ -549,7 +552,7 @@ class QuotaCollector:
                             % provider)
                 readings[provider] = QuotaReading(None, None, False, "all tiers unavailable")
                 continue
-            fresh = selected in (Tier.NATIVE, Tier.CODEXBAR_LIVE) and quota.fresh
+            fresh = selected in FRESH_TIERS and quota.fresh and not quota.cached
             self.logger("quota %s: selected %s (fresh=%d)" % (
                 provider, selected.value, 1 if fresh else 0,
             ))
@@ -561,6 +564,11 @@ class QuotaCollector:
     ) -> Optional[ProviderQuota]:
         if tier is Tier.NATIVE:
             return self._native(provider)
+        if tier is Tier.PI_LIVE:
+            if self.pi_live_client is None:
+                return None
+            result = self.pi_live_client.query(provider)
+            return result.quota if result.fresh and result.quota is not None and result.quota.fresh and not result.quota.cached else None
         if tier is Tier.CODEXBAR_LIVE:
             return self._codexbar(provider)
         if tier is Tier.CODEXBAR_CACHE:
