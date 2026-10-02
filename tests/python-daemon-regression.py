@@ -6,6 +6,26 @@ from quota_sentinel.config import *
 from quota_sentinel.runtime.selection import build_runtime_plan
 from quota_sentinel.daemon import serve
 class DaemonTests(unittest.TestCase):
+ def test_listener_import_and_start_with_queries_disabled(self):
+  import subprocess,os
+  from quota_sentinel.state.new_installation import initialize_new_installation
+  with tempfile.TemporaryDirectory() as tmp:
+   state=Path(tmp)/'state';c=replace(new_user_defaults(),features=FeatureSettings(False,False,False,True));initialize_new_installation(state,c)
+   code='''import asyncio,sys,types
+from unittest.mock import Mock,patch,AsyncMock
+from pathlib import Path
+import feishu_listener as m
+from quota_sentinel.config import read_config
+c=read_config(Path(sys.argv[1])).settings
+listener=m.FeishuListener(c,Path(sys.argv[1]).parent,Path(sys.argv[1]),None)
+loop=asyncio.new_event_loop();sdk=Mock();sdk.ws.Client.return_value._disconnect=AsyncMock();credentials=Mock();credentials.get.side_effect={'app_id':'fixture-id','app_secret':'fixture-secret','user_id':'fixture-user'}.get
+with patch.object(m,'_load_sdk',return_value=sdk),patch('quota_sentinel.runtime.feishu.SelectedCredentials',return_value=credentials),patch.dict(sys.modules,{'lark_oapi.ws.client':types.SimpleNamespace(loop=loop)}):
+ listener.run();assert not m.commands_enabled;assert not m.submit_usage_command('fixture-user','fixture');listener.stop()
+loop.close()
+'''
+   env=dict(os.environ,QUOTA_SENTINEL_CONFIG=str(state/'config.json'),PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+   result=subprocess.run([sys.executable,'-c',code,str(state/'config.json')],env=env,capture_output=True,text=True,timeout=10)
+   self.assertEqual(result.returncode,0,result.stderr)
  def run_host(self,automatic,listener,*,fail=False):
   events=[];c=replace(new_user_defaults(),features=FeatureSettings(automatic,True,False,listener));p=build_runtime_plan(c,'serve')
   class S:

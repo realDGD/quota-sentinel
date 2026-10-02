@@ -66,6 +66,41 @@ def verify_private_handle(fd):
         if descriptor:kernel.LocalFree(descriptor)
         if token:kernel.CloseHandle(token)
 
+def protect_file_handle(handle, descriptor, expected_sid, *, writable):
+    """Validate this opened file's identity/owner before changing its DACL."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    api=c.WinDLL('advapi32',use_last_error=True);kernel=c.WinDLL('kernel32',use_last_error=True)
+    class Info(c.Structure):
+        _fields_=[('attributes',w.DWORD),('creation',w.FILETIME),('access',w.FILETIME),('write',w.FILETIME),('volume',w.DWORD),('sizeHigh',w.DWORD),('sizeLow',w.DWORD),('links',w.DWORD),('indexHigh',w.DWORD),('indexLow',w.DWORD)]
+    kernel.GetFileType.argtypes=[w.HANDLE];kernel.GetFileType.restype=w.DWORD
+    kernel.GetFileInformationByHandle.argtypes=[w.HANDLE,c.POINTER(Info)];kernel.GetFileInformationByHandle.restype=w.BOOL
+    api.GetSecurityInfo.argtypes=[w.HANDLE,w.DWORD,w.DWORD,c.POINTER(c.c_void_p),c.c_void_p,c.c_void_p,c.c_void_p,c.POINTER(c.c_void_p)];api.GetSecurityInfo.restype=w.DWORD
+    api.ConvertSidToStringSidW.argtypes=[c.c_void_p,c.POINTER(w.LPWSTR)];api.ConvertSidToStringSidW.restype=w.BOOL
+    api.GetSecurityDescriptorDacl.argtypes=[c.c_void_p,c.POINTER(w.BOOL),c.POINTER(c.c_void_p),c.POINTER(w.BOOL)];api.GetSecurityDescriptorDacl.restype=w.BOOL
+    api.SetSecurityInfo.argtypes=[w.HANDLE,w.DWORD,w.DWORD,c.c_void_p,c.c_void_p,c.c_void_p,c.c_void_p];api.SetSecurityInfo.restype=w.DWORD
+    kernel.LocalFree.argtypes=[c.c_void_p]
+    existing=c.c_void_p();owner_text=w.LPWSTR()
+    try:
+        info=Info()
+        if kernel.GetFileType(handle)!=1 or not kernel.GetFileInformationByHandle(handle,c.byref(info)):
+            raise OSError('private file must be a regular disk file')
+        if info.attributes&(0x10|0x400):raise OSError('private file cannot be a directory or reparse point')
+        owner=c.c_void_p();error=api.GetSecurityInfo(handle,1,1,c.byref(owner),None,None,None,c.byref(existing))
+        if error:raise c.WinError(error)
+        if not owner or not api.ConvertSidToStringSidW(owner,c.byref(owner_text)):
+            raise OSError('private file owner unavailable')
+        if owner_text.value!=expected_sid:raise OSError('private file must be owned by this user')
+        if writable:
+            present=w.BOOL();defaulted=w.BOOL();dacl=c.c_void_p()
+            if not api.GetSecurityDescriptorDacl(descriptor,c.byref(present),c.byref(dacl),c.byref(defaulted)) or not present or not dacl:
+                raise OSError('private file DACL unavailable')
+            error=api.SetSecurityInfo(handle,1,0x80000004,None,None,dacl,None)
+            if error:raise c.WinError(error)
+    finally:
+        if owner_text:kernel.LocalFree(c.cast(owner_text,c.c_void_p))
+        if existing:kernel.LocalFree(existing)
+
 
 def protect_directory(path):
     """Create or restrict a directory, with a DACL inherited by SQLite sidecars."""

@@ -44,6 +44,24 @@ class ServiceManager:
   if self.system=='Linux':return Path(self.environment.get('XDG_CONFIG_HOME',str(self.home/'.config')))/'systemd/user'/(d.name+'.service')
   return Path(self.environment.get('LOCALAPPDATA',str(self.home/'AppData/Local')))/'Quota-Sentinel/services'/(d.name+'.xml')
  def manifest_path(self,d):return self.path(d).with_suffix('.launch.json')
+ def installed_definition(self,name,state_dir):
+  """Stop identity is independent of scheduler/configuration health."""
+  import json,plistlib
+  d=ServiceDefinition(name,(sys.executable,),Path(state_dir).absolute(),self.environment,300)
+  source=self.manifest_path(d) if self.system=='Windows' else self.path(d)
+  try:
+   with private_open(source,'rb') as file:raw=file.read(65537)
+   if len(raw)>65536:raise ValueError('installed service metadata too large')
+   if self.system=='Darwin':timeout=plistlib.loads(raw)['ExitTimeOut']
+   elif self.system=='Windows':timeout=json.loads(raw)['stop_timeout']
+   else:
+    lines=[line.split('=',1)[1] for line in raw.decode().splitlines() if line.startswith('TimeoutStopSec=')]
+    if len(lines)!=1:raise ValueError('missing installed stop timeout')
+    timeout=float(lines[0])
+   if type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0:raise ValueError('invalid installed stop timeout')
+   from dataclasses import replace
+   return replace(d,stop_timeout=timeout)
+  except (OSError,ValueError,KeyError,TypeError,OverflowError):return d
  def render(self,d):
   if self.system=='Darwin':
    from .launchd import render
@@ -78,7 +96,7 @@ class ServiceManager:
   if self.system=='Windows':
    import json
    if d.argv[1:3]!=('-m','quota_sentinel'):raise ServiceError('Windows service host requires the quota_sentinel module entry')
-   publish_private(self.manifest_path(d),json.dumps({'arguments':d.argv[3:],'environment':dict(d.environment)},ensure_ascii=False).encode())
+   publish_private(self.manifest_path(d),json.dumps({'arguments':d.argv[3:],'environment':dict(d.environment),'stop_timeout':d.stop_timeout},ensure_ascii=False).encode())
   publish_private(destination,self.render(d))
   if self.system=='Linux':
    self._run(('systemctl','--user','daemon-reload'));self._run(('systemctl','--user','enable',d.name+'.service'))

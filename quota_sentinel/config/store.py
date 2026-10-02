@@ -12,7 +12,12 @@ def _bool(v):
  if type(v) is not bool: raise ConfigurationError('feature flags must be boolean')
  return v
 def _number(v,name):
- if type(v) not in (int,float) or not math.isfinite(v) or v<0 or (v==0 and name not in ('kill_grace','codexbar_kill_grace','preflight')): raise ConfigurationError('invalid budget '+name)
+ try:finite=type(v) in (int,float) and math.isfinite(v)
+ except OverflowError:finite=False
+ if not finite or v<0:raise ConfigurationError('invalid budget '+name)
+ if name in ('transient_attempts','input_ceiling','output_ceiling','preflight') and type(v) is not int:raise ConfigurationError('invalid integer budget '+name)
+ if name=='preflight' and v not in (0,1):raise ConfigurationError('invalid preflight flag')
+ if v==0 and name not in ('kill_grace','codexbar_kill_grace','preflight','transient_attempts'):raise ConfigurationError('invalid budget '+name)
  return v
 def parse_config(document):
  d=dict(document) if isinstance(document,dict) else document
@@ -33,7 +38,9 @@ def parse_config(document):
   providers[p]=ProviderSettings(enabled,opening,*chains)
  app=dict(APP_DEFAULTS); a=d.get('app',{}); _keys(a,app,'app')
  for k,v in a.items():
-  if type(v) is not int or v<0 or (v==0 and k in ('initial_attempts','watchdog_attempts','retry_interval')): raise ConfigurationError('invalid app '+k)
+  try:finite=type(v) is int and math.isfinite(v)
+  except OverflowError:finite=False
+  if not finite or v<0 or (v==0 and k in ('initial_attempts','watchdog_attempts','retry_interval')): raise ConfigurationError('invalid app '+k)
   app[k]=v
  budgets={k:dict(v) for k,v in BUDGET_DEFAULTS.items()}; _keys(d.get('budgets',{}),budgets,'budgets')
  for k,v in d.get('budgets',{}).items():
@@ -43,7 +50,9 @@ def parse_config(document):
  _keys(clients,allowed,'clients')
  if any(not isinstance(v,str) or not v or '\x00' in v for v in clients.values()):raise ConfigurationError('invalid client path')
  refs={}
- for k,v in d.get('credentials',{}).items():
+ credentials=d.get('credentials',{})
+ if not isinstance(credentials,dict):raise ConfigurationError('credentials must be an object of references')
+ for k,v in credentials.items():
   _keys(v,CredentialReference.__dataclass_fields__,'credential reference',('kind','locator'))
   if v['kind'] not in ('system','environment','file') or any(not isinstance(x,str) or not x for x in v.values()):raise ConfigurationError('invalid credential reference')
   refs[k]=CredentialReference(**v)
@@ -71,11 +80,10 @@ def save_config(path,config,*,expected_revision):
    disabled=old_active-new_active
    if disabled:
     journal=path.with_suffix('.activations.json')
-    record=json.loads(journal.read_bytes()) if journal.exists() else {'schema_version':1,'pending':[]}
-    if record.get('schema_version')!=1 or not isinstance(record.get('pending'),list):raise ConfigurationError('invalid activation journal')
-    record['pending']=sorted(set(record['pending'])|disabled)
-    record['revision']=uuid.uuid4().hex
-    from quota_sentinel.state.activation import publish_bytes
+    from quota_sentinel.state.activation import publish_bytes,read_journal
+    try:pending,_=read_journal(journal)
+    except (OSError,ValueError,TypeError):raise ConfigurationError('invalid activation journal; repair it before saving') from None
+    record={'schema_version':1,'pending':sorted(pending|disabled),'revision':uuid.uuid4().hex}
     publish_bytes(journal,json.dumps(record).encode())
   from quota_sentinel.state.activation import publish_bytes
   publish_bytes(path,raw)

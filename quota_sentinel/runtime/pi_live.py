@@ -11,6 +11,7 @@ from .quota_probe import QuotaReading, _run_bounded
 from quota_sentinel.quota import Tier
 from quota_sentinel.quota.pi_live import normalize_pi_live
 from quota_sentinel.helpers import resource_path
+from quota_sentinel.platform.paths import user_home,expand_path
 
 MAX_BYTES = 1048576
 ERROR_CODES = frozenset(('unsupported_pi_sdk','unsupported_pi_plugin','unsupported_provider',
@@ -19,13 +20,19 @@ ERROR_CODES = frozenset(('unsupported_pi_sdk','unsupported_pi_plugin','unsupport
     'metadata_http_error','metadata_invalid_response','metadata_invalid_json','metadata_oversized',
     'invalid_request','invalid_usage'))
 
-def selected_sdk_root(config):
+def selected_sdk_root(config,*,environment=None):
+    env=os.environ if environment is None else environment
     if config.clients.get('pi_sdk'):
-        return Path(config.clients['pi_sdk']).expanduser().resolve()
-    executable = config.clients.get('pi') or shutil.which('pi')
+        return expand_path(config.clients['pi_sdk'],env).resolve()
+    executable = config.clients.get('pi') or shutil.which('pi',path=env.get('PATH',''))
     if not executable:
         return None
-    path = Path(executable).resolve()
+    path = expand_path(executable,env)
+    if not path.is_file() and not any(s in str(path) for s in ('/','\\')):
+        found=shutil.which(str(path),path=env.get('PATH',''))
+        if not found:return None
+        path=Path(found)
+    path=path.resolve()
     for parent in path.parents:
         for candidate in (parent, parent / 'libexec/lib/node_modules/@earendil-works/pi-coding-agent',
                           parent / 'node_modules/@earendil-works/pi-coding-agent'):
@@ -37,10 +44,11 @@ def selected_sdk_root(config):
                 pass
     return None
 
-def selected_plugin_root(config):
+def selected_plugin_root(config,*,environment=None):
+    env=os.environ if environment is None else environment
     entry = config.clients.get('antigravity_plugin')
     if entry:
-        path = Path(entry).expanduser().resolve()
+        path = expand_path(entry,env).resolve()
         for parent in (path, *path.parents):
             try:
                 manifest = json.loads((parent / 'package.json').read_bytes())
@@ -49,16 +57,16 @@ def selected_plugin_root(config):
             except (OSError, ValueError, AttributeError):
                 pass
         return None
-    return Path(config.clients.get('pi_auth', str(Path.home() / '.pi/agent/auth.json'))).expanduser().resolve().parent / 'npm/node_modules/pi-antigravity'
+    return expand_path(config.clients.get('pi_auth',str(user_home(env)/'.pi/agent/auth.json')),env).resolve().parent/'npm/node_modules/pi-antigravity'
 
 class PiLiveQuotaClient:
     def __init__(self, config, *, helper_path=None, node_bin=None, run_bounded=_run_bounded,
                  environment=None, clock=time.time):
         self.config = config
-        self.helper = Path(helper_path or resource_path('pi_quota_query.mjs')).expanduser().resolve()
-        self.node = str(node_bin or config.clients.get('node') or shutil.which('node') or 'node')
-        self.run_bounded = run_bounded
         self.environment = os.environ if environment is None else environment
+        self.helper = expand_path(helper_path or resource_path('pi_quota_query.mjs'),self.environment).resolve()
+        self.node = str(expand_path(node_bin or config.clients.get('node') or shutil.which('node',path=self.environment.get('PATH','')) or 'node',self.environment))
+        self.run_bounded = run_bounded
         self.clock = clock
 
     def query(self, provider):
@@ -73,11 +81,11 @@ class PiLiveQuotaClient:
         started = int(self.clock())
         budget = self.config.budgets['pi_live']
         request = dict(protocol_version=1, request_id=nonce, provider=provider,
-            sdk_path=str(selected_sdk_root(self.config) or ''),
-            auth_path=str(Path(self.config.clients.get('pi_auth', str(Path.home() / '.pi/agent/auth.json'))).expanduser().resolve()),
+            sdk_path=str(selected_sdk_root(self.config,environment=self.environment) or ''),
+            auth_path=str(expand_path(self.config.clients.get('pi_auth',str(user_home(self.environment)/'.pi/agent/auth.json')),self.environment).resolve()),
             timeout_seconds=budget['timeout'])
         if provider == 'antigravity':
-            request['plugin_path'] = str(selected_plugin_root(self.config) or '')
+            request['plugin_path'] = str(selected_plugin_root(self.config,environment=self.environment) or '')
         allowed = ('PATH','HOME','USERPROFILE','SYSTEMROOT','WINDIR','TEMP','TMP','TMPDIR',
                    'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy',
                    'all_proxy','no_proxy','SSL_CERT_FILE','SSL_CERT_DIR')

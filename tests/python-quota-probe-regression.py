@@ -29,6 +29,23 @@ WINDOWS = {
 
 
 class QuotaProbeTests(unittest.TestCase):
+    def test_native_codex_periods_are_explicit_unique_and_order_independent(self):
+        for durations in ((300,300),(720,10080),(None,None),(True,10080),(10080,300)):
+            with self.subTest(durations=durations):
+                limits={key:dict(usedPercent=19+index,resetsAt=1790000000+index*10000,**({} if value is None else {'windowDurationMins':value})) for index,(key,value) in enumerate(zip(('primary','secondary'),durations))}
+                code="import json,sys\nfor line in sys.stdin:\n req=json.loads(line)\n result={} if req['method']=='initialize' else "+repr({'rateLimits':limits})+"\n print(json.dumps(dict(jsonrpc='2.0',id=req['id'],result=result)),flush=True)\n"
+                result=self.collector(codex_bin=self.binary('codex',code))._native_codex()
+                if durations==(10080,300):
+                    self.assertEqual((result.five_hour.reset_at,result.weekly.reset_at),(1790010000,1790000000))
+                else:self.assertIsNone(result)
+    def test_schedule_keeps_first_cache_for_display_after_live_failure(self):
+        from quota_sentinel.quota import parse_document
+        cache=parse_document(dict(WINDOWS,source='cached fixture',fresh=False,cached=True,capturedAt=1790000000))
+        collector=self.collector(providers=('codex',),tier_chains={'codex':('codexbar-cache','native')});calls=[]
+        def tier(provider,tier,raw):
+            calls.append(tier);return cache if tier is Tier.CODEXBAR_CACHE else None
+        collector._tier=tier;reading=collector.collect(purpose='schedule')['codex']
+        self.assertEqual(calls,[Tier.CODEXBAR_CACHE,Tier.NATIVE]);self.assertIs(reading.quota,cache);self.assertFalse(reading.fresh)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

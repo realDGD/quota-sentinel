@@ -471,6 +471,12 @@ def run_serve(state_dir: Path, args: argparse.Namespace) -> int:
 def run_service(args):
     from quota_sentinel.install import service_definition, installation_extras
     from quota_sentinel.platform.services import ServiceManager
+    if args.service_action in ('stop','uninstall'):
+        manager=ServiceManager()
+        definition=manager.installed_definition(args.service_name,args.state_dir)
+        getattr(manager,'remove' if args.service_action=='uninstall' else 'stop')(definition)
+        print('Service '+args.service_action+' complete')
+        return 0
     from quota_sentinel.config.diagnostics import dependency_problems
     path, effective = _effective_settings(args.state_dir, args)
     definition = service_definition(effective.settings, args.state_dir, path,
@@ -532,6 +538,16 @@ def run_send_test_card(state_dir: Path, args: argparse.Namespace) -> int:
     now = int(time.time())
 
     def deliver(factory_module) -> None:
+        path,effective=_effective_settings(state_dir,args)
+        if path.exists() or effective.settings.origin!='legacy-migration':
+            from quota_sentinel.runtime.feishu import FeishuClient,SelectedCredentials
+            settings=effective.settings
+            credentials=SelectedCredentials(settings.credentials,timeout=settings.budgets['credentials']['timeout'])
+            client=FeishuClient(credentials,total_timeout=settings.budgets['notification']['timeout'])
+            client.require_credentials()
+            payload=factory_module.preview_payload(args.mode,user_id=credentials.get('user_id'),request_uuid='test-%s-%d'%(args.mode,now),now=now)
+            client.send(payload)
+            return
         payload = factory_module.preview_payload(
             args.mode, user_id=factory_module.notifier_user_id(),
             request_uuid="test-%s-%d" % (args.mode, now), now=now,

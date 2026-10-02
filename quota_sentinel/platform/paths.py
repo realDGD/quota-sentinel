@@ -6,11 +6,21 @@ import platform
 import shutil
 import sys
 
+def user_home(environment=None):
+    env=os.environ if environment is None else environment
+    return Path(env.get('HOME') or env.get('USERPROFILE') or Path.home())
+
+def expand_path(value,environment=None):
+    text=str(value)
+    if text=='~':return user_home(environment)
+    if text.startswith(('~/','~\\')):return user_home(environment)/text[2:]
+    return Path(text).expanduser()
+
 
 def default_state_dir(system=None, environment=None):
     env = os.environ if environment is None else environment
     if env.get('QUOTA_SENTINEL_STATE_DIR'):
-        return Path(env['QUOTA_SENTINEL_STATE_DIR']).expanduser()
+        return expand_path(env['QUOTA_SENTINEL_STATE_DIR'],env)
     system = platform.system() if system is None else system
     home = Path(env.get('USERPROFILE' if system == 'Windows' else 'HOME') or Path.home())
     if system == 'Darwin':

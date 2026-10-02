@@ -164,15 +164,12 @@ class Application:
         if self.runtime_plan is None:
             return set()
         path = self.state_dir / 'runtime-providers.json'
-        from quota_sentinel.state.activation import read_journal
+        from quota_sentinel.state.activation import read_journal,read_runtime_providers
         journal_pending, self._activation_revision = read_journal(self.activation_path)
-        try:
-            previous = json.loads(path.read_bytes())
-        except FileNotFoundError:
+        previous=read_runtime_providers(path)
+        if previous is None:
             self._write_active_transitions(journal_pending)
             return journal_pending
-        if not isinstance(previous, dict) or previous.get('schema_version') != 1 or not isinstance(previous.get('enabled'), list) or not isinstance(previous.get('awaiting_resume'), list):
-            raise ValueError('invalid provider activation metadata')
         awaiting = journal_pending | set(previous['awaiting_resume']) | (set(self.opening_providers) - set(previous['enabled']))
         self._write_active_transitions(awaiting)
         return awaiting

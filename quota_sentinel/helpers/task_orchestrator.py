@@ -378,21 +378,30 @@ class CommandResult:
 class SubprocessRunner:
     """One scheduler command with cancellable ownership after leader exit."""
     def __init__(self):
-        self._lock=threading.Lock();self._active=None
+        self._lock=threading.Lock();self._active=None;self._cancelled=False;self._generation=0
+    def reset(self):
+        with self._lock:self._generation+=1;self._cancelled=False
     @staticmethod
     def _terminate_group(process):
         process.stop(5)
     def run(self,args,timeout):
         from quota_sentinel.platform.process import spawn_owned
         started=time.monotonic();timed_out=False
+        with self._lock:
+            if self._cancelled:return CommandResult(130,False,0.0)
+            generation=self._generation
         process=spawn_owned(args,cwd=Path.cwd(),environment=os.environ,
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        with self._lock:self._active=process
+        with self._lock:
+            cancelled=self._cancelled or generation!=self._generation
+            self._active=process
         try:
-            try:process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out=True;process.stop(5)
-            code=process.poll()
+            if cancelled:process.stop(5);code=130
+            else:
+                try:process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out=True;process.stop(5)
+                code=process.poll()
         finally:
             process.close()
             with self._lock:
@@ -400,7 +409,8 @@ class SubprocessRunner:
         return CommandResult(exit_code=124 if timed_out else int(code or 0),
             timed_out=timed_out,elapsed=time.monotonic()-started)
     def cancel(self):
-        with self._lock:process=self._active
+        with self._lock:
+            self._cancelled=True;self._generation+=1;process=self._active
         if process is not None:process.stop(5)
 
 
@@ -842,6 +852,8 @@ class TaskOrchestrator:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        reset=getattr(self.runner,'reset',None)
+        if reset is not None:reset()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop,

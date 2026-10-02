@@ -5,6 +5,23 @@ from quota_sentinel.config import *
 from quota_sentinel.config.migration import capture_legacy_config
 from quota_sentinel.configure import configure
 class ConfigCliTests(unittest.TestCase):
+ def test_send_test_card_uses_saved_account_references(self):
+  from unittest.mock import patch
+  from quota_sentinel.__main__ import build_parser,run_send_test_card
+  from quota_sentinel.runtime import factory
+  from dataclasses import replace
+  c=replace(new_user_defaults(),credentials={name:CredentialReference('environment',variable) for name,variable in [('feishu_user_id','FIXTURE_RECEIVER'),('feishu_app_id','FIXTURE_APP'),('feishu_app_secret','FIXTURE_SECRET')]})
+  with tempfile.TemporaryDirectory() as tmp:
+   path=Path(tmp)/'config.json';save_config(path,c,expected_revision=None);args=build_parser().parse_args(['--config',str(path),'send-test-card','codex'])
+   with patch('quota_sentinel.__main__._runtime',return_value=factory),patch.object(factory,'notifier_user_id',side_effect=AssertionError('legacy account accessed')),patch.object(factory,'send_payload',side_effect=AssertionError('legacy transport accessed')),patch.dict('os.environ',{'FIXTURE_RECEIVER':'selected-user','FIXTURE_APP':'selected-app','FIXTURE_SECRET':'synthetic-secret'}),patch('quota_sentinel.runtime.feishu.FeishuClient.send',autospec=True) as send:
+    self.assertEqual(run_send_test_card(Path(tmp),args),0);client,payload=send.call_args.args
+    self.assertEqual(payload['receive_id'],'selected-user');self.assertEqual(client.credentials.get('app_id'),'selected-app')
+ def test_minimal_profile_offers_full_provider_inventory(self):
+  d=to_document(new_user_defaults());d['providers']={'codex':d['providers']['codex']};questions=[]
+  def answer(q):
+   questions.append(q);return 'n' if q.startswith('Save') else ''
+  configure(EffectiveConfig(parse_config(d),{},None),input_fn=answer,output_fn=lambda x:None)
+  for name in ('codex','antigravity','opencode','clinepass'):self.assertTrue(any(name in q for q in questions),name)
  def cli(self,*a):return subprocess.run([sys.executable,'-m','quota_sentinel',*a],text=True,capture_output=True,timeout=15)
  def test_edit_existing_starts_from_personal_choices(self):
   c=capture_legacy_config({},installed_preferences={'QUOTA_SENTINEL_ORCHESTRATOR_ENABLED':'1'});out=[]

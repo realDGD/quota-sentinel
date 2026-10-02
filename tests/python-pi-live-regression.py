@@ -7,6 +7,16 @@ from quota_sentinel.runtime.pi_live import PiLiveQuotaClient
 NOW=int(time.time())
 def payload():return {'rate_limit':{'primary_window':{'used_percent':19,'reset_at':NOW+18000,'limit_window_seconds':18000},'secondary_window':{'used_percent':8,'reset_at':NOW+604800,'limit_window_seconds':604800}}}
 class ClientTests(unittest.TestCase):
+ def test_supplied_home_owns_auth_sdk_and_plugin_coordinates(self):
+  from quota_sentinel.runtime.pi_live import selected_sdk_root,selected_plugin_root
+  with tempfile.TemporaryDirectory() as tmp:
+   c=self.client();c.environment={'HOME':tmp,'PATH':''};self.assertTrue(c.query('codex').fresh)
+   self.assertEqual(self.calls[0][3]['auth_path'],str((Path(tmp)/'.pi/agent/auth.json').resolve()))
+   d=to_document(c.config);d['clients'].update(pi_sdk='~/sdk',pi_auth='~/auth.json');c.config=parse_config(d)
+   self.assertTrue(c.query('codex').fresh);q=self.calls[-1][3]
+   self.assertEqual(q['sdk_path'],str((Path(tmp)/'sdk').resolve()));self.assertEqual(q['auth_path'],str((Path(tmp)/'auth.json').resolve()))
+   self.assertEqual(selected_plugin_root(c.config,environment=c.environment),Path(tmp).resolve()/'npm/node_modules/pi-antigravity')
+   self.assertIsNone(selected_sdk_root(self.config(),environment={'HOME':tmp,'PATH':''}))
  def config(self,selected=True):
   d=to_document(new_user_defaults());d['providers']['codex']['quota_chain']=['pi-live'] if selected else ['native'];return parse_config(d)
  def client(self,change=lambda r:r,selected=True):

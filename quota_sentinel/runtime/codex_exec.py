@@ -222,10 +222,11 @@ class CodexExecConfig:
         state_dir: Path,
     ) -> "CodexExecConfig":
         env = os.environ if environment is None else environment
-        home = Path(_env_value(env, "HOME", str(Path.home())))
+        from quota_sentinel.platform.paths import user_home,expand_path
+        home=user_home(env)
         return cls(
             codex_bin=Path(_env_value(env, "QUOTA_SENTINEL_CODEX_BIN", "/opt/homebrew/bin/codex")),
-            codex_home=Path(_env_value(env, "QUOTA_SENTINEL_CODEX_HOME", str(home / ".codex"))),
+            codex_home=expand_path(_env_value(env,"QUOTA_SENTINEL_CODEX_HOME",_env_value(env,"CODEX_HOME",str(home/".codex"))),env).absolute(),
             state_dir=Path(state_dir),
             timeout=_env_float(env, "QUOTA_SENTINEL_CODEX_TIMEOUT", CODEX_EXEC_TIMEOUT_SECONDS),
             kill_grace=_env_float(env, "QUOTA_SENTINEL_CODEX_KILL_GRACE", 10),

@@ -18,4 +18,9 @@ def service_definition(config,state_dir,config_path,*,environment=None,name='quo
  if plan.start_listener:budget=max(budget,listener_usage_budget({},config=config))
  return ServiceDefinition(name,(sys.executable,'-m','quota_sentinel','--state-dir',str(state_dir),'--config',str(config_path),'serve'),state_dir,service_environment(os.environ if environment is None else environment),max(15,budget+CLEANUP_ALLOWANCE_SECONDS))
 
-def installation_extras(config):return selected_extras(build_runtime_plan(config,'serve'))
+def installation_extras(config):
+ commands=['serve','run']
+ if config.features.quota_queries:commands.append('usage')
+ extras=set()
+ for command in commands:extras.update(selected_extras(build_runtime_plan(config,command)))
+ return tuple(x for x in ('feishu','secret-service','kwallet') if x in extras)

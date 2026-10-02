@@ -15,6 +15,40 @@ from quota_sentinel.state.new_installation import initialize_new_installation
 from quota_sentinel.platform.process import CommandResult
 
 class Services(unittest.TestCase):
+ def test_corrupt_installed_budget_keeps_stop_identity(self):
+  import json
+  for system in ('Darwin','Linux','Windows'):
+   with self.subTest(system=system):
+    m=self.manager(system);d=self.definition();path=m.manifest_path(d) if system=='Windows' else m.path(d);path.parent.mkdir(parents=True,exist_ok=True)
+    value=str(10**1000)
+    raw=('<plist version="1.0"><dict><key>ExitTimeOut</key><integer>'+value+'</integer></dict></plist>') if system=='Darwin' else json.dumps({'stop_timeout':int(value)}) if system=='Windows' else 'TimeoutStopSec='+value
+    path.write_text(raw);stopping=m.installed_definition(d.name,self.state)
+    self.assertEqual(stopping.name,d.name);self.assertEqual(stopping.stop_timeout,300)
+ def test_listener_without_queries_can_be_installed(self):
+  c=replace(self.c,features=FeatureSettings(False,False,False,True))
+  self.assertIsNotNone(self.definition(c))
+ def test_manual_query_selects_store_extras_and_diagnostics(self):
+  from quota_sentinel.install import installation_extras
+  from quota_sentinel.config.diagnostics import dependency_problems
+  for backend,module in (('secret-service','secretstorage'),('kwallet','dbus')):
+   with self.subTest(backend=backend):
+    providers=dict(self.c.providers);providers['codex']=replace(providers['codex'],enabled=False);providers['opencode']=replace(providers['opencode'],enabled=True,opening_enabled=False)
+    c=replace(self.c,features=FeatureSettings(False,True,False,False),providers=providers,clients={'curl':sys.executable},credentials={'opencode':CredentialReference('system',backend+':selected')})
+    self.assertEqual(installation_extras(c),(backend,))
+    with patch('sys.platform','linux'),patch('importlib.util.find_spec',side_effect=lambda name:None if name==module else object()):
+     self.assertIn('Install selected extra: quota-sentinel['+backend+']',dependency_problems(c))
+ def test_stop_and_remove_work_with_broken_config_or_authority(self):
+  from quota_sentinel.__main__ import main
+  for action in ('stop','uninstall'):
+   for defect in ('invalid','missing','authority'):
+    with self.subTest(action=action,defect=defect),tempfile.TemporaryDirectory() as tmp:
+     state=Path(tmp)/'state';initialize_new_installation(state,new_user_defaults());config=state/'config.json'
+     if defect=='invalid':config.write_text('{')
+     elif defect=='missing':config.unlink()
+     else:(state/'backend-authority.json').unlink()
+     with patch('quota_sentinel.platform.services.ServiceManager') as manager:
+      self.assertEqual(main(['--state-dir',str(state),'--config',str(config),'service',action,'--name','quota-sentinel.fixture']),0)
+      getattr(manager.return_value,'remove' if action=='uninstall' else action).assert_called_once()
  def setUp(self):
   self.assertIsNotNone(importlib.util.find_spec('quota_sentinel.platform.services'),'service boundary missing')
   from quota_sentinel.platform.services import ServiceManager, ServiceDefinition, ServiceError

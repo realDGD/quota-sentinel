@@ -66,10 +66,11 @@ def check_budget(c,plan):
 def listener_usage_budget(environment,*,config=None,plan=None):
  if config is None:
   from pathlib import Path
-  from quota_sentinel.config import read_config
+  from quota_sentinel.config.migration import resolve_config
   path=environment.get('QUOTA_SENTINEL_CONFIG')
   if not path:return 480.0 # explicit legacy listener entry until service migration
-  config=read_config(Path(path)).settings
+  config=resolve_config(Path(path),Path(path).parent,environment).settings
+ if not config.features.quota_queries:return 0.0
  if plan is None:
   from .selection import build_runtime_plan
   plan=build_runtime_plan(config,'usage')

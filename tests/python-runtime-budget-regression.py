@@ -6,6 +6,30 @@ from quota_sentinel.config.migration import capture_legacy_config
 from quota_sentinel.runtime.selection import build_runtime_plan
 from quota_sentinel.runtime.budgets import check_budget,usage_budget
 class BudgetTests(unittest.TestCase):
+ def test_disabled_listener_query_needs_no_usage_budget(self):
+  from dataclasses import replace
+  from quota_sentinel.runtime.budgets import listener_usage_budget
+  c=replace(new_user_defaults(),features=FeatureSettings(False,False,False,True))
+  self.assertEqual(listener_usage_budget({},config=c),0)
+ def test_resolved_environment_is_the_runner_budget_authority(self):
+  from quota_sentinel.config.migration import resolve_config
+  from quota_sentinel.runtime.selected_factory import runtime_environment
+  from quota_sentinel.runtime.models import ModelRunnerConfig
+  from tempfile import TemporaryDirectory
+  with TemporaryDirectory() as tmp:
+   path=Path(tmp)/'config.json';save_config(path,self.change(new_user_defaults(),'pi','timeout',1),expected_revision=None)
+   for raw in ('','invalid','NaN','inf','-1','0','2'):
+    with self.subTest(raw=raw):
+     env={'QUOTA_SENTINEL_MODEL_TIMEOUT':raw};c=resolve_config(path,path.parent,env).settings
+     self.assertEqual(ModelRunnerConfig.from_env(runtime_environment(c,env)).timeout,c.budgets['pi']['timeout'])
+ def test_standard_codex_home_matches_opening_and_collector(self):
+  from quota_sentinel.runtime.codex_exec import CodexExecConfig
+  from quota_sentinel.runtime.quota_probe import QuotaCollector
+  from tempfile import TemporaryDirectory
+  with TemporaryDirectory() as tmp:
+   env={'HOME':tmp,'CODEX_HOME':str(Path(tmp)/'alternate')};cfg=CodexExecConfig.from_env(env,state_dir=Path(tmp))
+   collector=QuotaCollector(Path(tmp),Path(tmp),environment=env)
+   self.assertEqual(str(cfg.codex_home),collector.environment['CODEX_HOME'])
  def change(self,c,group,key,value):
   d=to_document(c);d['budgets'][group][key]=value;return parse_config(d)
  def test_single_codex_excludes_pi(self):

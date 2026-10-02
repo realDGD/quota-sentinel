@@ -22,18 +22,20 @@ class NullNotifier:
   print(json.dumps({p:r.document for p,r in readings.items()},ensure_ascii=False))
 def runtime_environment(settings,environment):
  from quota_sentinel.config.migration import BUDGET_ENV,APP_ENV
+ from quota_sentinel.platform.paths import expand_path
  env=dict(environment)
  env["QUOTA_SENTINEL_VERIFY_PI_PLUGINS"]="1"
  env["QUOTA_SENTINEL_PI_PLUGIN_TIMEOUT"]=str(settings.budgets["pi"]["plugin_timeout"])
  for provider in ("antigravity", "clinepass"):
   if provider+"_plugin" in settings.clients:env["QUOTA_SENTINEL_"+provider.upper()+"_PLUGIN"]=settings.clients[provider+"_plugin"]
- for k,v in settings.app.items():env.setdefault(APP_ENV[k],str(v))
+ for k,v in settings.app.items():env[APP_ENV[k]]=str(v)
  for group,names in BUDGET_ENV.items():
-  for key,suffix in names.items():env.setdefault('QUOTA_SENTINEL_'+suffix,str(settings.budgets[group][key]))
+  for key,suffix in names.items():env['QUOTA_SENTINEL_'+suffix]=str(settings.budgets[group][key])
  for name in ('pi','codex','agy','codexbar','curl','uv','node'):
-  env.setdefault('QUOTA_SENTINEL_'+name.upper()+'_BIN',settings.clients.get(name,shutil.which(name) or name))
+  value=settings.clients.get(name,shutil.which(name,path=env.get('PATH','')) or name)
+  env['QUOTA_SENTINEL_'+name.upper()+'_BIN']=str(expand_path(value,env))
  for key,var in (('pi_auth','QUOTA_SENTINEL_PI_AUTH_FILE'),('codex_home','QUOTA_SENTINEL_CODEX_HOME')):
-  if key in settings.clients:env.setdefault(var,settings.clients[key])
+  if key in settings.clients:env[var]=str(expand_path(settings.clients[key],env).absolute())
  return env
 def create_selected_application(state_dir,settings,plan,*,environment,clock,sleep,dry_run_flag=None):
  from .factory import quota_probe_options

@@ -2,11 +2,13 @@
 import json
 from .config import to_document,parse_config,ConfigurationError
 from .runtime.pi_plugins import plugin_guidance
-from .config.defaults import OPENING_CHANNELS,QUERY_CHANNELS
+from .config.defaults import OPENING_CHANNELS,QUERY_CHANNELS,PROVIDERS,default_provider
+from dataclasses import asdict
 class _Cancel(Exception):pass
 
 def configure(config,*,input_fn=input,output_fn=print):
  d=to_document(config.settings)
+ for p in PROVIDERS:d['providers'].setdefault(p,asdict(default_provider(p)))
  def ask(prompt):
   value=input_fn(prompt).strip()
   if value.lower() in ('cancel','quit','q'):raise _Cancel()

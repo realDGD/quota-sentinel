@@ -56,36 +56,27 @@ def _windows_open(path, mode):
     kernel.CloseHandle.argtypes = [w.HANDLE]
     kernel.LocalFree.argtypes = [c.c_void_p]
     try:
-        get_attributes = kernel.GetFileAttributesW
-        get_attributes.argtypes = [w.LPCWSTR]; get_attributes.restype = w.DWORD
-        existing = get_attributes(str(path))
-        if existing != 0xFFFFFFFF and existing & 0x400:
-            raise OSError('private file cannot be a reparse point')
-        if mode != 'rb' and path.exists():
-            set_security = security.SetFileSecurityW
-            set_security.argtypes = [w.LPCWSTR, w.DWORD, c.c_void_p]
-            set_security.restype = w.BOOL
-            if not set_security(str(path), 0x80000004, descriptor):
-                raise c.WinError(c.get_last_error())
         attributes = Attributes(c.sizeof(Attributes), descriptor, False)
-        access = 0x80000000 if mode == 'rb' else 0xC0000000
+        access = (0x80000000 | 0x00020000) if mode == 'rb' else (0xC0000000 | 0x00060000)
         disposition = {'rb': 3, 'wb': 4, 'xb': 1, 'ab': 4, 'r+b': 3}[mode]
         handle = create(str(path), access, 7, c.byref(attributes), disposition,
                         0x00200080, None)  # OPEN_REPARSE_POINT, NORMAL
         if handle == c.c_void_p(-1).value:
             raise c.WinError(c.get_last_error())
-        # Reject reparse points rather than traversing a secret-file symlink.
-        if get_attributes(str(path)) & 0x400:
-            kernel.CloseHandle(handle)
-            raise OSError('private file cannot be a reparse point')
         try:
+            from .windows_files import protect_file_handle
+            protect_file_handle(handle,descriptor,sid,writable=mode!='rb')
             fd = msvcrt.open_osfhandle(handle, os.O_BINARY | (os.O_RDONLY if mode == 'rb' else os.O_RDWR))
         except BaseException:
             kernel.CloseHandle(handle)
             raise
-        if mode == 'wb':os.ftruncate(fd, 0)
-        if mode == 'ab':os.lseek(fd, 0, os.SEEK_END)
-        return os.fdopen(fd, mode)
+        try:
+            if mode == 'wb':os.ftruncate(fd, 0)
+            if mode == 'ab':os.lseek(fd, 0, os.SEEK_END)
+            return os.fdopen(fd, mode)
+        except BaseException:
+            os.close(fd)
+            raise
     finally:
         kernel.LocalFree(descriptor)
 

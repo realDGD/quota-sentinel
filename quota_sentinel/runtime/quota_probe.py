@@ -167,8 +167,9 @@ class QuotaCollector:
         pi_live_client=None,
     ) -> None:
         self.environment=dict(os.environ if environment is None else environment)
-        if self.environment.get("QUOTA_SENTINEL_CODEX_HOME"):
-            self.environment["CODEX_HOME"]=self.environment["QUOTA_SENTINEL_CODEX_HOME"]
+        from quota_sentinel.platform.paths import user_home,expand_path
+        home=self.environment.get('QUOTA_SENTINEL_CODEX_HOME') or self.environment.get('CODEX_HOME') or user_home(self.environment)/'.codex'
+        self.environment['CODEX_HOME']=str(expand_path(home,self.environment).absolute())
         self.providers = tuple(providers)
         self.pi_live_client = pi_live_client
         self.tier_chains = {p: tuple(Tier(t) for t in tier_chains[p]) for p in self.providers} if tier_chains is not None else None
@@ -312,8 +313,13 @@ class QuotaCollector:
                 limits=response.get('result',{}).get('rateLimits',{})
                 primary,secondary=limits.get('primary'),limits.get('secondary')
                 if not isinstance(primary,dict) or not isinstance(secondary,dict) or not primary or not secondary:return None
-                five=primary if primary.get('windowDurationMins',300)<=360 else secondary
-                weekly=secondary if secondary.get('windowDurationMins',10080)>360 else primary
+                periods={}
+                for value in (primary,secondary):
+                    duration=value.get('windowDurationMins')
+                    if type(duration) is not int or duration not in (300,10080) or duration in periods:return None
+                    periods[duration]=value
+                if set(periods)!={300,10080}:return None
+                five,weekly=periods[300],periods[10080]
                 def window(value):
                     used=value.get('usedPercent');reset=value.get('resetsAt')
                     if type(used) not in (int,float) or not math.isfinite(used) or not 0<=used<=100 or type(reset) is not int or reset<=0:raise ValueError('invalid native window')
@@ -430,6 +436,7 @@ class QuotaCollector:
         for provider in self.providers:
             quota = None
             selected = None
+            display_fallback=None
             for tier in (self.tier_chains[provider] if self.tier_chains is not None else tier_plan(provider)):
                 if tier not in _TIERS:
                     # The shell dies on an unknown tier rather than serving
@@ -459,9 +466,11 @@ class QuotaCollector:
                     "ok" if quota is not None else "none",
                     time.monotonic() - started,
                 ))
+                if quota is not None and display_fallback is None:display_fallback=(tier,quota)
                 if quota is not None and (purpose == "display" or tier in FRESH_TIERS and quota.fresh and not quota.cached):
                     selected = tier
                     break
+            if selected is None and display_fallback is not None:selected,quota=display_fallback
             if selected is None:
                 self.logger("quota %s: selected none (all tiers unavailable)"
                             % provider)

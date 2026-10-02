@@ -384,6 +384,22 @@ class TaskStoreConnectionLifetimeTest(unittest.TestCase):
 
 
 class SubprocessRunnerLifetimeTest(unittest.TestCase):
+    def test_cancel_before_run_prevents_spawn(self):
+        runner=SubprocessRunner();runner.cancel()
+        with patch('quota_sentinel.platform.process.spawn_owned') as spawn:
+            result=runner.run(('fixture',),10);spawn.assert_not_called();self.assertEqual(result.exit_code,130)
+    def test_cancel_while_spawn_is_returning_stops_created_process(self):
+        from unittest.mock import Mock
+        entered=threading.Event();release=threading.Event();process=Mock();process.poll.return_value=0
+        def spawn(*args,**kw):entered.set();self.assertTrue(release.wait(2));return process
+        runner=SubprocessRunner();errors=[]
+        def run():
+            try:runner.run(('fixture',),10)
+            except BaseException as error:errors.append(error)
+        with patch('quota_sentinel.platform.process.spawn_owned',side_effect=spawn):
+            thread=threading.Thread(target=run);thread.start();self.assertTrue(entered.wait(2));runner.cancel();release.set();thread.join(3)
+        self.assertFalse(thread.is_alive());self.assertFalse(errors);process.stop.assert_called_once();process.close.assert_called_once()
+        process.wait.assert_not_called()
     def test_outer_timeout_kills_detached_nested_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

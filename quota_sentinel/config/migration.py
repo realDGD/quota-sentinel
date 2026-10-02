@@ -22,8 +22,13 @@ def _overrides(c,env,sources):
    raw=env.get('QUOTA_SENTINEL_'+suffix,'')
    try:value=float(raw)
    except (ValueError,TypeError):continue
+   if k in ('transient_attempts','input_ceiling','output_ceiling'):
+    if not raw.strip().isdigit():continue
+    value=int(raw)
    if group=='agy' and k=='preflight':value=0 if raw=='0' else 1
-   if math.isfinite(value) and value>=0 and (value>0 or k in ('kill_grace','codexbar_kill_grace','preflight')):
+   try:finite=math.isfinite(value)
+   except OverflowError:continue
+   if finite and value>=0 and (value>0 or k in ('kill_grace','codexbar_kill_grace','preflight','transient_attempts')):
     d['budgets'][group][k]=value;sources['budgets.'+group+'.'+k]='environment'
  for client in ('pi','codex','agy','codexbar','curl','node','uv'):
   value=env.get('QUOTA_SENTINEL_'+client.upper()+'_BIN')

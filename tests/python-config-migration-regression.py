@@ -6,6 +6,12 @@ from quota_sentinel.config.migration import resolve_config,capture_legacy_config
 from quota_sentinel.state.new_installation import initialize_new_installation
 from quota_sentinel.state.authority import read_authority,AuthorityMissingError
 class MigrationTests(unittest.TestCase):
+ def test_oversized_integer_override_keeps_saved_preference(self):
+  c=capture_legacy_config({'QUOTA_SENTINEL_AGY_TRANSIENT_RETRIES':str(10**1000)},installed_preferences={})
+  self.assertEqual(c.budgets['agy']['transient_attempts'],3)
+ def test_zero_transient_retry_legacy_preference_preserved(self):
+  c=capture_legacy_config({'QUOTA_SENTINEL_AGY_TRANSIENT_RETRIES':'0'},installed_preferences={})
+  self.assertEqual(c.budgets['agy']['transient_attempts'],0)
  def test_personal_profile_preserved(self):
   c=capture_legacy_config({},installed_preferences={'QUOTA_SENTINEL_ORCHESTRATOR_ENABLED':'1'})
   self.assertEqual(c.providers['codex'].opening_chain,('pi','codex')); self.assertEqual(c.providers['antigravity'].opening_chain,('agy','pi')); self.assertEqual(c.providers['clinepass'].opening_chain,('direct',)); self.assertEqual(c.providers['codex'].quota_chain,('native','codexbar-live','codexbar-cache','pi-snapshot')); self.assertEqual(tuple(c.app.values()),(3,2,30,780,20,60)); self.assertTrue(c.features.feishu_listener)

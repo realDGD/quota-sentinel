@@ -37,7 +37,7 @@ def dependency_problems(c):
  import sys
  if sys.platform=='linux':
   import importlib.util
-  from quota_sentinel.runtime.selection import build_runtime_plan,selected_extras
+  from quota_sentinel.install import installation_extras
   for extra,module in (('secret-service','secretstorage'),('kwallet','dbus')):
-   if extra in selected_extras(build_runtime_plan(c,'serve')) and importlib.util.find_spec(module) is None:problems.append('Install selected extra: quota-sentinel['+extra+']')
+   if extra in installation_extras(c) and importlib.util.find_spec(module) is None:problems.append('Install selected extra: quota-sentinel['+extra+']')
  return problems
