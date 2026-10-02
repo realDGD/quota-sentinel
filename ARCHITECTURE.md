@@ -852,3 +852,8 @@ Display queries stop at the first usable result; scheduling skips stale results 
 Antigravity uses the selected plugin's metadata function and validates intercepted raw quota-summary fields before the plugin can replace missing fractions with zero. Supported Pi-owner refresh uses the plugin's verified Google OAuth constants and Pi credential-store lock through the guarded request boundary; the plugin's independent Undici refresh is not called. Codex uses Pi-owned OAuth and an account-scoped WHAM usage request. OpenCode uses the selected stored Pi API key and the existing usage endpoint. ClinePass live Pi queries remain unsupported.
 
 `Tier.PI_LIVE` is a live capability but is absent from the legacy/default ladder. Only explicitly saved chains invoke it. A failed live query cannot prepare any model runner or move an anchor.
+
+
+## Platform boundaries and installed resources
+
+Selected external calls use owned process boundaries; Windows starts suspended and assigns a Job Object before execution. Paths, private publication, native locks, bounded credential workers and current-user service adapters live in `quota_sentinel/platform`. Implementations and Python/JS/TS helper resources are packaged under `quota_sentinel/helpers`; root scripts preserve source entry names. Service installation and start are separate from saving configuration. Core imports remain stdlib-only, with Feishu/Linux password libraries as selected extras. Native proof, cleanup scope and unsupported session cases are recorded in [PLATFORMS.md](docs/PLATFORMS.md); Windows/Linux are not certified by Mac fixtures.

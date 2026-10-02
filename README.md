@@ -912,9 +912,9 @@ Use `quota-sentinel configure` to edit an existing profile, `config show` to ins
 
 `quota-sentinel serve` starts one scheduler when automatic opening is selected and one listener when the bot is selected. Opening-only services do not import the bot SDK; listener-only services do not start the scheduler. An authorized incoming `/usage` command can receive a reply with automatic push disabled. Independent queries disabled means the bot cannot run that query.
 
-Save and inspect the configuration before starting the host. Each host keeps its resolved configuration for its lifetime; edit, then explicitly restart to apply. The legacy listener entry and plist remain compatible with unsaved installations. The selected-service plist template is separate; configuration saving does not install it.
+Save and inspect the configuration before starting the host. Each host keeps its resolved configuration for its lifetime; edit, then explicitly restart to apply. The legacy listener entry and plist remain compatible with unsaved installations. Use `service install`, `service start`, `service stop` and `service uninstall` for the selected current-user host. Installation is separate from starting; uninstall keeps state, history and credentials. The legacy plist remains a compatibility artifact.
 
-The regression dispatcher discovers added Python suites, isolates credentials and home directories, bounds every script, and exits nonzero for any failed suite. `--platform portable` runs the platform-independent subset; native gates run only on their actual OS. Windows/Linux service/process/credential support remains in the subsequent approved platform implementation plan until its native gates pass. No supplier smoke tests are part of this dispatcher.
+The regression dispatcher discovers added Python suites, isolates credentials and home directories, bounds every script, and exits nonzero for any failed suite. `--platform portable` runs the platform-independent subset; native gates run only on their actual OS. Windows/Linux adapters are present; their native proof remains UNVERIFIED on this Mac. The [platform matrix](docs/PLATFORMS.md) records available proof, optional password-store dependencies, session limits and service migration. No supplier smoke tests are part of this dispatcher.
 
 ### Optional Pi live quota queries
 

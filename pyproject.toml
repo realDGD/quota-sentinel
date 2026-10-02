@@ -1,7 +1,7 @@
 [project]
 name = "quota-sentinel"
 version = "0.1.0"
-description = "macOS-first local AI quota scheduler and Feishu notifier"
+description = "Configurable local AI quota scheduler with optional Feishu notifications"
 requires-python = ">=3.9"
 dependencies = []
 
@@ -19,8 +19,12 @@ quota-sentinel = "quota_sentinel.__main__:main"
 [build-system]
 # Exact-pinned: uv does NOT record build-system requires in uv.lock, so
 # the editable build would otherwise float a fresh hatchling resolve on
-# every sync. 1.32.4 is the version the project has actually built with.
-requires = ["hatchling==1.32.4"]
+# every sync. Python 3.9 uses the last compatible pinned line; modern Python
+# retains the already validated build backend.
+requires = [
+  "hatchling==1.27.0; python_version < '3.10'",
+  "hatchling==1.32.4; python_version >= '3.10'",
+]
 build-backend = "hatchling.build"
 
 # Package implementations and helper resources; root scripts preserve source entry names.
