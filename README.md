@@ -895,3 +895,7 @@ the contract itself changed, and the reason is recorded in the commit.
 
 MIT — see [LICENSE](LICENSE).
 
+
+### Optional Pi opening plugins
+
+Choosing Pi as a primary or fallback for Antigravity requires `pi install npm:pi-antigravity`; ClinePass requires `pi install npm:pi-clinepass-provider`. Complete the corresponding login inside Pi. The selected plugin entry and provider/model registration are checked before opening. ClinePass Pi opening uses `clinepass` / `cline-pass/deepseek-v4.1-flash` and supplies no quota capture hook. Plugin installation is never performed at runtime.

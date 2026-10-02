@@ -13,6 +13,10 @@ class NullNotifier:
 def runtime_environment(settings,environment):
  from quota_sentinel.config.migration import BUDGET_ENV,APP_ENV
  env=dict(environment)
+ env["QUOTA_SENTINEL_VERIFY_PI_PLUGINS"]="1"
+ env["QUOTA_SENTINEL_PI_PLUGIN_TIMEOUT"]=str(settings.budgets["pi"]["plugin_timeout"])
+ for provider in ("antigravity", "clinepass"):
+  if provider+"_plugin" in settings.clients:env["QUOTA_SENTINEL_"+provider.upper()+"_PLUGIN"]=settings.clients[provider+"_plugin"]
  for k,v in settings.app.items():env.setdefault(APP_ENV[k],str(v))
  for group,names in BUDGET_ENV.items():
   for key,suffix in names.items():env.setdefault('QUOTA_SENTINEL_'+suffix,str(settings.budgets[group][key]))

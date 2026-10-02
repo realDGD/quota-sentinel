@@ -79,6 +79,9 @@ class ModelRunnerConfig:
     environment: Optional[Mapping[str, str]] = None
     # Optional run-log seam; ``None`` keeps every existing caller silent.
     logger: Optional[Callable[[str], None]] = None
+    plugin_entries: Optional[Mapping[str, Path]] = None
+    plugin_timeout: float = 15
+    verify_plugins: bool = False
 
     @classmethod
     def from_env(cls, environment: Optional[Mapping[str, str]] = None) -> "ModelRunnerConfig":
@@ -98,6 +101,9 @@ class ModelRunnerConfig:
                 env, "QUOTA_SENTINEL_PI_AUTH_TIMEOUT", PI_AUTH_TIMEOUT_SECONDS
             ),
             environment=environment,
+            plugin_entries={p: Path(env["QUOTA_SENTINEL_"+p.upper()+"_PLUGIN"]) for p in ("antigravity", "clinepass") if env.get("QUOTA_SENTINEL_"+p.upper()+"_PLUGIN")},
+            plugin_timeout=_env_positive_float(env, "QUOTA_SENTINEL_PI_PLUGIN_TIMEOUT", 15),
+            verify_plugins=env.get("QUOTA_SENTINEL_VERIFY_PI_PLUGINS") == "1",
         )
 
 
@@ -121,17 +127,23 @@ class AttemptResult:
     error_summary: str
 
 
+@dataclass(frozen=True)
+class PiProviderSpec:
+    provider_id: str
+    model: str
+    thinking: str
+    capture_env: Optional[str]
+    capture_extension: Optional[Path]
+    plugin_id: Optional[str]
+
 _PI_PROVIDER = {
-    "codex": ("openai-codex", "gpt-6-luna", "off", "PI_CODEX_QUOTA_FILE"),
-    "antigravity": ("antigravity", "gemini-3.7-flash", "low", "PI_ANTIGRAVITY_QUOTA_FILE"),
-    # OpenCode Go is delivered by runtime/direct.py in production; this row
-    # stays because the Pi transport remains selectable, and the model is kept
-    # identical to the direct one so a transport A/B compares transports only.
-    "opencode": ("opencode-go", "deepseek-v4.1-flash", "off", "PI_OPENCODE_QUOTA_FILE"),
+    'codex': PiProviderSpec('openai-codex','gpt-6-luna','off','PI_CODEX_QUOTA_FILE',Path('capture-codex-quota.ts'),None),
+    'antigravity': PiProviderSpec('antigravity','gemini-3.7-flash','low','PI_ANTIGRAVITY_QUOTA_FILE',Path('capture-antigravity-quota.ts'),'pi-antigravity'),
+    'opencode': PiProviderSpec('opencode-go','deepseek-v4.1-flash','off','PI_OPENCODE_QUOTA_FILE',Path('capture-opencode-quota.ts'),None),
+    'clinepass': PiProviderSpec('clinepass','cline-pass/deepseek-v4.1-flash','off',None,None,'pi-clinepass-provider'),
 }
-# The configuration entry reads the same roster that prepare()/run() accept.
 PI_PROVIDERS = frozenset(_PI_PROVIDER)
-_QUOTA_ENV_KEYS = tuple(item[3] for item in _PI_PROVIDER.values())
+_QUOTA_ENV_KEYS = tuple(spec.capture_env for spec in _PI_PROVIDER.values() if spec.capture_env)
 _PROMPT = "不用思考，只回复我 1"
 
 
@@ -326,7 +338,8 @@ class ModelRunner:
         env.pop("ANTIGRAVITY_NO_PREWARM", None)
         env["PI_CODING_AGENT_DIR"] = str(paths.agent_dir)
         env["PI_OFFLINE"] = "1"
-        env[_PI_PROVIDER[provider][3]] = str(paths.quota_path)
+        if _PI_PROVIDER[provider].capture_env:
+            env[_PI_PROVIDER[provider].capture_env] = str(paths.quota_path)
         if provider == "antigravity":
             env["ANTIGRAVITY_NO_PREWARM"] = "1"
         return env
@@ -440,7 +453,8 @@ class ModelRunner:
             stderr.write(captured_bytes)
 
     def _command(self, provider: str) -> list[str]:
-        pi_provider, model, thinking, _ = _PI_PROVIDER[provider]
+        spec = _PI_PROVIDER[provider]
+        pi_provider, model, thinking = spec.provider_id, spec.model, spec.thinking
         command = [
             str(self.config.pi_bin), "--provider", pi_provider, "--model", model,
             "--thinking", thinking, "--mode", "text", "--print", "--no-session",
@@ -448,9 +462,14 @@ class ModelRunner:
             "--no-themes", "--no-context-files", "--no-approve", "--offline",
             "--system-prompt", "忽略上下文",
         ]
-        if provider == "antigravity":
-            command.extend(["--extension", str(self.config.antigravity_provider_extension)])
-        command.extend(["--extension", str(Path(self.config.repo_dir) / f"capture-{provider}-quota.ts")])
+        if spec.plugin_id:
+            from .pi_plugins import plugin_entry
+            entry = plugin_entry(provider, self.config)
+            if entry is None:
+                raise ValueError("missing selected Pi plugin")
+            command.extend(["--extension", str(entry)])
+        if spec.capture_extension is not None:
+            command.extend(["--extension", str(Path(self.config.repo_dir) / spec.capture_extension)])
         command.extend(["--", _PROMPT])
         return command
 

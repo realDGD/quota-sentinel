@@ -336,7 +336,7 @@ def _provider_hooks(provider: str, config: ModelRunnerConfig, transport: str) ->
         # nor Pi's provider extension is part of its delivery path; requiring
         # a file this deployment does not use would refuse runs that work.
         return []
-    hooks = [REPO_DIR / ("capture-%s-quota.ts" % provider)]
+    hooks = [] if provider == "clinepass" else [REPO_DIR / ("capture-%s-quota.ts" % provider)]
     if provider == "antigravity":
         # Pi loads this provider extension for antigravity runs; a model
         # attempt without it fails after the timeout, not before.
@@ -443,6 +443,12 @@ def readiness_problems(
         if not os.access(path, os.X_OK):
             problems.append("%s is not executable: %s" % (name, path))
 
+    for provider in pi_providers:
+        if provider == "clinepass":
+            from .pi_plugins import plugin_entry, plugin_guidance
+            entry = plugin_entry(provider, config)
+            if entry is None or not entry.is_file():
+                problems.append("missing ClinePass Pi plugin: " + "; ".join(plugin_guidance(provider)))
     for provider in providers:
         if provider not in PROVIDERS:
             problems.append("unknown provider: %s" % provider)

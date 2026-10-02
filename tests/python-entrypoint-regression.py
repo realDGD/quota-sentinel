@@ -338,17 +338,12 @@ class EntrypointCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "ready")
 
-    def test_e12c_clinepass_pi_is_refused_before_runtime_work(self):
-        for verb in (("status",), ("run", "clinepass"), ("check",)):
+    def test_e12c_clinepass_pi_missing_plugin_refused_before_model(self):
+        for verb in (("status",), ("run", "clinepass")):
             with self.subTest(verb=verb):
-                result = self.cli(*verb, env={
-                    "QUOTA_SENTINEL_TRANSPORT": "clinepass=pi",
-                })
-                self.assertEqual(result.returncode, 3, result.stderr)
-                self.assertIn("invalid argument", result.stderr)
-                self.assertIn("'clinepass'", result.stderr)
-                self.assertIn("'pi'", result.stderr)
-                self.assertIn("clinepass supports: direct", result.stderr)
+                result = self.cli(*verb, env={"QUOTA_SENTINEL_TRANSPORT": "clinepass=pi"})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("pi-clinepass-provider", result.stderr + result.stdout)
                 self.assertNotIn("Traceback", result.stderr)
         self.assertFalse(self.capture.exists(), "a model was started anyway")
         self.assertIsNone(self.store().load("clinepass").last_task_at)
@@ -373,10 +368,8 @@ class TransportOverrideTest(unittest.TestCase):
             "opencode": "direct", "clinepass": "direct",
         })
 
-    def test_clinepass_pi_override_is_refused_with_direct_as_its_option(self):
-        with self.assertRaises(ValueError) as caught:
-            self.mapping("clinepass=pi")
-        self.assertIn("clinepass supports: direct", str(caught.exception))
+    def test_clinepass_pi_override_has_an_implemented_capability(self):
+        self.assertEqual(self.mapping("clinepass=pi")["clinepass"], "pi")
 
     def test_unservable_pairs_are_refused_with_their_real_options(self):
         for value, provider, transport, supported in (
@@ -435,7 +428,7 @@ class TransportOverrideTest(unittest.TestCase):
             self.assertIn(transport_for(provider), supported_transports(provider))
         for provider in ("codex", "antigravity", "opencode"):
             self.assertIn("pi", supported_transports(provider))
-        self.assertEqual(supported_transports("clinepass"), ["direct"])
+        self.assertEqual(supported_transports("clinepass"), ["direct", "pi"])
 
 
 if __name__ == "__main__":
