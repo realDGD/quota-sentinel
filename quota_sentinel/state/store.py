@@ -226,27 +226,11 @@ def _publish_atomic(path: Path, payload: bytes) -> None:
     old or new value, never a mix. No value-level serialization or
     encoding may happen here — the bytes are final by contract.
 
-    Temp names come from tempfile.mkstemp (kernel-globally unique): a
-    pid+random scheme is only probabilistically safe, and mkstemp also
-    fixes creation mode at 0600.
+    The platform boundary creates an exclusive private temporary file and
+    replaces it only after the complete bytes have been flushed.
     """
-    directory = path.parent
-    fd, temp_name = tempfile.mkstemp(
-        dir=str(directory), prefix=f"{path.name}.tmp.", suffix=""
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        # Clean up our temp file, but let the original error propagate.
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+    from quota_sentinel.platform.files import publish_private
+    publish_private(path, payload)
 
 
 class ProviderStateStore:

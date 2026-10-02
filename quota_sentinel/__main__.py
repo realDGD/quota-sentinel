@@ -76,10 +76,8 @@ from quota_sentinel.quota import cli as quota_cli
 
 
 def default_state_dir() -> Path:
-    env = os.environ.get("QUOTA_SENTINEL_STATE_DIR")
-    if env:
-        return Path(env)
-    return Path.home() / "Library/Application Support/Quota-Sentinel"
+    from quota_sentinel.platform.paths import default_state_dir as platform_state_dir
+    return platform_state_dir()
 
 
 # Every mode the shell accepted for card-preview / send-test-card. "both"
