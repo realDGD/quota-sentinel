@@ -1,6 +1,5 @@
 """Native Keychain synthetic roundtrip; never reads existing user items."""
 import os
-import pwd
 from pathlib import Path
 import sys
 import unittest
@@ -8,6 +7,7 @@ import uuid
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 if sys.platform!='darwin':
  print('UNVERIFIED: requires native macOS');raise SystemExit(77)
+import pwd
 from quota_sentinel.config import CredentialReference
 from quota_sentinel.platform.credentials import CredentialStore
 
