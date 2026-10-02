@@ -37,6 +37,7 @@ class Tier(str, Enum):
     CODEXBAR_LIVE = "codexbar-live"
     CODEXBAR_CACHE = "codexbar-cache"
     PI_SNAPSHOT = "pi-snapshot"
+    PI_LIVE = "pi-live"
 
 
 # The single ladder used by every provider, in resolution order.

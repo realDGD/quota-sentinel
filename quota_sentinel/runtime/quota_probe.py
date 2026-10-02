@@ -100,13 +100,14 @@ def _kill_group(process: subprocess.Popen, sig: int) -> None:
 def _run_bounded(
     command: Sequence[str], timeout: float, grace: float = 1.0,
     stdin: Optional[bytes] = None,
-    *, environment=None,
+    *, environment=None, cwd=None,
 ) -> _CommandResult:
     """Capture a child under a process-group deadline; never expose argv."""
     try:
         process = subprocess.Popen(
             list(command), stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, env=environment,
+            **({'cwd': str(cwd)} if cwd is not None else {}),
         )
     except OSError:
         return _CommandResult(b"", b"", 127)
