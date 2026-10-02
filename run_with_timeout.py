@@ -15,6 +15,7 @@ Contract (kept minimal on purpose):
 """
 
 import os
+import math
 import signal
 import subprocess
 import sys
@@ -88,35 +89,30 @@ def main():
     timeout, grace, command = parse_args(sys.argv[1:])
     if timeout is None or not command:
         return HELPER_ERROR_EXIT
-    if timeout <= 0 or grace < 0:
+    if not math.isfinite(timeout) or not math.isfinite(grace) or timeout <= 0 or grace < 0:
         fail("--timeout must be > 0 and --kill-grace >= 0")
         return HELPER_ERROR_EXIT
 
     try:
-        proc = subprocess.Popen(command, start_new_session=True)
+        from quota_sentinel.platform.process import spawn_owned
+        from pathlib import Path
+        proc = spawn_owned(command, cwd=Path.cwd(), environment=os.environ)
     except OSError as exc:
         fail(f"could not spawn child: {exc}")
         return SPAWN_ERROR_EXIT
 
     try:
-        return proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        pass
-
-    if kill_group(proc.pid, signal.SIGTERM):
-        fail(f"timed out after {timeout:g}s; SIGTERM sent to process group {proc.pid}")
         try:
-            proc.wait(timeout=grace)
+            return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass
-    else:
-        fail(f"timed out after {timeout:g}s; process group already gone")
-
-    # Reaping the leader does not establish that its descendants exited.
-    if kill_group(proc.pid, signal.SIGKILL):
-        fail(f"SIGKILL sent to remaining process group {proc.pid} after waiting up to {grace:g}s grace")
-    proc.wait()
-    return TIMEOUT_EXIT
+            operation = 'owned Job terminated' if os.name == 'nt' else 'SIGTERM sent to owned process groups'
+            fail(f"timed out after {timeout:g}s; {operation}")
+            proc.stop(grace)
+            if os.name != 'nt':
+                fail(f"SIGKILL cleanup completed after waiting up to {grace:g}s grace")
+            return TIMEOUT_EXIT
+    finally:
+        proc.close()
 
 
 if __name__ == "__main__":
