@@ -75,7 +75,7 @@ Stop/remove read bounded owned installed metadata; absent/corrupt metadata uses 
 # Whole-branch final review
 
 Reviewed range: `0a382f2..b1b67c568fe31cf122ede0ecff60311e28274dd6`.
-Workspace: `<home>/.codex/worktrees/modular-platforms/quota-sentinel`.
+Workspace: `__REPO_DIR__` (the isolated implementation checkout).
 Reviewer: sole fresh-context senior reviewer. Read-only review; this ignored report is the only checkout file written. No delegation, DSH, real credentials, supplier requests, model requests or service changes.
 
 ## Strengths and evidence
