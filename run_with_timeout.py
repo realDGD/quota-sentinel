@@ -7,8 +7,9 @@ Contract (kept minimal on purpose):
   child's stdout (e.g. the "reply 1" model check) sees the child's bytes only.
   All helper diagnostics go to stderr and never echo the command line.
 - The child starts a new session (setsid), so its PID is the process group
-  ID and the whole tree can be signalled: SIGTERM first, then SIGKILL to the
-  group once the grace period elapses.
+  ID and the whole tree can be signalled: SIGTERM first, then wait up to the
+  grace period for the child. Any remaining group members receive SIGKILL,
+  including descendants left behind by a child that exited on SIGTERM.
 - Exit codes: the child's own exit code, 124 on timeout (GNU timeout
   convention), 127 when the child cannot be spawned, 125 for helper misuse.
 """
@@ -63,20 +64,21 @@ def parse_args(argv):
     return None, None, None
 
 
-def group_differs_from_ours(pid):
-    """Fail-safe: refuse to signal our own process group. A ProcessLookupError
-    here means the child already exited, which is not a helper error."""
-    try:
-        return os.getpgid(pid) != os.getpgrp()
-    except ProcessLookupError:
-        return False
+def group_differs_from_ours(pgid):
+    """Use the group ID established by start_new_session, even after exit.
+
+    Looking up the child's current group fails once its leader is reaped,
+    although surviving descendants may still belong to that original group.
+    Never signal the helper's own group or a non-positive group ID.
+    """
+    return pgid > 0 and pgid != os.getpgrp()
 
 
-def kill_group(pid, sig):
-    if not group_differs_from_ours(pid):
+def kill_group(pgid, sig):
+    if not group_differs_from_ours(pgid):
         return False
     try:
-        os.killpg(pid, sig)
+        os.killpg(pgid, sig)
         return True
     except (ProcessLookupError, PermissionError):
         return False
@@ -101,22 +103,18 @@ def main():
     except subprocess.TimeoutExpired:
         pass
 
-    # The child may have exited between the wait deadline and this check.
-    if proc.poll() is not None:
-        return proc.returncode
-
     if kill_group(proc.pid, signal.SIGTERM):
         fail(f"timed out after {timeout:g}s; SIGTERM sent to process group {proc.pid}")
         try:
             proc.wait(timeout=grace)
-            return TIMEOUT_EXIT
         except subprocess.TimeoutExpired:
             pass
     else:
-        fail(f"timed out after {timeout:g}s; child already gone")
+        fail(f"timed out after {timeout:g}s; process group already gone")
 
+    # Reaping the leader does not establish that its descendants exited.
     if kill_group(proc.pid, signal.SIGKILL):
-        fail(f"SIGKILL sent to process group {proc.pid} after {grace:g}s grace")
+        fail(f"SIGKILL sent to remaining process group {proc.pid} after waiting up to {grace:g}s grace")
     proc.wait()
     return TIMEOUT_EXIT
 

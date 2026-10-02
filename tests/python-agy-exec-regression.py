@@ -83,7 +83,7 @@ TRANSIENT_BODY = {
 }
 
 FAKE_AGY = '''#!{python}
-import json, os, signal, sys, time
+import json, os, signal, subprocess, sys, time
 
 record = os.environ.get("QS_FAKE_AGY_RECORD")
 argv = sys.argv[1:]
@@ -115,6 +115,19 @@ if "--version" in argv:
 
 if "/agents" in argv:
     note("agents")
+    if mode == "agents-parent-exits":
+        pid_file = os.environ["QS_GRANDCHILD_PID"]
+        subprocess.Popen(
+            [sys.executable, "-c",
+             'import os,signal,sys,time; '
+             'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+             'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(60)',
+             pid_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        while not os.path.exists(pid_file):
+            time.sleep(0.01)
+        time.sleep(60)
     if mode == "agents-ignore-term":
         # A wedged CLI: it answers nothing and refuses SIGTERM, so only a
         # SIGKILL — the wrapper's escalation, or the parent's last resort — can
@@ -575,6 +588,26 @@ class AgyExecTests(unittest.TestCase):
         # grace (0.5s), not at an unbounded wait for a CLI that never exits.
         self.assertLess(elapsed, 2 + 0.5 + 1.0)
         self.assertEqual(self.survivors(), [], "the guard outlived itself")
+
+    def test_guard_reaps_a_stubborn_child_when_agy_exits_on_sigterm(self):
+        pid_file = self.root / "grandchild.pid"
+
+        def cleanup_child():
+            if pid_file.exists():
+                _kill_pids([int(pid_file.read_text())])
+
+        self.addCleanup(cleanup_child)
+        runner = self.runner(
+            mode="agents-parent-exits", timeout=2, kill_grace=0.5,
+            environment={"QS_GRANDCHILD_PID": str(pid_file)},
+        )
+        paths = runner.prepare("antigravity", self.workspace)
+        self.assertIsNone(runner.agent_listed(paths))
+        child_pid = int(pid_file.read_text())
+        self.assertTrue(
+            _wait_for(lambda: not _alive(child_pid), timeout=2),
+            "grandchild survived after agy exited on SIGTERM",
+        )
 
     def test_the_guard_wrapper_deadline_is_strictly_shorter_than_the_parent_guard(self):
         # Both numbers must derive from the config, and the wrapper's must stay

@@ -513,6 +513,28 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
             + fallback.timeout + fallback.kill_grace,
         )
 
+    def test_codex_primary_attempt_includes_its_pi_credential_refresh(self) -> None:
+        env = {
+            "QUOTA_SENTINEL_TRANSPORT": "codex=codex",
+            "QUOTA_SENTINEL_PI_AUTH_TIMEOUT": "10000",
+        }
+        # One failed Codex turn (120+10), Pi prepare (10000+10),
+        # then its terminal Pi turn (300+10), all inside ONE attempt.
+        self.assertGreaterEqual(worst_case_attempt_seconds(env), 10450.0)
+        self.assertGreaterEqual(worst_case_check_seconds(env), 5 * 10450.0)
+
+    def test_codex_primary_auth_budget_counts_every_fallback_and_burst(self) -> None:
+        env = {
+            "QUOTA_SENTINEL_TRANSPORT": "codex=codex",
+            "QUOTA_SENTINEL_PI_AUTH_TIMEOUT": "10000",
+        }
+        longer_auth = dict(env, QUOTA_SENTINEL_PI_AUTH_TIMEOUT="10007")
+        limits = AppConfig(initial_attempts=3, watchdog_attempts=2, retry_interval=30)
+        delta = worst_case_check_seconds(longer_auth, limits) - worst_case_check_seconds(env, limits)
+        # Five possible failed turns refresh Pi before fallback; both bursts
+        # also retain their separate conservative prepare allowance.
+        self.assertAlmostEqual(delta, 7 * 7.0)
+
     def test_burst_bound_counts_the_sleeps_between_rounds(self) -> None:
         self.assertEqual(worst_case_burst_seconds(3, 100.0, 30.0), 360.0)
         self.assertEqual(worst_case_burst_seconds(1, 100.0, 30.0), 100.0)
@@ -675,7 +697,8 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
         baseline = worst_case_check_seconds(self.ENV)
         before = pi_auth_timeout_seconds(self.ENV)
         self.assertGreater(before, 0)
-        added = 600.0
+        # Keep agy the longest attempt so this isolates the burst prepare term.
+        added = 60.0
         raised_seed = before + added
         with patch.object(models, "PI_AUTH_TIMEOUT_SECONDS", raised_seed, create=True):
             after = pi_auth_timeout_seconds(self.ENV)

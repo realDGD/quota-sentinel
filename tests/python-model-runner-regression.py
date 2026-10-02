@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -684,6 +685,26 @@ class PiAuthRefreshBoundTests(unittest.TestCase):
         self.assertEqual(self._wait_until_gone(str(pi)), [])
         # ...and so is the child it spawned: the group was reaped, not merely
         # the one process this call happened to know about.
+        self._assert_gone(int(self.grandchild_pid.read_text()))
+
+    def test_refresh_reaps_a_stubborn_child_when_pi_exits_on_sigterm(self) -> None:
+        template = self.HANGING_PI.replace(
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))",
+            1,
+        )
+
+        def cleanup_child():
+            if self.grandchild_pid.exists():
+                try:
+                    os.kill(int(self.grandchild_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(cleanup_child)
+        paths = self._runner(self._fake_pi(template)).prepare("codex", self.workspace)
+        self.assertEqual(len(self._lines(paths)), 1)
+        self.assertIn("timed out", self._lines(paths)[0])
         self._assert_gone(int(self.grandchild_pid.read_text()))
 
     def test_a_well_behaved_pi_still_refreshes_without_a_new_stderr_line(self) -> None:

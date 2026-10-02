@@ -129,6 +129,8 @@ _PI_PROVIDER = {
     # identical to the direct one so a transport A/B compares transports only.
     "opencode": ("opencode-go", "deepseek-v4.1-flash", "off", "PI_OPENCODE_QUOTA_FILE"),
 }
+# The configuration entry reads the same roster that prepare()/run() accept.
+PI_PROVIDERS = frozenset(_PI_PROVIDER)
 _QUOTA_ENV_KEYS = tuple(item[3] for item in _PI_PROVIDER.values())
 _PROMPT = "不用思考，只回复我 1"
 

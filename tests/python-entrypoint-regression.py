@@ -111,9 +111,9 @@ class EntrypointCase(unittest.TestCase):
             "QUOTA_SENTINEL_PI_BIN": str(self.pi),
             "QUOTA_SENTINEL_PI_AUTH_FILE": str(self.auth),
             # This suite exercises the Pi transport end to end, so it pins the
-            # codex provider back onto Pi: the shipped default is the official
-            # Codex CLI, and a suite must never start a real one (nor spend a
-            # real token) just because it drives `run codex`.
+            # codex provider onto its fake Pi, regardless of an inherited
+            # transport override. Driving `run codex` must never start a real
+            # Codex CLI or spend a real token.
             "QUOTA_SENTINEL_TRANSPORT": "codex=pi",
             "QS_CAPTURE_PATH": str(self.capture),
             # Never push, and never touch the Keychain: the dry-run client
@@ -338,6 +338,21 @@ class EntrypointCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "ready")
 
+    def test_e12c_clinepass_pi_is_refused_before_runtime_work(self):
+        for verb in (("status",), ("run", "clinepass"), ("check",)):
+            with self.subTest(verb=verb):
+                result = self.cli(*verb, env={
+                    "QUOTA_SENTINEL_TRANSPORT": "clinepass=pi",
+                })
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("invalid argument", result.stderr)
+                self.assertIn("'clinepass'", result.stderr)
+                self.assertIn("'pi'", result.stderr)
+                self.assertIn("clinepass supports: direct", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.capture.exists(), "a model was started anyway")
+        self.assertIsNone(self.store().load("clinepass").last_task_at)
+
 
 class TransportOverrideTest(unittest.TestCase):
     """DEFECT 2 at the configuration entry: no CLI, no state, no I/O.
@@ -352,12 +367,23 @@ class TransportOverrideTest(unittest.TestCase):
         from quota_sentinel.runtime.factory import provider_transports
         return provider_transports({"QUOTA_SENTINEL_TRANSPORT": value})
 
+    def test_default_transports_keep_the_shipped_priority(self):
+        self.assertEqual(self.mapping(""), {
+            "codex": "pi", "antigravity": "agy",
+            "opencode": "direct", "clinepass": "direct",
+        })
+
+    def test_clinepass_pi_override_is_refused_with_direct_as_its_option(self):
+        with self.assertRaises(ValueError) as caught:
+            self.mapping("clinepass=pi")
+        self.assertIn("clinepass supports: direct", str(caught.exception))
+
     def test_unservable_pairs_are_refused_with_their_real_options(self):
         for value, provider, transport, supported in (
             ("opencode=agy", "opencode", "agy", "direct, pi"),
             ("codex=agy", "codex", "agy", "codex, pi"),
             ("antigravity=codex", "antigravity", "codex", "agy, pi"),
-            ("clinepass=codex", "clinepass", "codex", "direct, pi"),
+            ("clinepass=codex", "clinepass", "codex", "direct"),
         ):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError) as caught:
@@ -407,7 +433,9 @@ class TransportOverrideTest(unittest.TestCase):
         self.assertEqual(TRANSPORT_PROVIDERS["direct"], frozenset(DIRECT_PROVIDERS))
         for provider in PROVIDERS:
             self.assertIn(transport_for(provider), supported_transports(provider))
+        for provider in ("codex", "antigravity", "opencode"):
             self.assertIn("pi", supported_transports(provider))
+        self.assertEqual(supported_transports("clinepass"), ["direct"])
 
 
 if __name__ == "__main__":

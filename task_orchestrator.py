@@ -198,7 +198,8 @@ def worst_case_attempt_seconds(
       grace. The shipped Pi runner hands a failed turn to the Codex terminal, so
       that one hop is part of the Pi budget too.
     * Codex — one bounded turn (``CODEX_EXEC_TIMEOUT_SECONDS``) plus its kill
-      grace, plus Pi as its one-hop fallback.
+      grace, plus a Pi credential refresh and turn as its one-hop fallback.
+      ``CodexExecRunner._fallback_to_pi`` prepares Pi on EVERY hand-over.
     * agy — the agent-listing guard and every turn run under the same channel
       timeout, so its budget is ``AGY_TRANSIENT_RETRIES + 1`` turns (plus the
       guard while ``preflight`` is on), plus Pi as its one-hop fallback.
@@ -219,6 +220,7 @@ def worst_case_attempt_seconds(
 
     pi_turn = pi.timeout + pi.kill_grace
     codex_turn = codex.timeout + codex.kill_grace
+    codex_pi_prepare = worst_case_prepare_seconds(environment)
     agy_turn = agy.timeout + agy.kill_grace
     # The free guard runs BEFORE the turn and is a real subprocess, so leaving
     # it out would understate a legal agy attempt by a whole turn. Its own
@@ -228,7 +230,7 @@ def worst_case_attempt_seconds(
 
     return max(
         pi_turn + codex_turn,             # Pi primary, Codex as its one-hop fallback
-        codex_turn + pi_turn,             # Codex primary, Pi as its one-hop fallback
+        codex_turn + codex_pi_prepare + pi_turn,  # Codex -> Pi prepares on each failure
         agy_guard + (agy.transient_retries + 1) * agy_turn + pi_turn,
         direct,                           # direct: one attempt, no fallback
     )
@@ -269,10 +271,11 @@ def worst_case_prepare_seconds(
     """One burst's sequential prepare pass, in seconds.
 
     `Application._burst` prepares every provider once per burst, before any
-    round runs, so this is a per-BURST cost, not a per-attempt one. Only the
-    codex prepare can spend a deadline (the Pi credential refresh above); the
-    other providers' prepares are private-directory work bounded by nothing
-    worth adding here.
+    round runs. This allowance covers that per-BURST pass; any extra Pi
+    prepare during a Codex fallback is counted separately in the per-attempt
+    bound above. Only the codex prepare can spend a deadline (the Pi credential
+    refresh above); the other providers' prepares are private-directory work
+    bounded by nothing worth adding here.
     """
     pi = ModelRunnerConfig.from_env(environment)
     return pi_auth_timeout_seconds(environment) + pi.kill_grace
@@ -304,7 +307,8 @@ def worst_case_check_seconds(
 
     Three terms, each read where it is spent:
 
-    * the model rounds, from the channel configs and the attempt limits;
+    * the model rounds, including any per-attempt fallback prepare, from the
+      channel configs and the attempt limits;
     * one prepare pass per burst — the codex prepare's bounded Pi credential
       refresh, plus its kill grace;
     * one probe phase per phase, from `runtime/probe_budget`, which reads the

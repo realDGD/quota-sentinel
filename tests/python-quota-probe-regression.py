@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import time
@@ -59,6 +60,45 @@ class QuotaProbeTests(unittest.TestCase):
         )
         args.update(overrides)
         return QuotaCollector(**args)
+
+    def stubborn_descendant(self):
+        """A ready child ignores TERM and holds none of the probe's pipes."""
+        pid_file = self.root / "stubborn-child.pid"
+
+        def cleanup_child():
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(cleanup_child)
+        body = f"""
+import subprocess, sys, time
+from pathlib import Path
+subprocess.Popen(
+    [sys.executable, '-c',
+     'import os,signal,sys,time; '
+     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+     'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)',
+     {str(pid_file)!r}],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+while not Path({str(pid_file)!r}).exists():
+    time.sleep(0.01)
+"""
+        return body, pid_file
+
+    def assert_child_gone(self, pid_file):
+        child_pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail("grandchild survived after probe parent exited on SIGTERM")
 
     # ---- Per-tier isolation: the shell runs every rung in its own process,
     # so one rung's failure is an rc, never an exception that ends the probe.
@@ -201,6 +241,25 @@ if sys.argv[sys.argv.index('--provider') + 1] == 'codex':
         self.assertEqual(result.quota.weekly.reset_at, 1790500000)
         self.assertEqual(result.quota.source, "Native · codex app-server")
         self.assertFalse(marker.exists())
+
+    def test_native_codex_cleanup_reaps_a_stubborn_descendant(self):
+        body, pid_file = self.stubborn_descendant()
+        codex = self.binary("codex", body + """
+import json
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'initialize':
+        result = {}
+    else:
+        result = {'rateLimits': {
+            'primary': {'windowDurationMins': 300, 'usedPercent': 19, 'resetsAt': 1790000000},
+            'secondary': {'windowDurationMins': 10080, 'usedPercent': 8, 'resetsAt': 1790500000}}}
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+""")
+        result = self.collector(codex_bin=codex)._native_codex()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.five_hour.remaining_percent, 81)
+        self.assert_child_gone(pid_file)
 
     def test_codexbar_retries_oauth_after_bad_cli_and_writes_stale_cache(self):
         calls = self.root / "calls"
@@ -350,6 +409,14 @@ print(json.dumps({quota!r}))
         result = _run_bounded([sys.executable, "-c", code], timeout=0.1, grace=0.1)
         self.assertTrue(result.timed_out)
         self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_timeout_reaps_a_stubborn_child_when_probe_exits_on_sigterm(self):
+        body, pid_file = self.stubborn_descendant()
+        probe = self.binary("probe", body + "time.sleep(30)\n")
+        result = _run_bounded([str(probe)], timeout=1, grace=0.5)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.returncode, 124)
+        self.assert_child_gone(pid_file)
 
     def test_timeout_falls_to_cache_and_reaps_codexbar_descendant(self):
         self.state.mkdir()

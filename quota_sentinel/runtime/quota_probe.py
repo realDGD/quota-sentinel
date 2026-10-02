@@ -120,8 +120,9 @@ def _run_bounded(
                 # A detached descendant can keep our pipes open after the
                 # direct child is dead. communicate() without a deadline would
                 # wait for that descendant forever while quota.lock is held.
-                _kill_group(process, signal.SIGKILL)
                 out, err = expired.output or b"", expired.stderr or b""
+            # A reaped leader can still leave a TERM-ignoring group member.
+            _kill_group(process, signal.SIGKILL)
             return _CommandResult(out[:_MAX_PROBE_BYTES], err[:_MAX_PROBE_BYTES], 124, True)
         if len(out) > _MAX_PROBE_BYTES or len(err) > _MAX_PROBE_BYTES:
             return _CommandResult(b"", b"", 1)
@@ -385,7 +386,10 @@ class QuotaCollector:
             try:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                _kill_group(process, signal.SIGKILL)
+                pass
+            # Closing the app-server also owns cleanup of its remaining group.
+            _kill_group(process, signal.SIGKILL)
+            if process.poll() is None:
                 process.wait()
             # An app-server that died mid-handshake leaves a broken pipe; a
             # close() that re-raises from here would escape collect() and

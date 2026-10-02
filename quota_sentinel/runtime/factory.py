@@ -41,7 +41,7 @@ from quota_sentinel.runtime.dispatch import TransportRouter
 from quota_sentinel.runtime.feishu import (
     FeishuClient, FeishuError, FeishuNotifier, KeychainCredentials,
 )
-from quota_sentinel.runtime.models import ModelRunner, ModelRunnerConfig
+from quota_sentinel.runtime.models import PI_PROVIDERS, ModelRunner, ModelRunnerConfig
 from quota_sentinel.runtime.quota_probe import QuotaCollector
 from quota_sentinel.scheduler import service
 from quota_sentinel.state.runlock import SHLOCK_BIN
@@ -56,7 +56,7 @@ TRANSPORTS = ("pi", "direct", "codex", "agy")
 
 # Which providers each transport can actually SERVE — the capability the
 # runners themselves declare, read here instead of re-typed:
-#   * `pi` is the universal fallback and serves the whole roster;
+#   * `pi` serves exactly the providers declared by its model runner;
 #   * `direct` serves exactly the providers in its own roster;
 #   * the codex CLI serves only CODEX_PROVIDER, the agy CLI only AGY_PROVIDER
 #     (both refuse anything else in `prepare`/`run`).
@@ -64,7 +64,7 @@ TRANSPORTS = ("pi", "direct", "codex", "agy")
 # entry instead of aborting a run that has already started: the mismatch would
 # otherwise surface as a `ValueError` from the runner mid-burst.
 TRANSPORT_PROVIDERS: Dict[str, FrozenSet[str]] = {
-    "pi": frozenset(PROVIDERS),
+    "pi": PI_PROVIDERS,
     "direct": frozenset(DIRECT_PROVIDERS),
     "codex": frozenset({CODEX_PROVIDER}),
     "agy": frozenset({AGY_PROVIDER}),

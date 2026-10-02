@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -267,6 +269,49 @@ class DirectRunnerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.exit_code, 124)
+
+    def test_timeout_reaps_a_stubborn_child_when_curl_exits_on_sigterm(self) -> None:
+        pid_file = self.root / "stubborn-child.pid"
+        parent = self.root / "term-exiting-curl.py"
+        parent.write_text(f"""
+import subprocess, sys, time
+from pathlib import Path
+subprocess.Popen(
+    [sys.executable, '-c',
+     'import os,signal,sys,time; '
+     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+     'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)',
+     {str(pid_file)!r}],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+while not Path({str(pid_file)!r}).exists():
+    time.sleep(0.01)
+time.sleep(30)
+""")
+
+        def cleanup_child():
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(cleanup_child)
+        _, rc, timed_out, _ = self.runner()._run_bounded(
+            [sys.executable, str(parent)], "", timeout=1,
+        )
+        self.assertEqual(rc, 124)
+        self.assertTrue(timed_out)
+        child_pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("grandchild survived after curl exited on SIGTERM")
 
     def test_vendor_text_is_redacted_before_persisting(self) -> None:
         result, _ = self.run_provider("clinepass", mode="secret_error")

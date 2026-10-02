@@ -379,7 +379,10 @@ class DirectRunner:
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    _kill_group(process, signal.SIGKILL)
+                    pass
+                # The curl process can exit on TERM while a descendant ignores it.
+                _kill_group(process, signal.SIGKILL)
+                if process.poll() is None:
                     process.wait(timeout=2)
                 return output[:_MAX_RESPONSE_BYTES], 124, True, ""
 
