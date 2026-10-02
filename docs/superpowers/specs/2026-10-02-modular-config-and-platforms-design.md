@@ -76,6 +76,8 @@ Codex/agy 由官方客户端负责登录和原生认证。仅启用 Codex 时不
 
 旧安装证据至少包括已安装的本软件后台服务、权威状态文件或旧配置；只有空目录不算旧安装证据。存在旧状态但无法确定服务偏好时，向导展示需要核对的项目，后台进程不得自行使用新默认值。
 
+新用户需要独立的新安装初始化入口：只有显式的新安装操作成功创建全新的状态目录后，才可建立 JSON/Python 权威状态和初始配置。目录已存在但权威文件缺失时不凭空补建，改走核对或恢复流程；运行命令和后台启动都不能隐式初始化。此入口不复活原先移除的通用 `initialize_authority`，不改变旧安装的 bootstrap/cutover/rollback 契约。
+
 已有个人配置中的数字固定保存，外层总预算根据这些数字与实际通道图重新推导，不能因为重构而漏掉认证、探测或清理成本。
 
 ## 4. 配置入口和依赖选择
@@ -150,9 +152,18 @@ Codex/agy 由官方客户端负责登录和原生认证。仅启用 Codex 时不
 | Codex | `codex`、`pi` | `native`、`pi-live`、可用的 CodexBar 实时/缓存、Pi 快照 |
 | Antigravity | `agy`、`pi` | `native`、`pi-live`、可用的 CodexBar 实时/缓存、Pi 快照 |
 | OpenCode Go | `direct`、`pi` | `native`、`pi-live`、可用的 CodexBar 实时/缓存、Pi 快照 |
-| ClinePass | `direct` | `native`、可用的 CodexBar 实时/缓存、Pi 快照 |
+| ClinePass | `direct`、待新增适配的 `pi` | `native`、可用的 CodexBar 实时/缓存、Pi 快照 |
 
-能力表来自实现，不能因为用户写了名字就视为支持。平台或客户端版本缺少某项能力时向导说明原因。`pi-live` 的三个供应商适配器只有通过第 7 节的查询契约后才列为可用，ClinePass 暂不宣称有 Pi 能力。
+能力表来自实现，不能因为用户写了名字就视为支持。平台或客户端版本缺少某项能力时向导说明原因。`pi-live` 的三个供应商适配器只有通过第 7 节的查询契约后才列为可用。ClinePass 的 Pi 开窗适配需要作为本次新增能力实现并验证，当前代码仍只接受其直接 API 通道；这不意味着自动新增 ClinePass 的 Pi 实时查询能力。
+
+选择 Antigravity 或 ClinePass 的 Pi 开窗通道，包括把 Pi 放在 fallback 位置，向导必须提醒安装对应的 Pi 插件，并显示插件名、安装指引和登录要求：
+
+- Antigravity：`pi-antigravity`，安装指引 `pi install npm:pi-antigravity`，随后在 Pi 内完成对应供应商登录。
+- ClinePass：首个适配目标为 `pi-clinepass-provider`，安装指引 `pi install npm:pi-clinepass-provider`，随后完成 ClinePass 认证。插件注册的 provider ID 与本软件逻辑名称要明确映射，不猜测其他插件的 ID。
+
+向导显示安装指引，保存选择时生成依赖清单；安装阶段处理用户明确选定的依赖，运行阶段只检查，不下载插件。使用 Pi 通道前验证插件入口、供应商注册、目标模型和认证来源可用；缺失或不兼容时给出安装/更新指引，不能退回 Pi 默认供应商或默认模型。若链内有用户明确选择且可用的下一通道，可以按链继续；只有 Pi 时在模型调用前失败。未选择这些 Pi 通道时不检查对应插件。
+
+当前用户的 Antigravity Pi fallback 继续引用已安装的插件；ClinePass 保持直接 API。迁移不会替用户安装新插件或加入新通道。
 
 所有模型通道都成为独立执行器，去掉执行器内部隐藏的固定 fallback。Pi 与原生通道的两种先后顺序均可配置，不再只支持硬编码的一跳方向。
 
@@ -246,6 +257,7 @@ macOS 使用 LaunchAgent，Linux 使用 systemd 用户服务，Windows 使用当
 - 当前用户迁移前后，供应商、通道顺序、重试与超时参数、凭据引用和通知设置一致。
 - 禁用功能后，不安装其可选库、不检查其凭据、不启动其进程；重新启用不重复执行旧债务。
 - 单通道失败不会调用其他通道；`[pi, codex]` 和 `[codex, pi]` 分别遵守顺序。
+- Antigravity/ClinePass 选择 Pi 为主通道或备用通道时均展示对应插件提示；插件缺失或注册不匹配时不会调用 Pi 默认模型。未选择 Pi 时不检查插件。
 - 查询顺序独立可调，缓存保持非实时，调度锚点只取可信实时结果。
 - Pi 额度查询各适配器的模型入口和模型端点调用次数为零，包括缺失或错误配置路径。
 - 配置覆盖、无效配置、重复迁移、保存中断和并发读取不破坏已保存配置。
@@ -267,5 +279,6 @@ macOS 使用 LaunchAgent，Linux 使用 systemd 用户服务，Windows 使用当
 - [Microsoft 的 CredReadW 文档](https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credreadw)提供用户会话凭据读取接口，并说明登录会话限制。
 - [Python keyring 文档](https://keyring.readthedocs.io/en/stable/)列出系统密码后端与无桌面 Linux 的 D-Bus 条件；无桌面不等于天然有可用、已解锁的密码库。
 - [CodexBar 的查询实现说明](https://github.com/steipete/CodexBar/blob/main/docs/codex-oauth.md)展示只读额度端点及认证所有权约束，供 Pi 查询适配参考；它不是 Pi 官方实时查询能力或稳定公开 API 的承诺。
+- [pi-antigravity 的安装文档](https://github.com/Rahularya01/pi-antigravity)和 [pi-clinepass-provider 的安装文档](https://github.com/jellydn/pi-clinepass-provider)提供对应插件安装入口。ClinePass 文档展示了 `clinepass` provider 和 `cline-pass/deepseek-v4.1-flash` 模型；本次尚未在本软件中运行或验证该插件。
 
 本轮未请求真实额度、未调用真实模型、未读取密钥、未重启服务。前一轮三个缺陷的修复及 22 个回归脚本验证保持原样；本设计不声称这些新功能已经实现。
