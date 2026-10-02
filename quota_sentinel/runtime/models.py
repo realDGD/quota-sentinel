@@ -348,6 +348,12 @@ class ModelRunner:
     def prepare(self, provider: str, workspace: Path) -> PreparedPaths:
         if provider not in _PI_PROVIDER:
             raise ValueError(f"unknown model provider: {provider}")
+        if _PI_PROVIDER[provider].plugin_id and (self.config.verify_plugins or provider == 'clinepass'):
+            from .pi_plugins import check_pi_plugin
+            from quota_sentinel.config import ConfigurationError
+            check = check_pi_plugin(provider, self.config)
+            if not check.available:
+                raise ConfigurationError(check.reason)
         workspace = Path(os.path.abspath(workspace))
         workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
         workspace.chmod(0o700)

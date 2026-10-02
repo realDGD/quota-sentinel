@@ -16,7 +16,7 @@ class AttemptChainRunner:
   for i,ch in enumerate(self.chains.get(provider,())):
    try:
     paths=self._runner(ch).prepare(provider,self._workspace(workspace,ch));self.prepared[key]=(i,paths);return paths
-   except Exception as e:failures.append(type(e).__name__)
+   except Exception as e:failures.append(str(e) if isinstance(e,ConfigurationError) else type(e).__name__)
   raise ConfigurationError('no ready opening channel for '+provider+' ('+', '.join(failures)+')')
  def run(self,provider,workspace,phase,attempt,limit):
   key=(provider,Path(workspace))

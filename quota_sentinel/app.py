@@ -155,24 +155,17 @@ class Application:
         return collector.collect(raw, purpose=purpose)
 
     def _write_active_transitions(self, awaiting):
-        from quota_sentinel.state.store import _publish_atomic
-        payload = json.dumps({'schema_version': 1, 'enabled': list(self.opening_providers), 'awaiting_resume': sorted(awaiting)}).encode()
-        _publish_atomic(self.state_dir / 'runtime-providers.json', payload)
-        if self.activation_path.exists():
-            record = json.loads(self.activation_path.read_bytes())
-            record['pending'] = sorted(set(record['pending']) - (set(self.opening_providers) - set(awaiting)))
-            _publish_atomic(self.activation_path, json.dumps(record).encode())
+        from quota_sentinel.state.activation import persist_activation
+        self._activation_revision = persist_activation(
+            self.state_dir, self.opening_providers, awaiting, self.activation_path,
+            getattr(self, '_activation_revision', None))
 
     def _active_transitions(self):
         if self.runtime_plan is None:
             return set()
         path = self.state_dir / 'runtime-providers.json'
-        journal_pending = set()
-        if self.activation_path.exists():
-            record = json.loads(self.activation_path.read_bytes())
-            if record.get('schema_version') != 1 or not isinstance(record.get('pending'), list):
-                raise ValueError('invalid activation journal')
-            journal_pending = set(record['pending'])
+        from quota_sentinel.state.activation import read_journal
+        journal_pending, self._activation_revision = read_journal(self.activation_path)
         try:
             previous = json.loads(path.read_bytes())
         except FileNotFoundError:

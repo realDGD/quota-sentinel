@@ -685,7 +685,7 @@ created with mode 0600; the state directory is mode 0700.
 
 ## Quota Acquisition Hierarchy & Freshness Model
 
-The quota acquisition pipeline strictly follows a 4-tier hierarchy for both providers:
+The preserved legacy profile uses the following hierarchy for all enabled providers. Saved configurations use their own ordered `quota_chain`; new Codex-only profiles contain `native` alone:
 
 ```text
 ① Native Direct (FRESH)
@@ -743,7 +743,7 @@ and become the new anchor. A rolling value that advances with every probe,
 whether in large jumps or many individually small steps, cannot chase the
 deadline forever. The first fresh reset of a generation anchors immediately;
 a successful task clears the old candidate/anchor state for the next cycle.
-Cache and Pi data still never write deadlines.
+Cache and Pi snapshots never write deadlines.
 
 ## Failure Retry & Pending Debt
 
@@ -793,7 +793,7 @@ Failures and timeouts never advance it and never re-seed the 5h01 fallback.
   - `/usage` reuses the same fresh-only calibration after its live query but
     does not execute a due task; the precision timer or watchdog performs it.
   - When a probe fails or returns a stale snapshot, `next_due_at` is **preserved
-    unchanged**. Cache and Pi data never overwrite the last authoritative
+    unchanged**. Cache and Pi snapshots never overwrite the last authoritative
     Fresh deadline.
 - **Graceful Fallback & Degradation**:
   - When `now >= next_due_at`, the due provider executes.
@@ -857,10 +857,10 @@ The suites under `tests/` are standalone scripts with no test runner to
 install. They live in the project's uv environment
 (`pyproject.toml` + `uv.lock`; the only third-party dependency is
 `lark-oapi`, needed by the Feishu listener suite). After the installer (or
-a manual `uv sync --locked`), the canonical run from the repository root is:
+a manual `uv sync --locked --extra feishu`), the canonical run from the repository root is:
 
 ```bash
-for t in tests/*.py; do PYTHONPATH=. uv run --frozen --no-sync python "$t" || echo "FAIL $t"; done
+uv run --frozen --no-sync python tests/run-regressions.py --platform current
 ```
 
 The stdlib-only suites also pass under plain system `python3`
@@ -907,3 +907,11 @@ New installations enable only Codex with official Codex opening and native accou
 Use `quota-sentinel configure` to edit an existing profile, `config show` to inspect effective settings and their sources, and `config validate` for static prerequisites. `--config /path/config.json` selects a saved profile. Opening and quota chains can each be ordered independently; disabled components do not load their optional libraries or check their credentials. Automatic opening still needs its internal live quota observations when the separate query command is disabled. A cache can be displayed first but cannot update a scheduling anchor.
 
 `uv sync --locked` installs core dependencies; add `--extra feishu` only for the Feishu listener. The legacy `install-launchagents.sh` explicitly installs that extra because its active service is the listener. Configuration saving leaves services running with their original choices; applying a new service definition is a separate operation. An unsaved legacy installation retains its existing runtime while migration is previewed.
+
+### Applying background features
+
+`quota-sentinel serve` starts one scheduler when automatic opening is selected and one listener when the bot is selected. Opening-only services do not import the bot SDK; listener-only services do not start the scheduler. An authorized incoming `/usage` command can receive a reply with automatic push disabled. Independent queries disabled means the bot cannot run that query.
+
+Save and inspect the configuration before starting the host. Each host keeps its resolved configuration for its lifetime; edit, then explicitly restart to apply. The legacy listener entry and plist remain compatible with unsaved installations. The selected-service plist template is separate; configuration saving does not install it.
+
+The regression dispatcher discovers added Python suites, isolates credentials and home directories, bounds every script, and exits nonzero for any failed suite. `--platform portable` runs the platform-independent subset; native gates run only on their actual OS. Windows/Linux service/process/credential support and Pi live metadata remain in the subsequent approved implementation plans until their gates pass. No supplier smoke tests are part of this dispatcher.

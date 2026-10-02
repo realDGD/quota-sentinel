@@ -22,4 +22,9 @@ class PluginTests(unittest.TestCase):
  def test_direct_only_no_plugin_check(self):self.assertIsNone(plugin_requirement('opencode'))
  def test_clinepass_pi_identity(self):
   r=ModelRunner(self.cfg);cmd=r._command('clinepass');self.assertEqual(cmd[cmd.index('--provider')+1],'clinepass');self.assertEqual(cmd[cmd.index('--model')+1],'cline-pass/deepseek-v4.1-flash');self.assertEqual(cmd[cmd.index('--thinking')+1],'off');self.assertIn(str(self.pkg/'index.ts'),cmd);self.assertFalse(any('capture-clinepass' in x for x in cmd))
+ def test_prepare_refuses_missing_plugin_before_creating_attempt_workspace(self):
+  from quota_sentinel.config import ConfigurationError
+  work=self.root/'work';r=ModelRunner(replace(self.cfg,plugin_entries={},verify_plugins=True))
+  with self.assertRaisesRegex(ConfigurationError,'pi-clinepass-provider'):r.prepare('clinepass',work)
+  self.assertFalse(work.exists())
 if __name__=='__main__':unittest.main()

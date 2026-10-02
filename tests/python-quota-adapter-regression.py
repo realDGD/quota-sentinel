@@ -2020,14 +2020,8 @@ class OpencodeNativeHelperTests(unittest.TestCase):
                 helper.terminate(); helper.wait(timeout=3)
 
     def test_outer_budget_covers_four_providers_and_delivery(self):
-        tree = ast.parse((REPO_ROOT / "feishu_listener.py").read_text())
-        bound = next(
-            node.value.value for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name)
-                    and target.id == "USAGE_COMMAND_TIMEOUT_SECONDS"
-                    for target in node.targets)
-        )
+        from quota_sentinel.runtime.budgets import listener_usage_budget
+        bound = listener_usage_budget({})
         # Per provider: every fresh rung's own budget plus CodexBar's kill
         # grace. ClinePass joined the roster with a native helper, so its two
         # budgeted rungs (15 + 20 + 10) are part of the worst case now.

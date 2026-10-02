@@ -1,5 +1,5 @@
 """Strict schema and private atomic CAS publication. Never reads credentials."""
-import hashlib,json,math,os,tempfile
+import hashlib,json,math,uuid
 from pathlib import Path
 from dataclasses import asdict
 from .types import *
@@ -71,12 +71,9 @@ def save_config(path,config,*,expected_revision):
     record=json.loads(journal.read_bytes()) if journal.exists() else {'schema_version':1,'pending':[]}
     if record.get('schema_version')!=1 or not isinstance(record.get('pending'),list):raise ConfigurationError('invalid activation journal')
     record['pending']=sorted(set(record['pending'])|disabled)
-    from quota_sentinel.state.store import _publish_atomic
-    _publish_atomic(journal,json.dumps(record).encode())
-  fd,name=tempfile.mkstemp(dir=path.parent,prefix='config.tmp.')
-  try:
-   with os.fdopen(fd,'wb') as out:out.write(raw);out.flush();os.fsync(out.fileno())
-   os.replace(name,path)
-  finally:
-   if os.path.exists(name):os.unlink(name)
+    record['revision']=uuid.uuid4().hex
+    from quota_sentinel.state.activation import publish_bytes
+    publish_bytes(journal,json.dumps(record).encode())
+  from quota_sentinel.state.activation import publish_bytes
+  publish_bytes(path,raw)
  return hashlib.sha256(raw).hexdigest()

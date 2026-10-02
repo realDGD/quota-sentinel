@@ -21,7 +21,7 @@ class ConfigTests(unittest.TestCase):
  def test_atomic_edit_failure(self):
   with tempfile.TemporaryDirectory() as t:
    p=Path(t)/'config.json'; rev=save_config(p,new_user_defaults(),expected_revision=None); raw=p.read_bytes()
-   with patch('quota_sentinel.config.store.os.replace',side_effect=OSError('interrupted')):
+   with patch('quota_sentinel.state.store.os.replace',side_effect=OSError('interrupted')):
     with self.assertRaises(OSError): save_config(p,replace(new_user_defaults(),origin='edited'),expected_revision=rev)
    self.assertEqual(p.read_bytes(),raw); self.assertEqual(read_config(p).revision,rev)
  def test_stale_editor(self):

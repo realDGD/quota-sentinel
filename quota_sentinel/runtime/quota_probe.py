@@ -374,9 +374,9 @@ class QuotaCollector:
                 weekly = secondary if secondary.get("windowDurationMins", 10080) > 360 else primary
 
                 def window(value: dict) -> QuotaWindow:
-                    used = value.get("usedPercent", 0)
+                    used = value.get("usedPercent")
                     reset = value.get("resetsAt")
-                    if type(used) not in (int, float) or not math.isfinite(used) or type(reset) is not int or not reset:
+                    if type(used) not in (int, float) or not math.isfinite(used) or not 0 <= used <= 100 or type(reset) is not int or reset <= 0:
                         raise ValueError("invalid native window")
                     remaining = math.floor(max(0, min(100, 100 - used)) + 0.5)
                     return QuotaWindow(remaining, reset)

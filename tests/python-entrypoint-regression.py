@@ -78,6 +78,14 @@ class EntrypointCase(unittest.TestCase):
         }))
         self.auth.chmod(0o600)
 
+        # All legacy fallback/readiness boundaries are fixtures too. A private
+        # HOME must not rely on the operator's installed clients or auth files.
+        self.codex_home = self.root / 'codex-home'; self.codex_home.mkdir()
+        (self.codex_home / 'auth.json').write_text('{}')
+        self.plugin = self.root / 'plugin.ts'; self.plugin.write_text('// fixture')
+        self.metadata = self.root / 'metadata-unavailable'
+        self.metadata.write_text('#!' + sys.executable + '\nraise SystemExit(1)\n')
+        self.metadata.chmod(0o700)
         self.capture = self.root / "pi-calls.jsonl"
         self.pi = self.root / "pi"
         self.pi.write_text("#!" + sys.executable + "\n" + textwrap.dedent("""\
@@ -110,6 +118,15 @@ class EntrypointCase(unittest.TestCase):
             "QUOTA_SENTINEL_LOG_DIR": str(self.root / "logs"),
             "QUOTA_SENTINEL_PI_BIN": str(self.pi),
             "QUOTA_SENTINEL_PI_AUTH_FILE": str(self.auth),
+            "QUOTA_SENTINEL_CODEX_HOME": str(self.codex_home),
+            "QUOTA_SENTINEL_CODEX_BIN": str(self.metadata),
+            "QUOTA_SENTINEL_AGY_BIN": str(self.metadata),
+            "QUOTA_SENTINEL_CODEXBAR_BIN": str(self.metadata),
+            "QUOTA_SENTINEL_CURL_BIN": str(self.metadata),
+            "QUOTA_SENTINEL_ANTIGRAVITY_PLUGIN": str(self.plugin),
+            "QUOTA_SENTINEL_KEYCHAIN_DISABLED": "1",
+            "OPENCODE_API_KEY": "fixture-opencode-key",
+            "CLINE_API_KEY": "fixture-cline-key",
             # This suite exercises the Pi transport end to end, so it pins the
             # codex provider onto its fake Pi, regardless of an inherited
             # transport override. Driving `run codex` must never start a real
@@ -124,8 +141,7 @@ class EntrypointCase(unittest.TestCase):
             "FEISHU_USER_ID": "cli-user-id",
             "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", "/private/tmp/qs-uv-cache"),
         })
-        for name in ("QUOTA_SENTINEL_CODEXBAR_BIN", "QUOTA_SENTINEL_AGY_BIN"):
-            self.env.pop(name, None)
+
 
     def cli(self, *args: str, env=None, cwd=None, offline: bool = True,
             timeout: int = 180) -> subprocess.CompletedProcess:

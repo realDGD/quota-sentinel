@@ -78,4 +78,24 @@ class PruningTests(unittest.TestCase):
  def test_only_opening_internal_observation_and_bot_refusal(self):
   c=replace(new_user_defaults(),features=FeatureSettings(True,False,False,False));self.assertEqual(build_runtime_plan(c,'check').probe_providers,('codex',))
   with self.assertRaises(ConfigurationError):build_runtime_plan(c,'usage')
+ def test_concurrent_disable_reenable_is_not_acknowledged_by_older_probe(self):
+  import json
+  owner=self;c=new_user_defaults();path=self.state/'config.json';mutate=False
+  def toggle():
+   current=read_config(path);d=to_document(c);d['providers']['codex']['enabled']=False
+   revision=save_config(path,parse_config(d),expected_revision=current.revision)
+   save_config(path,c,expected_revision=revision)
+  class C:
+   def collect(self,*a,**k):
+    if mutate:toggle()
+    return {'codex':QuotaReading(owner.quota(True),Tier.NATIVE,True)}
+   def save_pi_snapshots(self,raw):pass
+  class R:
+   def prepare(self,*a):raise AssertionError('old debt replayed')
+  class N:
+   def validate_ready(self):pass
+   def task(self,*a):pass
+  app=Application(self.state,R(),lambda w:C(),N(),clock=lambda:1000,runtime_plan=build_runtime_plan(c,'check'))
+  app.check();toggle();mutate=True;app.check()
+  self.assertEqual(json.loads(path.with_suffix('.activations.json').read_bytes())['pending'],['codex'])
 if __name__=='__main__':unittest.main()

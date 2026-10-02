@@ -577,14 +577,9 @@ direct  ──▶ runtime.direct.DirectRunner         opencode, clinepass
 coordinator, the retry debt, the locks, the cards and the run log never learn
 which one answered.
 
-**Pi is the shipped path for codex; the official CLI is its fallback.** Pi costs
-~54 tokens per ignition against the official CLI's ~1,687 (measured below), so
-the cheap path runs first and the official client takes the attempt only when
-Pi cannot deliver it. `QUOTA_SENTINEL_TRANSPORT=codex=codex` inverts the
-priority for an A/B run without editing code. The chain is deliberately one hop
-deep in both directions: the composition root builds each runner's counterpart
-as a *terminal* instance (no fallback of its own), so an attempt can be handed
-over exactly once and can never bounce back.
+**Opening and quota-query chains are separate saved choices.** New users get only official Codex opening and native Codex metadata, with no fallback or Feishu. The preserved personal profile opens Codex through Pi then Codex, Antigravity through agy then Pi, and the two API providers directly. Its quota order remains native → CodexBar live → cache → Pi snapshot. The profile is migration data, not the new-user default.
+
+`runtime.chains.AttemptChainRunner` owns configured fallback; selected concrete runners are terminal. Only explicitly listed channels can run, in their saved order. Functional failure advances; accepted success (including a cost warning) stops. A selected Antigravity/ClinePass Pi plugin is checked before an attempt; missing plugins provide installation guidance. Existing callers without a runtime plan retain the legacy composition until explicit migration.
 
 The codex transport exists because a transport also decides *who the client
 is*, not only what a turn costs. A default `codex exec` carries the whole Codex
@@ -841,3 +836,11 @@ user's state is their decision, and the files are harmless once retired.
   explained. Timeouts and thresholds are not relaxed to reach green.
 * Persistence and scheduler suites run under `python -O` too: no security or
   correctness property may depend on `assert`.
+
+## Selected runtime configuration
+
+`config` resolves typed, nonsecret feature/provider/channel choices. `configure` previews and saves them under a compare-and-swap edit lock. A missing authority in an existing state directory remains an error. Explicit fresh provisioning seeds all provider documents, publishes JSON authority last, and refuses an existing directory. Disabled providers retain history but cannot prepare runners, probe, notify, repay debt, or enter the deadline roster. Re-enabling waits for fresh metadata before retiring old debt.
+
+Display queries stop at the first usable result; scheduling skips stale results and continues through the same listed chain. No fresh result means no authoritative anchor update. Selected budgets include each sequential query tier, primary preparation, per-attempt fallback preparation, notifications and cleanup.
+
+`daemon.serve` owns scheduler/listener startup, signal handling and shutdown. The listener receives the sole scheduler reference and owns its bounded command workers. Bot replies belong to incoming authorized commands; automatic push is separately selected. Runtime plans are fixed until explicit restart. `tests/run-regressions.py` separates portable and native gates, removes inherited credentials and bounds each script.
