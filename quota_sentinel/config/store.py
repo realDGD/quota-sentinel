@@ -47,6 +47,9 @@ def parse_config(document):
   _keys(v,CredentialReference.__dataclass_fields__,'credential reference',('kind','locator'))
   if v['kind'] not in ('system','environment','file') or any(not isinstance(x,str) or not x for x in v.values()):raise ConfigurationError('invalid credential reference')
   refs[k]=CredentialReference(**v)
+  from quota_sentinel.platform.credentials import validate_reference,CredentialUnavailable
+  try:validate_reference(refs[k])
+  except CredentialUnavailable:raise ConfigurationError('invalid credential reference') from None
  origin=d.get('origin','saved')
  if not isinstance(origin,str) or not origin:raise ConfigurationError('invalid origin')
  return SoftwareConfig(1,origin,features,providers,app,budgets,clients,refs)

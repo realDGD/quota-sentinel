@@ -520,14 +520,20 @@ def run_send_test_card(state_dir: Path, args: argparse.Namespace) -> int:
 
 
 def run_discover_feishu_user(state_dir: Path, args: argparse.Namespace) -> int:
-    from quota_sentinel.runtime.feishu import FeishuClient, FeishuError
+    from quota_sentinel.runtime.feishu import FeishuClient, FeishuError, SelectedCredentials
     if not args.identifier:
         print("quota_sentinel: an email address or mobile number is required",
               file=sys.stderr)
         return 2
     _runtime(state_dir)
     try:
-        user_id = FeishuClient().discover_user(args.identifier)
+        path,effective=_effective_settings(state_dir,args)
+        if path.exists() or effective.settings.origin!='legacy-migration':
+            settings=effective.settings
+            credentials=SelectedCredentials(settings.credentials,timeout=settings.budgets['credentials']['timeout'])
+            client=FeishuClient(credentials,total_timeout=settings.budgets['notification']['timeout'])
+        else:client=FeishuClient()
+        user_id = client.discover_user(args.identifier)
     except (FeishuError, ValueError) as exc:
         print(f"quota_sentinel: {exc}", file=sys.stderr)
         return 1

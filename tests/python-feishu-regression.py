@@ -336,7 +336,12 @@ class KeychainBoundTests(unittest.TestCase):
         self.assertLess(elapsed, 5.0)
 
     def test_a_wedged_write_is_a_refusal_not_a_wait(self):
-        with mock.patch.object(feishu_module, "KEYCHAIN_WRITE_TIMEOUT_SECONDS", 1):
+        # Inject the worker itself; native writes must never touch a real
+        # Keychain item merely because a fake security executable was supplied.
+        from quota_sentinel.platform.credentials import CredentialStore
+        with mock.patch.object(feishu_module, "KEYCHAIN_WRITE_TIMEOUT_SECONDS", 1), mock.patch(
+            'quota_sentinel.platform.credentials.CredentialStore',
+            side_effect=lambda **kw: CredentialStore(**kw,worker_command=(sys.executable,str(self.security)))):
             store = feishu_module.KeychainCredentials(
                 environment={}, security_bin=str(self.security)
             )

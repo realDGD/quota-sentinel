@@ -76,28 +76,8 @@ def read_keychain(
     security_bin: str = "/usr/bin/security",
     timeout: float = KEYCHAIN_READ_TIMEOUT_SECONDS,
 ) -> str:
-    try:
-        res = subprocess.run(
-            [
-                security_bin,
-                "find-generic-password",
-                "-a",
-                KEYCHAIN_ACCOUNT,
-                "-s",
-                service,
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout,
-        )
-        return res.stdout.strip()
-    except subprocess.SubprocessError as e:
-        # CalledProcessError (no item, denied) and TimeoutExpired (the bound
-        # above) are the same thing to every caller: an empty credential.
-        logger.error(f"Failed to read keychain for {service}: {e}")
-        return ""
+    from quota_sentinel.runtime.keychain import read
+    return read(service,security_bin=security_bin,timeout=timeout)
 
 
 def get_credentials() -> tuple[str, str]:
@@ -394,10 +374,15 @@ class FeishuListener:
     def run(self):
         global TASK_ORCHESTRATOR, USAGE_COMMAND, USAGE_COMMAND_TIMEOUT_SECONDS
         global command_environment, commands_enabled, commands_closing, command_executor
+        global AUTHORIZED_USER_ID
         import asyncio
         sdk = _load_sdk()
-        app_id, app_secret = get_credentials()
-        if not get_authorized_user_id():
+        from quota_sentinel.runtime.feishu import SelectedCredentials
+        credentials=SelectedCredentials(self.config.credentials,timeout=self.config.budgets['credentials']['timeout'])
+        app_id, app_secret = credentials.get('app_id'), credentials.get('app_secret')
+        if not app_id or not app_secret:raise RuntimeError('Feishu App ID or App Secret is missing')
+        AUTHORIZED_USER_ID=credentials.get('user_id')
+        if not AUTHORIZED_USER_ID:
             raise RuntimeError('Authorized Feishu user ID is missing')
         TASK_ORCHESTRATOR = self.scheduler
         commands_enabled = self.config.features.quota_queries

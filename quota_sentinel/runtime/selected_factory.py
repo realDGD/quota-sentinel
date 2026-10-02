@@ -43,6 +43,12 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
  from .agy_exec import AgyExecConfig,AgyExecRunner
  from .direct import DirectRunner
  env=runtime_environment(settings,environment);options=quota_probe_options(env)
+ def selected_key(provider, env_key):
+  reference=settings.credentials.get(provider)
+  if reference is None:return env.get(env_key,'')
+  from quota_sentinel.platform.credentials import CredentialStore,CredentialUnavailable
+  try:return CredentialStore(environment=env).read(reference,timeout=settings.budgets['credentials']['timeout'])
+  except CredentialUnavailable:return ''
  captures=frozenset(p for p in plan.active_providers if "pi-snapshot" in settings.providers[p].quota_chain)
  def runner_factory(ch):
   exe=env['QUOTA_SENTINEL_'+('curl' if ch=='direct' else ch).upper()+'_BIN']
@@ -69,7 +75,8 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
     if r.config.preflight and r.agent_listed(paths) is not True:raise ConfigurationError('selected agy agent/auth metadata unavailable')
    return ReadyRunner(r,agy_ready)
   if ch=='direct':
-   r=DirectRunner(curl_bin=options['curl_bin'],timeout=settings.budgets['direct']['timeout'],environment=env,logger=log,capture_providers=captures)
+   from .direct import DIRECT_PROVIDERS
+   r=DirectRunner(curl_bin=options['curl_bin'],timeout=settings.budgets['direct']['timeout'],environment=env,logger=log,capture_providers=captures,key_reader=lambda p:selected_key(p,DIRECT_PROVIDERS[p].env_key))
    def direct_ready(provider,paths):
     if not r._key_reader(provider):raise ConfigurationError('selected direct credential unavailable for '+provider)
    return ReadyRunner(r,direct_ready)
@@ -78,8 +85,9 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
  notifier=NullNotifier()
  reply_user=env.get('QUOTA_SENTINEL_REPLY_USER', '') if plan.command=='usage' and settings.features.feishu_listener else ''
  if plan.notify or reply_user:
-  from .feishu import FeishuClient,FeishuNotifier
-  notifier=FeishuNotifier(FeishuClient(environment=env,dry_run=dry_run_flag,total_timeout=settings.budgets["notification"]["timeout"]),roster=plan.active_providers)
+  from .feishu import FeishuClient,FeishuNotifier,SelectedCredentials
+  credentials=SelectedCredentials(settings.credentials,environment=env,timeout=settings.budgets['credentials']['timeout'])
+  notifier=FeishuNotifier(FeishuClient(credentials,environment=env,dry_run=dry_run_flag,total_timeout=settings.budgets["notification"]["timeout"]),roster=plan.active_providers)
   if reply_user:
    from quota_sentinel.daemon import ReplyNotifier
    notifier=ReplyNotifier(notifier.client,reply_user)
@@ -88,7 +96,10 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
   if any('pi-live' in chain for chain in plan.quota_chains.values()):
    from .pi_live import PiLiveQuotaClient
    live=PiLiveQuotaClient(settings,environment=env)
-  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,pi_live_client=live,logger=logging.getLogger('quota_sentinel.quota').info,**options)
+  def key(service,env_key):
+   provider='opencode' if service=='quota-sentinel.opencode-go-api-key' else 'clinepass'
+   return selected_key(provider,env_key)
+  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,pi_live_client=live,api_key_getter=key,logger=logging.getLogger('quota_sentinel.quota').info,**options)
  def preflight(providers):
   # Construct only explicitly listed candidates; preparation is still deferred
   # until the application has a private workspace, before state attempts begin.

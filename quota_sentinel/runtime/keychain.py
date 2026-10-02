@@ -11,7 +11,6 @@ that, and they pass secrets to child processes over stdin only.
 from __future__ import annotations
 
 import os
-import subprocess
 from typing import Mapping, Optional
 
 KEYCHAIN_ACCOUNT = "quota-sentinel"
@@ -44,20 +43,14 @@ def read(
     """Read a generic password; an absent Keychain or item is empty, not fatal."""
     if disabled(environment):
         return ""
+    from quota_sentinel.config import CredentialReference
+    from quota_sentinel.platform.credentials import CredentialStore, CredentialUnavailable
     budget = DEFAULT_READ_TIMEOUT_SECONDS if timeout is None else timeout
     try:
-        result = subprocess.run(
-            [security_bin, "find-generic-password", "-a", account,
-             "-s", service, "-w"],
-            check=False, capture_output=True, timeout=budget,
-        )
-    except (OSError, subprocess.SubprocessError):
-        # A timeout is one more way the item is unavailable, not an error the
-        # caller has to handle: the credential ladder moves on either way.
+        return CredentialStore(environment=environment, security_bin=security_bin).read(
+            CredentialReference('system', service, account), timeout=budget)
+    except CredentialUnavailable:
         return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout.decode("utf-8", "replace").strip()
 
 
 def present(service: str, **kwargs) -> bool:

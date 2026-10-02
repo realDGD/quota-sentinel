@@ -43,8 +43,12 @@ def _windows_open(path, mode):
     convert.argtypes = [w.LPCWSTR, w.DWORD, c.POINTER(c.c_void_p), c.c_void_p]
     convert.restype = w.BOOL
     descriptor = c.c_void_p()
-    # Protected DACL; owner, SYSTEM and administrators only. No inherited ACEs.
-    if not convert('D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)', 1, c.byref(descriptor), None):
+    # Explicit user owner, including an elevated administrator token whose
+    # default object owner may otherwise be the Administrators group.
+    from .windows_files import current_user_sid
+    sid=current_user_sid()
+    sddl='O:'+sid+'D:P(A;;FA;;;'+sid+')(A;;FA;;;SY)(A;;FA;;;BA)'
+    if not convert(sddl, 1, c.byref(descriptor), None):
         raise c.WinError(c.get_last_error())
     create = kernel.CreateFileW
     create.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, c.POINTER(Attributes), w.DWORD, w.DWORD, w.HANDLE]
@@ -52,6 +56,11 @@ def _windows_open(path, mode):
     kernel.CloseHandle.argtypes = [w.HANDLE]
     kernel.LocalFree.argtypes = [c.c_void_p]
     try:
+        get_attributes = kernel.GetFileAttributesW
+        get_attributes.argtypes = [w.LPCWSTR]; get_attributes.restype = w.DWORD
+        existing = get_attributes(str(path))
+        if existing != 0xFFFFFFFF and existing & 0x400:
+            raise OSError('private file cannot be a reparse point')
         if mode != 'rb' and path.exists():
             set_security = security.SetFileSecurityW
             set_security.argtypes = [w.LPCWSTR, w.DWORD, c.c_void_p]
@@ -66,8 +75,6 @@ def _windows_open(path, mode):
         if handle == c.c_void_p(-1).value:
             raise c.WinError(c.get_last_error())
         # Reject reparse points rather than traversing a secret-file symlink.
-        get_attributes = kernel.GetFileAttributesW
-        get_attributes.argtypes = [w.LPCWSTR]; get_attributes.restype = w.DWORD
         if get_attributes(str(path)) & 0x400:
             kernel.CloseHandle(handle)
             raise OSError('private file cannot be a reparse point')

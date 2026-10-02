@@ -183,6 +183,7 @@ class QuotaCollector:
         security_bin: Path = Path("/usr/bin/security"),
         python_bin: Path = Path(sys.executable),
         opencode_api_key_getter: Optional[Callable[[], str]] = None,
+        api_key_getter=None,
         logger: Optional[Callable[[str], None]] = None,
         codexbar_timeout: float = 20,
         antigravity_codexbar_timeout: float = 35,
@@ -212,6 +213,7 @@ class QuotaCollector:
         self.security_bin = Path(security_bin)
         self.python_bin = Path(python_bin)
         self.opencode_api_key_getter = opencode_api_key_getter
+        self.api_key_getter = api_key_getter
         self.logger = logger or (lambda _message: None)
         self.codexbar_timeout = codexbar_timeout
         self.antigravity_codexbar_timeout = antigravity_codexbar_timeout
@@ -317,6 +319,7 @@ class QuotaCollector:
         ``opencode_api_key_getter`` remains the injectable seam the OpenCode
         suites use; every other provider reads its own service.
         """
+        if self.api_key_getter is not None:return self.api_key_getter(service,env_key) or ''
         if service == _OPENCODE_API_KEY_SERVICE and self.opencode_api_key_getter is not None:
             return self.opencode_api_key_getter() or ""
         value = os.environ.get(env_key, "")

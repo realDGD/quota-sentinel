@@ -10,7 +10,6 @@ import os
 import queue
 import re
 import socket
-import subprocess
 import threading
 import time
 from typing import Any, Mapping, Optional
@@ -108,20 +107,40 @@ class KeychainCredentials:
         )
 
     def save_user_id(self, value: str) -> None:
+        from quota_sentinel.config import CredentialReference
+        from quota_sentinel.platform.credentials import CredentialStore, CredentialUnavailable
         try:
-            done = subprocess.run(
-                [self.security_bin, "add-generic-password", "-U", "-a", KEYCHAIN_ACCOUNT,
-                 "-s", SERVICES["user_id"], "-T", self.security_bin, "-w", value],
-                check=False, capture_output=True, text=True,
-                # Bounded like the read (keychain.DEFAULT_READ_TIMEOUT_SECONDS):
-                # `discover-feishu-user` must not hang on an unanswered Keychain
-                # prompt, and a write that cannot finish is a refusal, not a wait.
-                timeout=KEYCHAIN_WRITE_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise FeishuError("could not save Feishu user ID in Keychain") from exc
-        if done.returncode != 0:
-            raise FeishuError("could not save Feishu user ID in Keychain")
+            CredentialStore(environment=self.environment).write(
+                CredentialReference('system', SERVICES['user_id'], KEYCHAIN_ACCOUNT),
+                value, timeout=KEYCHAIN_WRITE_TIMEOUT_SECONDS)
+        except CredentialUnavailable:
+            raise FeishuError('could not save Feishu user ID in the selected credential store') from None
+
+
+class SelectedCredentials:
+    """Profile references first; missing references only use named env values."""
+    def __init__(self, references, *, environment=None, timeout=15, store=None):
+        from quota_sentinel.platform.credentials import CredentialStore
+        self.references=references
+        self.environment=dict(os.environ if environment is None else environment)
+        self.timeout=timeout
+        self.store=store or CredentialStore(environment=self.environment)
+
+    def get(self, name):
+        from quota_sentinel.platform.credentials import CredentialUnavailable
+        if name not in SERVICES:raise KeyError(name)
+        reference=self.references.get('feishu_'+name)
+        if reference is None:return self.environment.get(ENV_NAMES[name], '')
+        try:return self.store.read(reference,timeout=self.timeout)
+        except CredentialUnavailable:return ''
+
+    def save_user_id(self, value):
+        from quota_sentinel.platform.credentials import CredentialUnavailable
+        reference=self.references.get('feishu_user_id')
+        if reference is None:raise FeishuError('configure a writable Feishu user ID credential reference first')
+        try:self.store.write(reference,value,timeout=self.timeout)
+        except CredentialUnavailable:
+            raise FeishuError('could not save Feishu user ID in the selected credential store') from None
 
 
 class UrllibHttp:
