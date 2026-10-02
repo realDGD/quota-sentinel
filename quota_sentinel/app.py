@@ -132,8 +132,10 @@ class Application:
         config: AppConfig = AppConfig(),
         workspace_parent: Optional[Path] = None,
         preflight: Optional[Callable[[Sequence[str]], None]] = None,
+        runtime_plan=None,
     ) -> None:
         self.state_dir = Path(state_dir)
+        self.runtime_plan = runtime_plan
         self.model_runner = model_runner
         self.quota_collector_factory = quota_collector_factory
         self.notifier = notifier

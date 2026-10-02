@@ -227,9 +227,13 @@ def create_application(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     config: Optional[AppConfig] = None,
+    software_config=None, runtime_plan=None,
 ) -> Application:
     env = _env(environment)
     state_dir = Path(state_dir)
+    if runtime_plan is not None:
+        from .selected_factory import create_selected_application
+        return create_selected_application(state_dir, software_config, runtime_plan, environment=env, clock=clock, sleep=sleep, dry_run_flag=dry_run_flag)
     # FIRST, before any config object, runner, workspace or state work: an
     # override that names a transport which cannot serve the provider is a
     # configuration error, and it must be reported as one (the CLI turns the
