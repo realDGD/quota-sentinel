@@ -432,22 +432,24 @@ class ModelRunner:
         # child that leaked a background process holding stderr could stall a
         # pipe read, while nothing here reads until the helper is gone.
         with tempfile.TemporaryFile() as captured:
-            with subprocess.Popen(
-                command,
+            from quota_sentinel.platform.process import spawn_owned
+            with spawn_owned(
+                command, cwd=Path.cwd(), environment=self._base_environment(),
                 stdout=discard,
                 stderr=captured,
-                env=self._base_environment(),
             ) as process:
                 try:
                     process.wait(timeout=guard)
                 except subprocess.TimeoutExpired:
                     # The helper wedged before it could escalate, so the guard
                     # reaps the tree here; the caller writes the single line.
-                    _reap_wedged_helper(process.pid)
-                    process.kill()
-                    process.wait()
+                    # The parent retained every observed child group before
+                    # Pi exited on TERM, so reparenting cannot hide its child
+                    # from a late process-table snapshot.
+                    process.stop(0)
                     raise
-            if process.returncode == _HELPER_TIMEOUT_EXIT:
+                returncode = process.poll()
+            if returncode == _HELPER_TIMEOUT_EXIT:
                 # The helper timed out and reaped the group itself; its own
                 # diagnostics are replaced by the one line the caller's
                 # contract promises, so the file never grows two lines about a
