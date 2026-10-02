@@ -51,9 +51,13 @@ def scheduler_state_sources() -> list:
     them — so the runtime modules are excluded from this sweep for the same
     reason as ``quota_sentinel/quota``.
     """
+    # files.py is the byte-only OS primitive beneath the state writer; it
+    # contains no scheduler serialization or authority policy. Other platform
+    # modules remain in this sweep so they cannot acquire state-writing policy.
     return [
         path for path in python_sources()
         if "/quota/" not in str(path) and "/runtime/" not in str(path)
+        and path != REPO / "quota_sentinel/platform/files.py"
     ]
 
 
