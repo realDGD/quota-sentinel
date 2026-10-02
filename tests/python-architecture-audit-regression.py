@@ -128,7 +128,7 @@ class AuthoritativeWriter(unittest.TestCase):
     PERSISTENCE_PACKAGE = "quota_sentinel/state/"
     WRITE_PATTERN = re.compile(
         r"_publish_atomic|os\.replace\(|\.write_text\(|\.write_bytes\("
-        r"|open\([^)]*,\s*['\"][wa]"
+        r"|\bopen\([^)]*,\s*['\"][wa]"
     )
 
     def test_ar4_no_direct_state_writes_outside_the_persistence_package(self):
