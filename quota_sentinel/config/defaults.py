@@ -9,7 +9,7 @@ BUDGET_DEFAULTS={
  'agy':dict(timeout=120,kill_grace=10,input_ceiling=1500,output_ceiling=200,transient_attempts=3,preflight=1),
  'direct':dict(timeout=120,kill_grace=10),
  'probes':dict(codexbar_timeout=20,antigravity_codexbar_timeout=35,opencode_codexbar_timeout=20,clinepass_codexbar_timeout=20,antigravity_native_timeout=20,opencode_native_timeout=15,clinepass_native_timeout=15,codexbar_kill_grace=10),
- 'credentials':dict(timeout=15),'notification':dict(timeout=15),
+ 'credentials':dict(timeout=15),'notification':dict(timeout=45),
  'pi_live':dict(timeout=30,kill_grace=10),
 }
 def default_provider(provider,*,enabled=False):

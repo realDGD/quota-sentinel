@@ -243,9 +243,11 @@ class DirectRunner:
         timeout: float = DIRECT_TIMEOUT_SECONDS,
         logger: Optional[Callable[[str], None]] = None,
         providers: Mapping[str, DirectProvider] = DIRECT_PROVIDERS,
+        capture_providers=None,
         key_reader: Optional[Callable[[str], str]] = None,
         environment: Optional[Mapping[str, str]] = None,
     ) -> None:
+        self.capture_providers = capture_providers
         self.curl_bin = Path(curl_bin)
         self.timeout = timeout
         self.logger = logger or (lambda _message: None)
@@ -307,7 +309,7 @@ class DirectRunner:
         content, usage, detail = self._read_completion(spec, completion)
         success = completion.status == "200" and completion.returncode == 0 and content == "1"
 
-        if success:
+        if success and (self.capture_providers is None or provider in self.capture_providers):
             self._write_snapshot(spec, key, paths.quota_path)
 
         with _open_private(paths.stdout_path) as handle:

@@ -28,7 +28,7 @@ def _overrides(c,env,sources):
  for client in ('pi','codex','agy','codexbar','curl','node','uv'):
   value=env.get('QUOTA_SENTINEL_'+client.upper()+'_BIN')
   if value:d['clients'][client]=value;sources['clients.'+client]='environment'
- for client,var in (('pi_auth','QUOTA_SENTINEL_PI_AUTH_FILE'),('codex_home','CODEX_HOME')):
+ for client,var in (('pi_auth','QUOTA_SENTINEL_PI_AUTH_FILE'),('codex_home','QUOTA_SENTINEL_CODEX_HOME')):
   if env.get(var):d['clients'][client]=env[var];sources['clients.'+client]='environment'
  for pair in env.get('QUOTA_SENTINEL_TRANSPORT','').split(','):
   parts=pair.strip().split('=')

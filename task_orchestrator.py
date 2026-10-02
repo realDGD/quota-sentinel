@@ -337,6 +337,7 @@ def worst_case_check_seconds(
 def check_command_timeout(
     environment: Mapping[str, str] | None = None,
     config: AppConfig | None = None,
+    *, software_config=None, runtime_plan=None,
 ) -> float:
     """`QUOTA_SENTINEL_CHECK_TIMEOUT`, or the derived bound plus its margin.
 
@@ -346,9 +347,11 @@ def check_command_timeout(
     module is loaded by launchd, so a typo in an environment variable must not
     take the listener down.
     """
-    derived = worst_case_check_seconds(environment, config) * (
-        1.0 + CHECK_TIMEOUT_SAFETY_FRACTION
-    )
+    if software_config is not None:
+        from quota_sentinel.runtime.budgets import check_budget
+        derived = check_budget(software_config, runtime_plan)
+    else:
+        derived = worst_case_check_seconds(environment, config) * (1.0 + CHECK_TIMEOUT_SAFETY_FRACTION)
     env = os.environ if environment is None else environment
     raw = env.get(CHECK_TIMEOUT_ENV, "").strip()
     if not raw:

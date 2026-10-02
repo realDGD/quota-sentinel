@@ -437,8 +437,9 @@ class LaunchAgentConfigTest(unittest.TestCase):
         cls.project_root = Path(__file__).resolve().parent.parent
 
     def load_plist(self, filename: str) -> dict[str, object]:
-        with (self.project_root / filename).open("rb") as handle:
-            return plistlib.load(handle)
+        template = (self.project_root / (filename + ".template")).read_text()
+        rendered = template.replace("__REPO_DIR__", str(self.project_root)).replace("__LOG_DIR__", str(self.project_root / "logs"))
+        return plistlib.loads(rendered.encode())
 
     def test_listener_hosts_the_task_orchestrator(self) -> None:
         job = self.load_plist("quota-sentinel.feishu-listener.plist")

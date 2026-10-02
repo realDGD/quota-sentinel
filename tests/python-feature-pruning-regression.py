@@ -62,6 +62,19 @@ class PruningTests(unittest.TestCase):
   rev=save_config(path,parse_config(d),expected_revision=saved.revision)
   save_config(path,c,expected_revision=rev)
   app.check();self.assertEqual(events,[]);self.assertFalse(service.load_state(self.state,'codex').retry_pending)
+ def test_direct_opening_without_snapshot_does_not_issue_usage(self):
+  from quota_sentinel.runtime.direct import DirectRunner
+  class R(DirectRunner):
+   def _post_json(self,*a):return SimpleNamespace(stdout='{"choices":[{"message":{"content":"1"}}]}',status='200',returncode=0,timed_out=False,error='')
+   def _write_snapshot(self,*a):raise AssertionError('unselected snapshot request')
+  r=R(key_reader=lambda p:'fake',capture_providers=frozenset());r.prepare('opencode',self.root)
+  self.assertTrue(r.run('opencode',self.root,'initial',1,1).success)
+ def test_native_cli_auth_without_auth_json(self):
+  from quota_sentinel.runtime.factory import create_application
+  cli=self.root/'codex';seen=self.root/'seen';cli.write_text('#!'+sys.executable+'\nimport sys\nfrom pathlib import Path\nassert sys.argv[1:] == ["login","status"]\nPath('+repr(str(seen))+').write_text("metadata")\n');cli.chmod(0o700)
+  d=to_document(new_user_defaults());d['clients']={'codex':str(cli),'codex_home':str(self.root/'no-auth-file')};c=parse_config(d)
+  app=create_application(self.state,software_config=c,runtime_plan=build_runtime_plan(c,'run'),environment={})
+  app.model_runner.prepare('codex',self.root/'work');self.assertTrue(seen.exists(),'official-client auth status must be checked before an attempt')
  def test_only_opening_internal_observation_and_bot_refusal(self):
   c=replace(new_user_defaults(),features=FeatureSettings(True,False,False,False));self.assertEqual(build_runtime_plan(c,'check').probe_providers,('codex',))
   with self.assertRaises(ConfigurationError):build_runtime_plan(c,'usage')

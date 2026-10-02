@@ -54,7 +54,8 @@ TASK_ORCHESTRATOR: TaskOrchestrator | None = None
 # Native opencode ~16s + CodexBar opencode (20+10)s ≈ 207s; Feishu auth 45s
 # + send 3x45s + retry delays ≈ 183s. The outer bound includes both
 # acquisition and delivery. No cadence changes.
-USAGE_COMMAND_TIMEOUT_SECONDS = 480
+from quota_sentinel.runtime.budgets import listener_usage_budget
+USAGE_COMMAND_TIMEOUT_SECONDS = listener_usage_budget(os.environ)
 
 # The listener reads its own credentials before it can serve anything. A wedged
 # `security` (an unanswered Keychain prompt, stuck IPC) must not hold daemon

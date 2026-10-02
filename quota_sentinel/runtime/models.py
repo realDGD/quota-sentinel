@@ -82,6 +82,7 @@ class ModelRunnerConfig:
     plugin_entries: Optional[Mapping[str, Path]] = None
     plugin_timeout: float = 15
     verify_plugins: bool = False
+    capture_providers: Optional[frozenset] = None
 
     @classmethod
     def from_env(cls, environment: Optional[Mapping[str, str]] = None) -> "ModelRunnerConfig":
@@ -338,7 +339,7 @@ class ModelRunner:
         env.pop("ANTIGRAVITY_NO_PREWARM", None)
         env["PI_CODING_AGENT_DIR"] = str(paths.agent_dir)
         env["PI_OFFLINE"] = "1"
-        if _PI_PROVIDER[provider].capture_env:
+        if _PI_PROVIDER[provider].capture_env and (self.config.capture_providers is None or provider in self.config.capture_providers):
             env[_PI_PROVIDER[provider].capture_env] = str(paths.quota_path)
         if provider == "antigravity":
             env["ANTIGRAVITY_NO_PREWARM"] = "1"
@@ -468,7 +469,7 @@ class ModelRunner:
             if entry is None:
                 raise ValueError("missing selected Pi plugin")
             command.extend(["--extension", str(entry)])
-        if spec.capture_extension is not None:
+        if spec.capture_extension is not None and (self.config.capture_providers is None or provider in self.config.capture_providers):
             command.extend(["--extension", str(Path(self.config.repo_dir) / spec.capture_extension)])
         command.extend(["--", _PROMPT])
         return command

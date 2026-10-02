@@ -176,7 +176,7 @@ def lookup_payload(identifier: str) -> dict:
 
 
 class FeishuClient:
-    def __init__(self, credentials: Any = None, *, http: Any = None, sleep: Any = None, dry_run: Optional[bool] = None, api_base: str = API_BASE, environment: Optional[Mapping[str, str]] = None):
+    def __init__(self, credentials: Any = None, *, http: Any = None, sleep: Any = None, dry_run: Optional[bool] = None, api_base: str = API_BASE, environment: Optional[Mapping[str, str]] = None, total_timeout: float = 45):
         self.credentials = credentials if credentials is not None else KeychainCredentials(environment)
         self.http = http if http is not None else UrllibHttp()
         self.sleep = sleep if sleep is not None else time.sleep
@@ -185,6 +185,7 @@ class FeishuClient:
         # exactly like FEISHU_DISABLE_CHART below.
         env = os.environ if environment is None else environment
         self.dry_run = (env.get("FEISHU_DRY_RUN") == "1") if dry_run is None else dry_run
+        self.total_timeout = total_timeout
         self.api_base = api_base.rstrip("/")
 
     def _credential(self, name: str) -> str:
@@ -258,7 +259,7 @@ class FeishuClient:
         for attempt in range(retries + 1):
             try:
                 result = self.http.post(
-                    f"{self.api_base}/{path}", self._encode(body), headers, 15, 45,
+                    f"{self.api_base}/{path}", self._encode(body), headers, min(15,self.total_timeout), self.total_timeout,
                 )
                 if isinstance(result, bytes):
                     result = json.loads(result)
