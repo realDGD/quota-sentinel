@@ -88,7 +88,8 @@ class ModelRunnerConfig:
     def from_env(cls, environment: Optional[Mapping[str, str]] = None) -> "ModelRunnerConfig":
         env = os.environ if environment is None else environment
         home = Path(_env_value(env, "HOME", str(Path.home())))
-        repo = Path(__file__).resolve().parents[2]
+        from quota_sentinel.helpers import resource_path
+        repo = resource_path("run_with_timeout.py").parent
         return cls(
             pi_bin=Path(_env_value(env, "QUOTA_SENTINEL_PI_BIN", "/opt/homebrew/bin/pi")),
             auth_file=Path(
@@ -149,10 +150,9 @@ _PROMPT = "不用思考，只回复我 1"
 
 
 def _open_private(path: Path, *, append: bool = False):
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-    fd = os.open(path, flags, 0o600)
-    os.fchmod(fd, 0o600)
-    return os.fdopen(fd, "ab" if append else "wb")
+    from quota_sentinel.platform.files import private_open
+    return private_open(path, 'ab' if append else 'wb')
+
 
 
 _STDERR_TAIL_BYTES = 8192
@@ -226,80 +226,6 @@ def _auth_refresh_timeout_line(seconds: float) -> bytes:
     ).encode()
 
 
-def _sigkill(pid: int) -> None:
-    """SIGKILL one process, and the group it leads when it leads one.
-
-    The refresh helper gives its child its own session, so a survivor is a
-    group leader whose group is exactly the tree below it -- signalling that
-    group is what reaches grandchildren the walk has not named. The helper's
-    own fail-safe is repeated here: never signal this process's group, even if
-    a victim is reported to share it.
-    """
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        return
-    if pgid == pid and pgid != os.getpgrp():
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
-            pass
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-
-
-def _process_descendants(root: int) -> list[int]:
-    """Every live process below ``root``, parents before children.
-
-    ``ps`` is the portable process-table reader on both targets; a table that
-    cannot be read (or holds nothing) only means the guard below has nothing
-    extra to name, never an exception out of prepare(). The read is bounded like
-    every other external process here: a wedged ``ps`` must not turn a
-    last-resort reap into the very hang it exists to end.
-    """
-    try:
-        listing = subprocess.run(
-            ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True,
-            check=False, timeout=_PROCESS_TABLE_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    children: dict[int, list[int]] = {}
-    for line in listing.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            continue
-        try:
-            pid, ppid = int(fields[0]), int(fields[1])
-        except ValueError:
-            continue
-        children.setdefault(ppid, []).append(pid)
-    found: list[int] = []
-    queue = [root]
-    while queue:
-        for child in children.get(queue.pop(0), ()):
-            found.append(child)
-            queue.append(child)
-    return found
-
-
-def _reap_wedged_helper(pid: int) -> None:
-    """Last resort for a refresh helper that outlived its own deadline.
-
-    The parent-side guard is a real last resort, so it cannot assume the helper
-    is alive enough to escalate for itself, and it cannot signal the helper's
-    group either: the helper puts the refresh child in a session of its own.
-    The tree is therefore read from the process table first, killed
-    deepest-first, and the helper is signalled last so nothing is reparented
-    before it is named.
-    """
-    for survivor in reversed(_process_descendants(pid)):
-        _sigkill(survivor)
-    _sigkill(pid)
-
-
 class ModelRunner:
     """The Pi transport.
 
@@ -355,16 +281,15 @@ class ModelRunner:
             if not check.available:
                 raise ConfigurationError(check.reason)
         workspace = Path(os.path.abspath(workspace))
-        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-        workspace.chmod(0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(workspace)
         paths = PreparedPaths(
             agent_dir=workspace / f"{provider}-agent",
             stdout_path=workspace / f"{provider}-stdout",
             stderr_path=workspace / f"{provider}-stderr",
             quota_path=workspace / f"{provider}-quota.json",
         )
-        paths.agent_dir.mkdir(mode=0o700, exist_ok=True)
-        paths.agent_dir.chmod(0o700)
+        private_directory(paths.agent_dir)
         if provider == "codex":
             # Pi may refresh OAuth here. Its bearer token must never enter a log.
             with open(os.devnull, "wb") as discard, _open_private(paths.stderr_path) as stderr:
@@ -376,8 +301,8 @@ class ModelRunner:
                     # exactly like the refresh's own timeout: one diagnosable
                     # line, then the credential already on disk is copied.
                     stderr.write(_auth_refresh_timeout_line(self.config.auth_timeout))
-                except OSError as exc:
-                    stderr.write(f"Pi auth refresh could not start: {exc.strerror or type(exc).__name__}\n".encode())
+                except (OSError,ValueError) as exc:
+                    stderr.write(f"Pi auth refresh could not start: {self.config.pi_bin.name} ({type(exc).__name__})\n".encode())
         try:
             with Path(self.config.auth_file).open("rb") as source, _open_private(paths.agent_dir / "auth.json") as dest:
                 shutil.copyfileobj(source, dest)
@@ -393,79 +318,37 @@ class ModelRunner:
         settings = '{"transport":"sse"}\n' if provider == "codex" else '{}\n'
         with _open_private(paths.agent_dir / "settings.json") as dest:
             dest.write(settings.encode())
+        if _PI_PROVIDER[provider].capture_extension and (self.config.capture_providers is None or provider in self.config.capture_providers):
+            # Node writeFile preserves the pre-created file's restricted native
+            # ACL on Windows; a POSIX mode argument alone cannot provide it.
+            with _open_private(paths.quota_path):pass
         self._prepared[(provider, workspace)] = paths
         return paths
 
+    def _helper_resource(self,name):
+        from quota_sentinel.helpers import resource_path
+        candidate=Path(self.config.repo_dir)/name
+        return candidate if candidate.is_file() else resource_path(name)
+
     def _refresh_pi_credentials(self, discard, stderr) -> None:
-        """Run the Pi credential refresh under the shared timeout helper.
-
-        The refresh is the one provider call this module makes outside an
-        attempt, and it used to run with no bound at all: a ``pi`` waiting on a
-        locked keyring or a wedged network stack blocked prepare(), and with it
-        every codex attempt -- including a manual ``run``, which has no outer
-        guard to be rescued by. ``run_with_timeout.py`` gives the child a
-        session of its own, SIGTERMs the whole group at ``auth_timeout``,
-        escalates to SIGKILL after ``kill_grace`` and reaps it; the parent-side
-        guard at ``auth_timeout + kill_grace`` repeats that deadline as a real
-        last resort, and is the legal cost of one codex prepare() that the
-        orchestrator's worst-case bound is built from.
-
-        A refresh that is cut short is not an error for this call site: the
-        caller reports the one bounded line and the attempt continues with the
-        credential already on disk. The bearer token is never read -- the
-        child's stdout is discarded, exactly as before.
-        """
-        helper = Path(self.config.repo_dir) / "run_with_timeout.py"
-        command = [
-            sys.executable, str(helper),
-            "--timeout", str(self.config.auth_timeout),
-            "--kill-grace", str(self.config.kill_grace),
-            "--", str(self.config.pi_bin), "auth", "print-bearer-token",
-            "--provider", "openai-codex",
-        ]
-        guard = self.config.auth_timeout + self.config.kill_grace
-        # The helper's stderr is captured, not inherited: on either expiry path
-        # the prepared stderr file must carry exactly one line, and on every
-        # other path the bytes are copied through unchanged below, so the
-        # child's own diagnostics still land where a direct invocation put
-        # them. The capture is a private temporary file rather than a pipe: a
-        # child that leaked a background process holding stderr could stall a
-        # pipe read, while nothing here reads until the helper is gone.
-        with tempfile.TemporaryFile() as captured:
-            from quota_sentinel.platform.process import spawn_owned
-            with spawn_owned(
-                command, cwd=Path.cwd(), environment=self._base_environment(),
-                stdout=discard,
-                stderr=captured,
-            ) as process:
-                try:
-                    process.wait(timeout=guard)
-                except subprocess.TimeoutExpired:
-                    # The helper wedged before it could escalate, so the guard
-                    # reaps the tree here; the caller writes the single line.
-                    # The parent retained every observed child group before
-                    # Pi exited on TERM, so reparenting cannot hide its child
-                    # from a late process-table snapshot.
-                    process.stop(0)
-                    raise
-                returncode = process.poll()
-            if returncode == _HELPER_TIMEOUT_EXIT:
-                # The helper timed out and reaped the group itself; its own
-                # diagnostics are replaced by the one line the caller's
-                # contract promises, so the file never grows two lines about a
-                # single expiry.
-                stderr.write(_auth_refresh_timeout_line(self.config.auth_timeout))
-                return
-            captured.seek(0)
-            captured_bytes = captured.read()
-        if captured_bytes:
-            stderr.write(captured_bytes)
+        """Refresh inside an owned deadline; bearer stdout is never read."""
+        from quota_sentinel.platform.paths import resolve_launcher
+        from quota_sentinel.platform.process import run_bounded
+        command=[sys.executable,str(self._helper_resource('run_with_timeout.py')),
+            '--timeout',str(self.config.auth_timeout),'--kill-grace',str(self.config.kill_grace),
+            '--',*resolve_launcher('pi',explicit=self.config.pi_bin),'auth','print-bearer-token','--provider','openai-codex']
+        result=run_bounded(command,cwd=Path.cwd(),environment=self._base_environment(),
+            timeout=self.config.auth_timeout+self.config.kill_grace,kill_grace=0,discard_stdout=True)
+        if result.timed_out or result.returncode==_HELPER_TIMEOUT_EXIT:
+            stderr.write(_auth_refresh_timeout_line(self.config.auth_timeout))
+        elif result.stderr:stderr.write(result.stderr)
 
     def _command(self, provider: str) -> list[str]:
         spec = _PI_PROVIDER[provider]
         pi_provider, model, thinking = spec.provider_id, spec.model, spec.thinking
+        from quota_sentinel.platform.paths import resolve_launcher
         command = [
-            str(self.config.pi_bin), "--provider", pi_provider, "--model", model,
+            *resolve_launcher("pi",explicit=self.config.pi_bin), "--provider", pi_provider, "--model", model,
             "--thinking", thinking, "--mode", "text", "--print", "--no-session",
             "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
             "--no-themes", "--no-context-files", "--no-approve", "--offline",
@@ -478,7 +361,7 @@ class ModelRunner:
                 raise ValueError("missing selected Pi plugin")
             command.extend(["--extension", str(entry)])
         if spec.capture_extension is not None and (self.config.capture_providers is None or provider in self.config.capture_providers):
-            command.extend(["--extension", str(Path(self.config.repo_dir) / spec.capture_extension)])
+            command.extend(["--extension", str(self._helper_resource(str(spec.capture_extension)))])
         command.extend(["--", _PROMPT])
         return command
 
@@ -487,21 +370,18 @@ class ModelRunner:
             raise ValueError(f"unknown model provider: {provider}")
         workspace = Path(os.path.abspath(workspace))
         paths = self._prepared.get((provider, workspace)) or self.prepare(provider, workspace)
-        helper = Path(self.config.repo_dir) / "run_with_timeout.py"
+        helper = self._helper_resource("run_with_timeout.py")
         command = [
             sys.executable, str(helper), "--timeout", str(self.config.timeout),
             "--kill-grace", str(self.config.kill_grace), "--", *self._command(provider),
         ]
         started = time.monotonic()
-        with _open_private(paths.stdout_path) as stdout, _open_private(paths.stderr_path, append=True) as stderr:
-            completed = subprocess.run(
-                command,
-                cwd="/private/tmp",
-                env=self._environment(provider, paths),
-                stdout=stdout,
-                stderr=stderr,
-                check=False,
-            )
+        from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS
+        with tempfile.TemporaryDirectory(prefix='quota-pi-turn.') as cwd:
+            completed=run_bounded(command,cwd=cwd,environment=self._environment(provider,paths),
+                timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
+        with _open_private(paths.stdout_path) as stdout, _open_private(paths.stderr_path,append=True) as stderr:
+            stdout.write(completed.stdout);stderr.write(completed.stderr)
         elapsed = time.monotonic() - started
         # Shell command substitution strips trailing newlines, then tests exact
         # 1. Reading in text mode would translate CRLF to LF and accept "1\r\n",

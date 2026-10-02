@@ -65,3 +65,50 @@ def verify_private_handle(fd):
         for pointer in allocated:kernel.LocalFree(pointer)
         if descriptor:kernel.LocalFree(descriptor)
         if token:kernel.CloseHandle(token)
+
+
+def protect_directory(path):
+    """Create or restrict a directory, with a DACL inherited by SQLite sidecars."""
+    import ctypes as c
+    from ctypes import wintypes as w
+    api=c.WinDLL('advapi32',use_last_error=True);kernel=c.WinDLL('kernel32',use_last_error=True)
+    class Attributes(c.Structure):
+        _fields_=[('length',w.DWORD),('descriptor',c.c_void_p),('inherit',w.BOOL)]
+    sid=current_user_sid();descriptor=c.c_void_p()
+    sddl='O:'+sid+'D:P(A;OICI;FA;;;'+sid+')(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+    convert=api.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes=[w.LPCWSTR,w.DWORD,c.POINTER(c.c_void_p),c.c_void_p];convert.restype=w.BOOL
+    kernel.CreateDirectoryW.argtypes=[w.LPCWSTR,c.POINTER(Attributes)];kernel.CreateDirectoryW.restype=w.BOOL
+    kernel.CreateFileW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,c.c_void_p,w.DWORD,w.DWORD,w.HANDLE];kernel.CreateFileW.restype=w.HANDLE
+    kernel.CloseHandle.argtypes=[w.HANDLE];kernel.LocalFree.argtypes=[c.c_void_p]
+    api.GetSecurityInfo.argtypes=[w.HANDLE,w.DWORD,w.DWORD,c.POINTER(c.c_void_p),c.c_void_p,c.c_void_p,c.c_void_p,c.POINTER(c.c_void_p)];api.GetSecurityInfo.restype=w.DWORD
+    api.ConvertSidToStringSidW.argtypes=[c.c_void_p,c.POINTER(w.LPWSTR)];api.ConvertSidToStringSidW.restype=w.BOOL
+    api.GetSecurityDescriptorDacl.argtypes=[c.c_void_p,c.POINTER(w.BOOL),c.POINTER(c.c_void_p),c.POINTER(w.BOOL)];api.GetSecurityDescriptorDacl.restype=w.BOOL
+    api.SetSecurityInfo.argtypes=[w.HANDLE,w.DWORD,w.DWORD,c.c_void_p,c.c_void_p,c.c_void_p,c.c_void_p];api.SetSecurityInfo.restype=w.DWORD
+    handle=None;existing=c.c_void_p();owner_text=w.LPWSTR()
+    try:
+        if not convert(sddl,1,c.byref(descriptor),None):raise c.WinError(c.get_last_error())
+        attrs=Attributes(c.sizeof(Attributes),descriptor,False)
+        if not kernel.CreateDirectoryW(str(path),c.byref(attrs)) and c.get_last_error()!=183:
+            raise c.WinError(c.get_last_error())
+        # Open the directory itself rather than following a junction.
+        handle=kernel.CreateFileW(str(path),0x00060000,7,None,3,0x02200000,None)
+        if handle==c.c_void_p(-1).value:handle=None;raise c.WinError(c.get_last_error())
+        class Info(c.Structure):
+            _fields_=[('attributes',w.DWORD),('creation',w.FILETIME),('access',w.FILETIME),('write',w.FILETIME),('volume',w.DWORD),('sizeHigh',w.DWORD),('sizeLow',w.DWORD),('links',w.DWORD),('indexHigh',w.DWORD),('indexLow',w.DWORD)]
+        info=Info();kernel.GetFileInformationByHandle.argtypes=[w.HANDLE,c.POINTER(Info)];kernel.GetFileInformationByHandle.restype=w.BOOL
+        if not kernel.GetFileInformationByHandle(handle,c.byref(info)):raise c.WinError(c.get_last_error())
+        if not info.attributes&0x10 or info.attributes&0x400:raise OSError('private directory cannot be a reparse point')
+        owner=c.c_void_p();error=api.GetSecurityInfo(handle,1,1,c.byref(owner),None,None,None,c.byref(existing))
+        if error:raise c.WinError(error)
+        if not api.ConvertSidToStringSidW(owner,c.byref(owner_text)):raise c.WinError(c.get_last_error())
+        if owner_text.value!=sid:raise OSError('private directory must be owned by this user')
+        present=w.BOOL();defaulted=w.BOOL();dacl=c.c_void_p()
+        if not api.GetSecurityDescriptorDacl(descriptor,c.byref(present),c.byref(dacl),c.byref(defaulted)):raise c.WinError(c.get_last_error())
+        error=api.SetSecurityInfo(handle,1,0x80000004,None,None,dacl,None)
+        if error:raise c.WinError(error)
+    finally:
+        if owner_text:kernel.LocalFree(c.cast(owner_text,c.c_void_p))
+        if existing:kernel.LocalFree(existing)
+        if handle:kernel.CloseHandle(handle)
+        if descriptor:kernel.LocalFree(descriptor)

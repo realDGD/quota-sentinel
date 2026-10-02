@@ -36,6 +36,8 @@ def resolve_launcher(name, explicit=None):
     if not isinstance(name, str) or not name or '\x00' in name:
         raise ValueError('invalid launcher name')
     found = str(explicit) if explicit is not None else shutil.which(name)
+    if found and not Path(found).is_file() and not any(s in found for s in ('/', '\\')):
+        found=shutil.which(found)
     if not found or '\x00' in found:
         raise ValueError('selected executable is unavailable: ' + name)
     # Preserve executable symlinks: resolving a virtualenv Python would select

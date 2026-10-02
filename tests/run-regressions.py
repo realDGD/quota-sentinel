@@ -15,6 +15,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_CACHE = None
 MACOS = {'python-installer-regression.py', 'python-runtime-lock-regression.py',
          'python-authority-regression.py', 'python-state-cutover-regression.py',
          'python-config-regression.py', 'python-config-cli-regression.py',
@@ -58,6 +59,8 @@ def fixture_environment(home):
                LOCALAPPDATA=str(home / 'AppData/Local'), PYTHONUNBUFFERED='1',
                UV_PYTHON=sys.executable, UV_PYTHON_DOWNLOADS='never',
                QUOTA_SENTINEL_KEYCHAIN_DISABLED='1')
+    if BUILD_CACHE:
+        env['QUOTA_SENTINEL_TEST_UV_CACHE'] = BUILD_CACHE
     return env
 
 def run_script(path, log, *, timeout=360):
@@ -99,6 +102,12 @@ def main(argv=None):
         parser.error('native verification must run on that operating system')
     log_dir = args.log_dir or Path(tempfile.mkdtemp(prefix='qs-regressions-'))
     log_dir.mkdir(parents=True, exist_ok=True)
+    global BUILD_CACHE
+    import shutil
+    uv = shutil.which('uv')
+    if uv:
+        cache = subprocess.run([uv, '--no-config', 'cache', 'dir'], capture_output=True, text=True, timeout=10)
+        if cache.returncode == 0: BUILD_CACHE = cache.stdout.strip()
     scripts = discover(selected) + discover_node()
     failed = []
     for script in scripts:

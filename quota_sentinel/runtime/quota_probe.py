@@ -57,7 +57,8 @@ _NORMALIZE_PI = {
     "opencode": normalize_pi_opencode,
     "clinepass": normalize_pi_clinepass,
 }
-_ROOT = Path(__file__).resolve().parents[2]
+from quota_sentinel.helpers import resource_path
+_ROOT = resource_path("opencode_usage.py").parent
 _MAX_PROBE_BYTES = 1024 * 1024
 # The shell has no outer bound on the native helper: only the helper's own
 # --timeout applies, and uv + interpreter start-up happens BEFORE that clock
@@ -103,47 +104,14 @@ def _run_bounded(
     stdin: Optional[bytes] = None,
     *, environment=None, cwd=None,
 ) -> _CommandResult:
-    """Capture a child under a process-group deadline; never expose argv."""
+    """Capture an owned tree with finite, portable pipe limits."""
+    from quota_sentinel.platform.process import run_bounded
     try:
-        process = subprocess.Popen(
-            list(command), stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, env=environment,
-            **({'cwd': str(cwd)} if cwd is not None else {}),
-        )
-    except OSError:
-        return _CommandResult(b"", b"", 127)
-    try:
-        try:
-            out, err = process.communicate(input=stdin, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_group(process, signal.SIGTERM)
-            try:
-                out, err = process.communicate(timeout=grace)
-            except subprocess.TimeoutExpired as expired:
-                # A detached descendant can keep our pipes open after the
-                # direct child is dead. communicate() without a deadline would
-                # wait for that descendant forever while quota.lock is held.
-                out, err = expired.output or b"", expired.stderr or b""
-            # A reaped leader can still leave a TERM-ignoring group member.
-            _kill_group(process, signal.SIGKILL)
-            return _CommandResult(out[:_MAX_PROBE_BYTES], err[:_MAX_PROBE_BYTES], 124, True)
-        if len(out) > _MAX_PROBE_BYTES or len(err) > _MAX_PROBE_BYTES:
-            return _CommandResult(b"", b"", 1)
-        return _CommandResult(out, err, process.returncode)
-    finally:
-        if process.poll() is None:
-            _kill_group(process, signal.SIGKILL)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=1)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                with contextlib.suppress(OSError):
-                    stream.close()
+        result=run_bounded(command,cwd=Path.cwd() if cwd is None else cwd,
+            environment=os.environ if environment is None else environment,
+            input_data=stdin,timeout=timeout,kill_grace=grace,max_bytes=_MAX_PROBE_BYTES)
+    except (OSError,ValueError):return _CommandResult(b"",b"",127)
+    return _CommandResult(result.stdout,result.stderr,result.returncode,result.timed_out)
 
 
 def _read_json(path: Path):
@@ -184,6 +152,7 @@ class QuotaCollector:
         python_bin: Path = Path(sys.executable),
         opencode_api_key_getter: Optional[Callable[[], str]] = None,
         api_key_getter=None,
+        environment=None,
         logger: Optional[Callable[[str], None]] = None,
         codexbar_timeout: float = 20,
         antigravity_codexbar_timeout: float = 35,
@@ -197,6 +166,9 @@ class QuotaCollector:
         tier_chains=None,
         pi_live_client=None,
     ) -> None:
+        self.environment=dict(os.environ if environment is None else environment)
+        if self.environment.get("QUOTA_SENTINEL_CODEX_HOME"):
+            self.environment["CODEX_HOME"]=self.environment["QUOTA_SENTINEL_CODEX_HOME"]
         self.providers = tuple(providers)
         self.pi_live_client = pi_live_client
         self.tier_chains = {p: tuple(Tier(t) for t in tier_chains[p]) for p in self.providers} if tier_chains is not None else None
@@ -236,21 +208,8 @@ class QuotaCollector:
 
     def _write_json(self, path: Path, document: dict) -> None:
         self._ensure_state_dir()
-        descriptor, name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent))
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                json.dump(document, output, ensure_ascii=False)
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.chmod(name, 0o600)
-            os.replace(name, path)
-        except BaseException:
-            try:
-                os.unlink(name)
-            except OSError:
-                pass
-            raise
+        from quota_sentinel.platform.files import publish_private
+        publish_private(path,(json.dumps(document,ensure_ascii=False)+'\n').encode())
 
     def _save_cache(self, provider: str, live: ProviderQuota) -> None:
         cached = demote_to_cached(live).as_document()
@@ -330,94 +289,46 @@ class QuotaCollector:
         )
 
     def _native_codex(self) -> Optional[ProviderQuota]:
-        if not os.access(self.codex_bin, os.X_OK):
-            return None
+        from quota_sentinel.platform.paths import resolve_launcher
+        from quota_sentinel.platform.process import spawn_owned, BoundedPipes
+        env=dict(self.environment)
+        for key in ('OPENAI_API_KEY','CODEX_API_KEY'):env.pop(key,None)
         try:
-            process = subprocess.Popen(
-                [str(self.codex_bin), "app-server"], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError:
-            return None
-        pending = b""
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ)
-
-                def request(request_id: int, method: str, params: dict):
-                    nonlocal pending
-                    data = json.dumps({"jsonrpc": "2.0", "id": request_id,
-                                       "method": method, "params": params}).encode() + b"\n"
-                    process.stdin.write(data)
-                    process.stdin.flush()
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        while b"\n" in pending:
-                            line, pending = pending.split(b"\n", 1)
-                            response = _bytes_json(line)
-                            if isinstance(response, dict) and response.get("id") == request_id:
-                                return response
-                        events = selector.select(max(0, deadline - time.monotonic()))
-                        if not events:
-                            break
-                        chunk = os.read(process.stdout.fileno(), 65536)
-                        if not chunk or len(pending) + len(chunk) > _MAX_PROBE_BYTES:
-                            break
-                        pending += chunk
+            command=(*resolve_launcher('codex',explicit=self.codex_bin),'app-server')
+            process=spawn_owned(command,cwd=self.workspace if self.workspace.is_dir() else Path.cwd(),environment=env,
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            with BoundedPipes(process,max_bytes=_MAX_PROBE_BYTES) as pipes:
+                def request(request_id,method,params):
+                    deadline=time.monotonic()+5
+                    data=json.dumps(dict(jsonrpc='2.0',id=request_id,method=method,params=params)).encode()+b'\n'
+                    pipes.write(data,deadline=deadline)
+                    while time.monotonic()<deadline:
+                        response=_bytes_json(pipes.readline(deadline=deadline))
+                        if isinstance(response,dict) and response.get('id')==request_id:return response
                     return None
-
-                if request(1, "initialize", {"clientInfo": {
-                    "name": "quota-sentinel", "version": "1.0"}}) is None:
-                    return None
-                response = request(2, "account/rateLimits/read", {})
-                if not isinstance(response, dict):
-                    return None
-                limits = response.get("result", {}).get("rateLimits", {})
-                primary, secondary = limits.get("primary"), limits.get("secondary")
-                if not isinstance(primary, dict) or not isinstance(secondary, dict) or not primary or not secondary:
-                    return None
-                five = primary if primary.get("windowDurationMins", 300) <= 360 else secondary
-                weekly = secondary if secondary.get("windowDurationMins", 10080) > 360 else primary
-
-                def window(value: dict) -> QuotaWindow:
-                    used = value.get("usedPercent")
-                    reset = value.get("resetsAt")
-                    if type(used) not in (int, float) or not math.isfinite(used) or not 0 <= used <= 100 or type(reset) is not int or reset <= 0:
-                        raise ValueError("invalid native window")
-                    remaining = math.floor(max(0, min(100, 100 - used)) + 0.5)
-                    return QuotaWindow(remaining, reset)
-
-                quota = ProviderQuota("Native · codex app-server", True, False,
-                                      int(time.time()), window(five), window(weekly))
+                if request(1,'initialize',{'clientInfo':{'name':'quota-sentinel','version':'1.0'}}) is None:return None
+                response=request(2,'account/rateLimits/read',{})
+                if not isinstance(response,dict):return None
+                limits=response.get('result',{}).get('rateLimits',{})
+                primary,secondary=limits.get('primary'),limits.get('secondary')
+                if not isinstance(primary,dict) or not isinstance(secondary,dict) or not primary or not secondary:return None
+                five=primary if primary.get('windowDurationMins',300)<=360 else secondary
+                weekly=secondary if secondary.get('windowDurationMins',10080)>360 else primary
+                def window(value):
+                    used=value.get('usedPercent');reset=value.get('resetsAt')
+                    if type(used) not in (int,float) or not math.isfinite(used) or not 0<=used<=100 or type(reset) is not int or reset<=0:raise ValueError('invalid native window')
+                    return QuotaWindow(math.floor(max(0,min(100,100-used))+.5),reset)
+                quota=ProviderQuota('Native · codex app-server',True,False,int(time.time()),window(five),window(weekly))
                 return parse_document(quota.as_document())
-        except (BrokenPipeError, OSError, ValueError, TypeError, AttributeError):
-            return None
-        finally:
-            _kill_group(process, signal.SIGTERM)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
-            # Closing the app-server also owns cleanup of its remaining group.
-            _kill_group(process, signal.SIGKILL)
-            if process.poll() is None:
-                process.wait()
-            # An app-server that died mid-handshake leaves a broken pipe; a
-            # close() that re-raises from here would escape collect() and
-            # cost every other provider its reading.
-            with contextlib.suppress(OSError):
-                process.stdin.close()
-            with contextlib.suppress(OSError):
-                process.stdout.close()
+        except (OSError,ValueError,TypeError,AttributeError,EOFError,subprocess.SubprocessError):return None
 
     def _native_helper(self, provider: str) -> Optional[ProviderQuota]:
         if provider == "antigravity":
-            if not os.access(self.agy_bin, os.X_OK) or not os.access(self.uv_bin, os.X_OK):
-                return None
+            from quota_sentinel.platform.paths import resolve_launcher
+            try:resolve_launcher('agy',explicit=self.agy_bin)
+            except ValueError:return None
             timeout = self.antigravity_native_timeout
-            command = [str(self.uv_bin), "run", "--offline", "--no-project", "--no-config",
-                       "python", "-B", str(self.antigravity_usage_helper),
+            command = [str(self.python_bin), "-B", str(self.antigravity_usage_helper),
                        "--agy", str(self.agy_bin), "--timeout", str(timeout)]
             stdin = None
         elif provider == "opencode":
@@ -446,7 +357,7 @@ class QuotaCollector:
             # collector already understands, and it keeps one provider's command
             # from being built out of another provider's helper.
             return None
-        result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin)
+        result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin, environment=self.environment)
         if result.returncode != 0 or not result.stdout:
             reason_match = re.search(
                 rb"(?:antigravity_usage|opencode_usage|clinepass_usage): ([a-z_0-9]+)",
@@ -469,8 +380,9 @@ class QuotaCollector:
         return self._native_codex() if provider == "codex" else self._native_helper(provider)
 
     def _codexbar(self, provider: str) -> Optional[ProviderQuota]:
-        if not os.access(self.codexbar_bin, os.X_OK):
-            return None
+        from quota_sentinel.platform.paths import resolve_launcher
+        try:prefix=resolve_launcher('codexbar',explicit=self.codexbar_bin)
+        except ValueError:return None
         names = {"opencode": "opencodego"}
         # CodexBar's ClinePass provider documents exactly two source modes
         # (auto and api) and reaches the vendor with an API key, like OpenCode's.
@@ -481,9 +393,9 @@ class QuotaCollector:
                    self.clinepass_codexbar_timeout if provider == "clinepass" else
                    self.codexbar_timeout)
         for source in sources:
-            command = [str(self.codexbar_bin), "usage", "--provider", names.get(provider, provider),
+            command = [*prefix, "usage", "--provider", names.get(provider, provider),
                        "--source", source, "--format", "json", "--json-only", "--no-color"]
-            result = _run_bounded(command, timeout, self.codexbar_kill_grace)
+            result = _run_bounded(command, timeout, self.codexbar_kill_grace, environment=self.environment)
             if result.timed_out:
                 self.logger("quota %s: codexbar-live TIMEOUT after %ss (source %s)" % (provider, timeout, source))
             if result.returncode != 0:

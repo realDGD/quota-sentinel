@@ -392,21 +392,20 @@ class AgyExecRunner:
         if provider != AGY_PROVIDER:
             raise ValueError(f"agy transport does not serve {provider!r}")
         workspace = Path(os.path.abspath(workspace))
-        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-        workspace.chmod(0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(workspace)
         agent_dir = workspace / f"{provider}-agy"
-        agent_dir.mkdir(mode=0o700, exist_ok=True)
-        agent_dir.chmod(0o700)
+        private_directory(agent_dir)
         # An empty cwd, exactly like the Pi and codex transports: no AGENTS.md,
         # no repository, and therefore nothing this run can discover that the
         # profile did not put there. The agent lives inside it because a
         # project agent is only found by walking up from the cwd.
         cwd = agent_dir / "cwd"
-        cwd.mkdir(mode=0o700, exist_ok=True)
-        cwd.chmod(0o700)
+        private_directory(cwd)
         agent_path = self._agent_path(agent_dir)
-        agent_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with open(os.open(agent_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as handle:
+        private_directory(agent_path.parent)
+        from quota_sentinel.platform.files import private_open
+        with private_open(agent_path,"wb") as handle:
             handle.write(agent_document().encode())
         paths = PreparedPaths(
             agent_dir=agent_dir,
@@ -445,7 +444,8 @@ class AgyExecRunner:
         numbers, because only the guard also holds a parent-side deadline; see
         ``_guard_deadlines`` for why the wrapper's must be the shorter one.
         """
-        helper = Path(__file__).resolve().parents[2] / "run_with_timeout.py"
+        from quota_sentinel.helpers import resource_path
+        helper = resource_path("run_with_timeout.py")
         deadline = self.config.timeout if timeout is None else timeout
         grace = self.config.kill_grace if kill_grace is None else kill_grace
         return [
@@ -471,38 +471,32 @@ class AgyExecRunner:
         command = self._helper_command(inner)
         started = time.monotonic()
         stderr_offset = _file_size(paths.stderr_path)
-        with open(paths.stdout_path, "wb") as stdout, open(paths.stderr_path, "ab") as stderr:
-            completed = subprocess.run(
-                command,
-                cwd=str(self._cwd(paths)),
-                env=self._environment(),
-                stdout=stdout,
-                stderr=stderr,
-                check=False,
-            )
-        return completed.returncode, time.monotonic() - started, stderr_offset
+        from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS
+        from quota_sentinel.platform.files import private_open
+        completed=run_bounded(command,cwd=self._cwd(paths),environment=self._environment(),
+            timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
+        with private_open(paths.stdout_path,'wb') as stdout,private_open(paths.stderr_path,'ab') as stderr:
+            stdout.write(completed.stdout);stderr.write(completed.stderr)
+        return completed.returncode,time.monotonic()-started,stderr_offset
 
     def agy_version(self) -> Optional[str]:
+        from quota_sentinel.platform.process import run_bounded
+        from quota_sentinel.platform.paths import resolve_launcher
         try:
-            completed = subprocess.run(
-                [str(self.config.agy_bin), "--version"],
-                capture_output=True, timeout=20, check=False,
-                env=self._environment(),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if completed.returncode != 0:
-            return None
-        text = completed.stdout.decode("utf-8", "replace").strip().splitlines()
-        return text[0].strip()[:64] if text and text[0].strip() else None
+            result=run_bounded((*resolve_launcher('agy',explicit=self.config.agy_bin),'--version'),
+                cwd=Path.cwd(),environment=self._environment(),timeout=20,kill_grace=0,max_bytes=4096)
+        except (OSError,ValueError):return None
+        text=result.stdout.decode('utf-8','replace').strip().splitlines()
+        return text[0][:64] if not result.returncode and text else None
 
     def _command(self) -> List[str]:
         # ``--print-timeout`` takes a Go duration string; a bare number is a
         # hard usage error. It is set just inside the outer wrapper so the CLI
         # can end its own turn and still exit 0.
         inner_timeout = max(1, int(self.config.timeout) - 5)
+        from quota_sentinel.platform.paths import resolve_launcher
         return [
-            str(self.config.agy_bin),
+            *resolve_launcher("agy",explicit=self.config.agy_bin),
             "--agent", AGENT_NAME,
             "--model", AGY_MODEL,
             "--effort", AGY_EFFORT,
@@ -565,39 +559,15 @@ class AgyExecRunner:
         wrapper's entire tree rather than killing the wrapper and orphaning the
         grandchild it can no longer reach.
         """
-        inner = [
-            str(self.config.agy_bin), "-p", "/agents",
-            "--output-format", "json",
-        ]
+        from quota_sentinel.platform.paths import resolve_launcher
+        from quota_sentinel.platform.process import run_bounded
         try:
-            process = subprocess.Popen(
-                self._guard_command(inner),
-                cwd=str(self._cwd(paths)),
-                env=self._environment(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                # The wrapper leads its own group, so the last resort below can
-                # signal it (and what it spawned) without any chance of
-                # signalling this process; the CLI it starts still gets its own
-                # session from the helper.
-                start_new_session=True,
-            )
-        except OSError:
-            return None
-        try:
-            stdout, _stderr = process.communicate(timeout=self._guard_timeout())
-        except subprocess.TimeoutExpired:
-            # The wrapper itself wedged: it has already had its own deadline
-            # plus the grace it was told to give its child, so what is left is
-            # the SIGKILL it could not deliver itself.
-            _reap_guard_tree(process)
-            return None
-        except (OSError, subprocess.SubprocessError):
-            # Any other failure to collect it still must not leave the tree
-            # running: a backgrounded CLI is a leak either way.
-            _reap_guard_tree(process)
-            return None
-        raw = stdout.decode("utf-8", "replace")
+            inner=[*resolve_launcher('agy',explicit=self.config.agy_bin),'-p','/agents','--output-format','json']
+            result=run_bounded(self._guard_command(inner),cwd=self._cwd(paths),environment=self._environment(),
+                timeout=self._guard_timeout(),kill_grace=0)
+        except (OSError,ValueError):return None
+        if result.returncode:return None
+        raw=result.stdout.decode('utf-8','replace')
         try:
             document = json.loads(raw.strip() or "null")
         except ValueError:
@@ -665,20 +635,9 @@ class AgyExecRunner:
         path = self._profile_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent))
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "version": version,
-                        "fingerprint": profile_fingerprint(),
-                        "usage": dict(usage),
-                        "checked_at": int(time.time()),
-                    },
-                    handle,
-                    ensure_ascii=False,
-                )
-            os.chmod(name, 0o600)
-            os.replace(name, path)
+            from quota_sentinel.platform.files import publish_private
+            record=dict(version=version,fingerprint=profile_fingerprint(),usage=dict(usage),checked_at=int(time.time()))
+            publish_private(path,(json.dumps(record,ensure_ascii=False)+'\n').encode())
         except OSError:
             # Diagnostics, not correctness: a read-only state directory must
             # not fail an attempt that already succeeded.
@@ -926,46 +885,17 @@ def _tree_process_groups(root_pid: int) -> List[int]:
     the caller signals these with SIGKILL, and this process must not be in the
     set.
     """
-    groups = [root_pid]
-    try:
-        completed = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,ppid=,pgid="],
-            check=False, capture_output=True, text=True, timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        # Without a snapshot the wrapper's own group is still worth killing;
-        # losing the snapshot costs the grandchild, not the caller.
-        return groups
-
-    children: Dict[int, List[int]] = {}
-    pgids: Dict[int, int] = {}
-    for line in completed.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 3:
-            continue
+    from quota_sentinel.platform.posix_process import _children
+    groups={root_pid};pending=[root_pid];seen=set();deadline=time.monotonic()+2
+    while pending and len(seen)<4096 and time.monotonic()<deadline:
+        pid=pending.pop()
+        if pid in seen:continue
+        seen.add(pid);pending.extend(_children(pid))
         try:
-            pid, ppid, pgid = (int(field) for field in fields)
-        except ValueError:
-            continue
-        children.setdefault(ppid, []).append(pid)
-        pgids[pid] = pgid
-
-    seen = {root_pid}
-    stack = [root_pid]
-    while stack:
-        parent = stack.pop()
-        for child in children.get(parent, []):
-            if child in seen:
-                continue
-            seen.add(child)
-            stack.append(child)
-
-    own_group = os.getpgrp()
-    for pid in seen:
-        pgid = pgids.get(pid, 0)
-        if pgid > 0 and pgid != own_group and pgid not in groups:
-            groups.append(pgid)
-    return groups
+            group=os.getpgid(pid)
+            if group>0 and group!=os.getpgrp():groups.add(group)
+        except ProcessLookupError:pass
+    return list(groups)
 
 
 def _reap_guard_tree(process: subprocess.Popen) -> None:

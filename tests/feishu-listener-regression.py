@@ -109,14 +109,17 @@ class TestFeishuListener(unittest.TestCase):
 
         mock_handler.assert_not_called()
 
-    @patch("feishu_listener.subprocess.Popen")
+    @patch("quota_sentinel.platform.process.capture_owned")
+    @patch("quota_sentinel.platform.process.spawn_owned")
     def test_usage_is_recorded_by_orchestrator_without_changing_command(
-        self, mock_popen
+        self, mock_popen, mock_capture
     ):
         process = mock_popen.return_value
         process.communicate.return_value = ("", "")
         process.returncode = 0
         process.poll.return_value = 0
+        from quota_sentinel.platform.process import CommandResult
+        mock_capture.return_value=CommandResult(b'',b'',0,False)
         orchestrator = MagicMock()
         orchestrator.run_external_task.side_effect = (
             lambda _task_name, _trigger, action: action()
@@ -129,13 +132,11 @@ class TestFeishuListener(unittest.TestCase):
         task_name, trigger, _action = orchestrator.run_external_task.call_args.args
         self.assertEqual(task_name, "usage")
         self.assertEqual(trigger, "feishu:msg-history")
-        mock_popen.assert_called_once_with(
-            list(feishu_listener.USAGE_COMMAND),
-            stdout=feishu_listener.subprocess.PIPE,
-            stderr=feishu_listener.subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        self.assertEqual(mock_popen.call_count,1)
+        self.assertEqual(mock_popen.call_args.args[0],list(feishu_listener.USAGE_COMMAND))
+        self.assertEqual(mock_popen.call_args.kwargs['stdout'],feishu_listener.subprocess.PIPE)
+        self.assertEqual(mock_popen.call_args.kwargs['stderr'],feishu_listener.subprocess.PIPE)
+        self.assertIs(mock_capture.call_args.args[0],process)
 
     def test_a_wedged_keychain_read_cannot_hold_daemon_startup(self):
         """`security` is an external process like any other: it is bounded.

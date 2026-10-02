@@ -10,6 +10,7 @@ import time
 from .quota_probe import QuotaReading, _run_bounded
 from quota_sentinel.quota import Tier
 from quota_sentinel.quota.pi_live import normalize_pi_live
+from quota_sentinel.helpers import resource_path
 
 MAX_BYTES = 1048576
 ERROR_CODES = frozenset(('unsupported_pi_sdk','unsupported_pi_plugin','unsupported_provider',
@@ -54,7 +55,7 @@ class PiLiveQuotaClient:
     def __init__(self, config, *, helper_path=None, node_bin=None, run_bounded=_run_bounded,
                  environment=None, clock=time.time):
         self.config = config
-        self.helper = Path(helper_path or Path(__file__).resolve().parents[2] / 'pi_quota_query.mjs').expanduser().resolve()
+        self.helper = Path(helper_path or resource_path('pi_quota_query.mjs')).expanduser().resolve()
         self.node = str(node_bin or config.clients.get('node') or shutil.which('node') or 'node')
         self.run_bounded = run_bounded
         self.environment = os.environ if environment is None else environment
@@ -86,8 +87,8 @@ class PiLiveQuotaClient:
         env['PI_OFFLINE'] = '1'
         try:
             with tempfile.TemporaryDirectory(prefix='quota-pi-live.') as temp:
-                if os.name != 'nt':
-                    os.chmod(temp, 0o700)
+                from quota_sentinel.platform.files import private_directory
+                private_directory(temp)
                 result = self.run_bounded([self.node,str(self.helper)], budget['timeout'],
                     budget['kill_grace'], json.dumps(request).encode(), environment=env, cwd=temp)
             if result.timed_out:

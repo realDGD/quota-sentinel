@@ -181,7 +181,9 @@ NATIVE_HELPER_KILL_GRACE_SECONDS = 1
 # `_run_bounded`'s finally block can still owe one bounded reap after a kill
 # (`process.wait(timeout=1)`), and `_native_codex`'s teardown waits the same
 # second: one allowance per command that can be killed.
-REAP_ALLOWANCE_SECONDS = 1
+from quota_sentinel.platform.process import CLEANUP_ALLOWANCE_SECONDS
+# Five seconds startup plus the remaining stop/reap/pipe-join allowance.
+REAP_ALLOWANCE_SECONDS = CLEANUP_ALLOWANCE_SECONDS - 5
 
 # One allowance per spawned process, on top of every deadline the collector
 # itself sets. For the native helpers this is exactly what the collector's
@@ -264,7 +266,7 @@ def _native_bound_seconds(provider: str, timeouts: Mapping[str, float]) -> float
         # No native helper exists for this provider; the rung resolves without
         # spawning anything.
         return 0.0
-    keychain = _KEYCHAIN_READS.get(provider, 0) * KEYCHAIN_READ_TIMEOUT_SECONDS
+    keychain = _KEYCHAIN_READS.get(provider, 0) * (KEYCHAIN_READ_TIMEOUT_SECONDS+CLEANUP_ALLOWANCE_SECONDS)
     return (
         timeouts[option]
         + NATIVE_HELPER_SLACK_SECONDS

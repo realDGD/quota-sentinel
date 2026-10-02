@@ -23,10 +23,6 @@ quota-sentinel = "quota_sentinel.__main__:main"
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
-# Flat layout lives at the repository root alongside the shell/launchd
-# assets by design (Phase 3A.5: no src/ migration). Only quota_sentinel/
-# is an installed package; the root-level helper scripts (task_orchestrator,
-# feishu_listener, run_with_timeout, *_usage) stay path-executed modules,
-# exactly as before this file existed.
+# Package implementations and helper resources; root scripts preserve source entry names.
 [tool.hatch.build.targets.wheel]
 packages = ["quota_sentinel"]

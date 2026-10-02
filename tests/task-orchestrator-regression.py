@@ -29,6 +29,7 @@ from quota_sentinel.app import AppConfig
 from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.runtime import agy_exec, codex_exec, models, probe_budget
 from quota_sentinel.runtime.models import ModelRunnerConfig
+from quota_sentinel.platform.process import CLEANUP_ALLOWANCE_SECONDS
 from quota_sentinel.state import bootstrap_legacy_authority
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
@@ -556,10 +557,15 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
             raised = worst_case_check_seconds(self.ENV)
         self.assertAlmostEqual(raised - baseline, rounds * turns * 240.0)
 
+    def test_prepare_includes_owned_cleanup(self):
+        pi = ModelRunnerConfig.from_env(self.ENV)
+        self.assertGreaterEqual(worst_case_prepare_seconds(self.ENV),
+            pi_auth_timeout_seconds(self.ENV) + pi.kill_grace + CLEANUP_ALLOWANCE_SECONDS)
+
     def test_bound_follows_a_raised_retry_count(self) -> None:
         limits = AppConfig()
         rounds = limits.watchdog_attempts + limits.initial_attempts
-        turn = agy_exec.AGY_EXEC_TIMEOUT_SECONDS + 10  # timeout + kill grace
+        turn = agy_exec.AGY_EXEC_TIMEOUT_SECONDS + 10 + 2 * CLEANUP_ALLOWANCE_SECONDS
         baseline = worst_case_check_seconds(self.ENV)
         with patch.object(
             agy_exec, "AGY_TRANSIENT_RETRIES", agy_exec.AGY_TRANSIENT_RETRIES + 2
@@ -710,7 +716,7 @@ class CheckTimeoutDerivationTest(unittest.TestCase):
         # The refresh is bounded by the auth budget PLUS the runner's own kill
         # grace, so the prepare term is never just the auth timeout.
         grace = ModelRunnerConfig.from_env(self.ENV).kill_grace
-        self.assertAlmostEqual(prepared, after + grace)
+        self.assertAlmostEqual(prepared, after + grace + CLEANUP_ALLOWANCE_SECONDS)
 
     def test_env_override_still_wins(self) -> None:
         self.assertEqual(

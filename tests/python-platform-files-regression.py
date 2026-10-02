@@ -23,6 +23,18 @@ class Files(unittest.TestCase):
    if os.name!='nt':self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o600)
    self.files.publish_private(p,b'next')
    if os.name!='nt':self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o600)
+ def test_private_directory(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   p=Path(tmp)/"owned"/"history"
+   self.files.private_directory(p)
+   self.assertTrue(p.is_dir())
+   if os.name!="nt":self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o700)
+   self.files.private_directory(p)
+ @unittest.skipIf(os.name=="nt","POSIX symlink fixture")
+ def test_directory_symlink_rejected(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   target=Path(tmp)/"target";target.mkdir();link=Path(tmp)/"link";link.symlink_to(target)
+   with self.assertRaises(OSError):self.files.private_directory(link)
  def test_failed_publish_keeps_prior_state(self):
   with tempfile.TemporaryDirectory() as tmp:
    p=Path(tmp)/'state';p.write_bytes(b'prior')

@@ -108,3 +108,25 @@ def publish_private(path, payload):
     finally:
         try:temporary.unlink()
         except FileNotFoundError:pass
+
+
+def private_directory(path):
+    """Create a user-owned directory before any private child is created."""
+    path = Path(path).absolute()
+    if not path.parent.exists():
+        private_directory(path.parent)
+    if os.name == 'nt':
+        from .windows_files import protect_directory
+        protect_directory(path)
+    else:
+        try: path.mkdir(mode=0o700)
+        except FileExistsError: pass
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(str(path), flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                raise OSError('private directory must be owned by this user')
+            os.fchmod(fd, 0o700)
+        finally: os.close(fd)
+    return path

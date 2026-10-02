@@ -38,12 +38,12 @@ class _DailyFileHandler(logging.Handler):
         if self._stream is not None and day == self._day:
             return self._stream
         self._close()
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.directory, 0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(self.directory)
         path = self.directory / (day + LOG_FILE_SUFFIX)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.fchmod(descriptor, 0o600)
-        self._stream = os.fdopen(descriptor, "a", encoding="utf-8")
+        from quota_sentinel.platform.files import private_open
+        import io
+        self._stream = io.TextIOWrapper(private_open(path,'ab'),encoding='utf-8')
         self._day = day
         return self._stream
 
@@ -102,7 +102,10 @@ def default_log_dir() -> Path:
     env = os.environ.get("QUOTA_SENTINEL_LOG_DIR")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parents[2] / DEFAULT_LOG_DIR_NAME
+    source_root=Path(__file__).resolve().parents[2]
+    if (source_root/'pyproject.toml').is_file():return source_root/DEFAULT_LOG_DIR_NAME
+    from quota_sentinel.platform.paths import default_state_dir
+    return default_state_dir()/DEFAULT_LOG_DIR_NAME
 
 
 __all__ = ["configure", "default_log_dir"]

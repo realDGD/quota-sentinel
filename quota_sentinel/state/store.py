@@ -375,8 +375,8 @@ class FileStateStore(ProviderStateStore):
         before the first publish — matching the shell writers. Write-path
         only: load never calls this."""
         try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.state_dir, 0o700)
+            from quota_sentinel.platform.files import private_directory
+            private_directory(self.state_dir)
         except OSError as exc:
             raise StateStoreError(
                 f"cannot prepare state dir {self.state_dir}: {exc}"

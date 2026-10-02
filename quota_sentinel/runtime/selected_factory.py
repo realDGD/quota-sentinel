@@ -52,7 +52,9 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
  captures=frozenset(p for p in plan.active_providers if "pi-snapshot" in settings.providers[p].quota_chain)
  def runner_factory(ch):
   exe=env['QUOTA_SENTINEL_'+('curl' if ch=='direct' else ch).upper()+'_BIN']
-  if not (shutil.which(exe) or os.access(exe,os.X_OK)):raise ConfigurationError('missing selected client '+ch)
+  from quota_sentinel.platform.paths import resolve_launcher
+  try:resolve_launcher('curl' if ch=='direct' else ch,explicit=exe)
+  except ValueError:raise ConfigurationError('missing or unsupported selected client '+ch) from None
   log=logging.getLogger('quota_sentinel.'+ch).info
   if ch=='pi':
    r=ModelRunner(replace(ModelRunnerConfig.from_env(env),capture_providers=captures),logger=log)
@@ -65,7 +67,7 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
    r=CodexExecRunner(replace(cfg,timeout=b["timeout"],kill_grace=b["kill_grace"],input_ceiling=int(b["input_ceiling"]),output_ceiling=int(b["output_ceiling"])),logger=log)
    def codex_ready(provider,paths):
     from .quota_probe import _run_bounded
-    result=_run_bounded([str(r.config.codex_bin),'login','status'],15,1,environment=r._environment())
+    result=_run_bounded([*resolve_launcher('codex',explicit=r.config.codex_bin),'login','status'],15,1,environment=r._environment())
     if result.returncode:raise ConfigurationError('official Codex login unavailable; run codex login')
    return ReadyRunner(r,codex_ready)
   if ch=='agy':
@@ -99,7 +101,7 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
   def key(service,env_key):
    provider='opencode' if service=='quota-sentinel.opencode-go-api-key' else 'clinepass'
    return selected_key(provider,env_key)
-  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,pi_live_client=live,api_key_getter=key,logger=logging.getLogger('quota_sentinel.quota').info,**options)
+  return QuotaCollector(state_dir,workspace,providers=plan.probe_providers,tier_chains=plan.quota_chains,pi_live_client=live,api_key_getter=key,environment=env,logger=logging.getLogger('quota_sentinel.quota').info,**options)
  def preflight(providers):
   # Construct only explicitly listed candidates; preparation is still deferred
   # until the application has a private workspace, before state attempts begin.

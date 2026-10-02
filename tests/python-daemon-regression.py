@@ -84,7 +84,8 @@ class DaemonTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as tmp:
    path=Path(tmp)/'pid'
    code='import os,signal,time\nfrom pathlib import Path\np=os.fork()\nif p==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n Path('+repr(str(path))+').write_text(str(os.getpid()))\n while True:time.sleep(.1)\nwhile not Path('+repr(str(path))+').exists():time.sleep(.01)\n'
-   process=subprocess.Popen([sys.executable,'-c',code],start_new_session=True)
+   from quota_sentinel.platform.process import spawn_owned
+   process=spawn_owned((sys.executable,'-c',code),cwd=tmp,environment=os.environ)
    process.wait(timeout=5);pid=int(path.read_text())
    try:
     feishu_listener.terminate_process_group(process)
@@ -95,6 +96,7 @@ class DaemonTests(unittest.TestCase):
      time.sleep(.02)
     else:self.fail('child survives completed leader')
    finally:
+    process.close()
     try:os.kill(pid,signal.SIGKILL)
     except ProcessLookupError:pass
 if __name__=='__main__':unittest.main()

@@ -48,6 +48,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -640,34 +641,20 @@ class AgyExecTests(unittest.TestCase):
             30.0,
         )
 
-    def test_the_turn_path_keeps_the_wrapper_as_its_only_bound(self):
-        # _run_cli deliberately passes NO outer deadline: there the wrapper's own
-        # deadline is the only bound, so the wrapper always outlives it and gets
-        # to reap the CLI's process group itself. A second, equal deadline here
-        # is exactly the guard's leak — this pins the shape so the fix cannot
-        # migrate the bug to the turn path.
-        runner = self.runner(timeout=30)
-        paths = runner.prepare("antigravity", self.workspace)
-        seen = {}
-        real_run = agy_exec.subprocess.run
-
-        def spy(command, **kwargs):
-            seen["command"] = command
-            seen["timeout"] = kwargs.get("timeout")
-            return real_run(command, **kwargs)
-
-        agy_exec.subprocess.run = spy
-        try:
-            exit_code, _elapsed, _offset = runner._run_cli(
-                [str(self.agy), "-p", USER_PROMPT], paths
-            )
-        finally:
-            agy_exec.subprocess.run = real_run
-        self.assertEqual(exit_code, 0)
-        self.assertIsNone(seen.get("timeout"), "the turn path gained an outer deadline")
-        command = seen["command"]
-        self.assertEqual(float(command[command.index("--timeout") + 1]), 30)
-        self.assertEqual(float(command[command.index("--kill-grace") + 1]), 1)
+    def test_the_turn_guard_leaves_room_for_wrapper_cleanup(self):
+        # The portable owner also bounds a wedged wrapper, after the wrapper's
+        # own timeout/grace and cleanup allowance have elapsed.
+        from quota_sentinel.platform import process as platform_process
+        runner=self.runner(timeout=30);paths=runner.prepare('antigravity',self.workspace);seen={}
+        real=platform_process.run_bounded
+        def spy(command,**options):
+            seen['command']=command;seen['timeout']=options['timeout'];return real(command,**options)
+        with mock.patch.object(platform_process,'run_bounded',side_effect=spy):
+            code,_elapsed,_offset=runner._run_cli([str(self.agy),'-p',USER_PROMPT],paths)
+        self.assertEqual(code,0)
+        command=seen['command'];inner=float(command[command.index('--timeout')+1]);grace=float(command[command.index('--kill-grace')+1])
+        self.assertEqual(inner,30);self.assertEqual(grace,1)
+        self.assertGreaterEqual(seen['timeout'],inner+grace+platform_process.CLEANUP_ALLOWANCE_SECONDS)
 
     def test_the_parent_last_resort_reaps_a_tree_whose_wrapper_wedged(self):
         # The wrapper is the polite path, but it is also a Python process: if IT

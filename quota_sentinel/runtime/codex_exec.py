@@ -286,15 +286,15 @@ class CodexExecRunner:
         if provider != CODEX_PROVIDER:
             raise ValueError(f"codex transport does not serve {provider!r}")
         workspace = Path(os.path.abspath(workspace))
-        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-        workspace.chmod(0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(workspace)
         agent_dir = workspace / f"{provider}-codex"
-        agent_dir.mkdir(mode=0o700, exist_ok=True)
-        agent_dir.chmod(0o700)
+        private_directory(agent_dir)
         # An empty cwd, exactly like the Pi transport: no AGENTS.md, no repo.
-        (agent_dir / "cwd").mkdir(mode=0o700, exist_ok=True)
+        private_directory(agent_dir / "cwd")
         instructions = self._instructions_path(provider, workspace)
-        with open(os.open(instructions, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as handle:
+        from quota_sentinel.platform.files import private_open
+        with private_open(instructions,"wb") as handle:
             handle.write((SYSTEM_INSTRUCTIONS + "\n").encode())
         paths = PreparedPaths(
             agent_dir=agent_dir,
@@ -319,23 +319,20 @@ class CodexExecRunner:
         return env
 
     def codex_version(self) -> Optional[str]:
+        from quota_sentinel.platform.process import run_bounded
+        from quota_sentinel.platform.paths import resolve_launcher
         try:
-            completed = subprocess.run(
-                [str(self.config.codex_bin), "--version"],
-                capture_output=True, timeout=20, check=False,
-                env=self._environment(),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if completed.returncode != 0:
-            return None
-        text = completed.stdout.decode("utf-8", "replace").strip()
-        return text or None
+            result=run_bounded((*resolve_launcher('codex',explicit=self.config.codex_bin),'--version'),
+                cwd=Path.cwd(),environment=self._environment(),timeout=20,kill_grace=0,max_bytes=4096)
+        except (OSError,ValueError):return None
+        if result.returncode:return None
+        return result.stdout.decode('utf-8','replace').strip() or None
 
     def _command(self, provider: str, workspace: Path) -> list:
         instructions = self._instructions_path(provider, workspace)
+        from quota_sentinel.platform.paths import resolve_launcher
         command = [
-            str(self.config.codex_bin), "exec", "--json", "--ephemeral",
+            *resolve_launcher("codex",explicit=self.config.codex_bin), "exec", "--json", "--ephemeral",
             "--ignore-user-config", "--skip-git-repo-check",
         ]
         for override in PROFILE_OVERRIDES:
@@ -347,22 +344,20 @@ class CodexExecRunner:
         return command
 
     def _run_codex(self, provider: str, workspace: Path, paths: PreparedPaths) -> _Attempt:
-        helper = Path(__file__).resolve().parents[2] / "run_with_timeout.py"
+        from quota_sentinel.helpers import resource_path
+        helper = resource_path("run_with_timeout.py")
         command = [
             sys.executable, str(helper), "--timeout", str(self.config.timeout),
             "--kill-grace", str(self.config.kill_grace), "--",
             *self._command(provider, workspace),
         ]
         started = time.monotonic()
-        with open(paths.stdout_path, "wb") as stdout, open(paths.stderr_path, "ab") as stderr:
-            completed = subprocess.run(
-                command,
-                cwd=str(paths.agent_dir / "cwd"),
-                env=self._environment(),
-                stdout=stdout,
-                stderr=stderr,
-                check=False,
-            )
+        from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS
+        from quota_sentinel.platform.files import private_open
+        completed=run_bounded(command,cwd=paths.agent_dir/'cwd',environment=self._environment(),
+            timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
+        with private_open(paths.stdout_path,'wb') as stdout,private_open(paths.stderr_path,'ab') as stderr:
+            stdout.write(completed.stdout);stderr.write(completed.stderr)
         elapsed = time.monotonic() - started
         raw = paths.stdout_path.read_bytes().decode("utf-8", "replace")
         final, usage, events, turn_completed = parse_events(raw)
@@ -400,20 +395,9 @@ class CodexExecRunner:
         path = self._profile_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent))
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "version": version,
-                        "fingerprint": profile_fingerprint(),
-                        "usage": dict(usage),
-                        "checked_at": int(time.time()),
-                    },
-                    handle,
-                    ensure_ascii=False,
-                )
-            os.chmod(name, 0o600)
-            os.replace(name, path)
+            from quota_sentinel.platform.files import publish_private
+            record=dict(version=version,fingerprint=profile_fingerprint(),usage=dict(usage),checked_at=int(time.time()))
+            publish_private(path,(json.dumps(record,ensure_ascii=False)+'\n').encode())
         except OSError:
             # The record is diagnostics, not correctness: a read-only state
             # directory must not fail an attempt that already succeeded.

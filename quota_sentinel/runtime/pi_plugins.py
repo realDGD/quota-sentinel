@@ -44,34 +44,22 @@ def check_pi_plugin(provider,config):
   declared={(root/x).resolve() for x in manifest['pi']['extensions']}
   if manifest['name']!=r.package or entry.resolve() not in declared:raise ValueError()
  except (OSError,ValueError,KeyError,TypeError,AttributeError):return PluginCheck(False,None,'unsupported plugin manifest')
- from .quota_probe import _run_bounded
+ from quota_sentinel.platform.paths import resolve_launcher
+ from quota_sentinel.platform.process import run_bounded
  with tempfile.TemporaryDirectory(prefix='quota-pi-preflight.') as tmp:
-  agent=Path(tmp);os.chmod(agent,0o700)
+  from quota_sentinel.platform.files import private_directory
+  agent=private_directory(tmp)
   if Path(config.auth_file).is_file():
-   auth=agent/'auth.json';shutil.copyfile(config.auth_file,auth);os.chmod(auth,0o600)
-  # No prompt/print/session mode is used. Pi's list-models exits before input.
-  command=[str(config.pi_bin),'--no-extensions','--extension',str(entry),'--no-skills','--no-context-files','--offline','--list-models',r.pi_provider]
-  # A temporary agent directory prevents ambient automatic extension loading.
-  env=dict(os.environ);env.update(config.environment or {});env['PI_AGENT_DIR']=str(agent);env['NO_COLOR']='1'
+   from quota_sentinel.platform.files import publish_private
+   publish_private(agent/'auth.json',Path(config.auth_file).read_bytes())
+  env=dict(os.environ);env.update(config.environment or {});env.pop('PI_AGENT_DIR',None)
+  env['PI_CODING_AGENT_DIR']=str(agent);env['NO_COLOR']='1';env['PI_OFFLINE']='1'
   try:
-   process=subprocess.Popen(command,cwd=tmp,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-  except OSError:return PluginCheck(False,None,'Pi metadata preflight unavailable')
-  try:
-   try:out,_=process.communicate(timeout=config.plugin_timeout)
-   except subprocess.TimeoutExpired:
-    from .quota_probe import _kill_group
-    import signal
-    _kill_group(process,signal.SIGKILL)
-    try:process.wait(timeout=1)
-    except subprocess.TimeoutExpired:pass
-    return PluginCheck(False,None,'Pi metadata preflight timed out')
-   if process.returncode or len(out)>1048576:return PluginCheck(False,None,'Pi metadata preflight failed')
-   text=re.sub(r'\x1b\[[0-9;]*m','',out.decode('utf-8','replace'))
-   valid=any(len(fields)>=2 and fields[0]==r.pi_provider and fields[1]==_MODELS[provider] for fields in (line.split() for line in text.splitlines()))
-   return PluginCheck(valid,entry if valid else None,'ready' if valid else 'provider/model unavailable; '+ '; '.join(plugin_guidance(provider)))
-  finally:
-   from .quota_probe import _kill_group
-   import signal
-   _kill_group(process,signal.SIGKILL)
-   for stream in (process.stdout,process.stderr):
-    if stream:stream.close()
+   command=[*resolve_launcher('pi',explicit=config.pi_bin),'--no-extensions','--extension',str(entry),'--no-skills','--no-context-files','--offline','--list-models',r.pi_provider]
+   result=run_bounded(command,cwd=tmp,environment=env,timeout=config.plugin_timeout,kill_grace=0)
+  except (OSError,ValueError):return PluginCheck(False,None,'Pi metadata preflight unavailable')
+  if result.timed_out:return PluginCheck(False,None,'Pi metadata preflight timed out')
+  if result.returncode:return PluginCheck(False,None,'Pi metadata preflight failed')
+  text=re.sub(r'\x1b\[[0-9;]*m','',result.stdout.decode('utf-8','replace'))
+  valid=any(len(fields)>=2 and fields[0]==r.pi_provider and fields[1]==_MODELS[provider] for fields in (line.split() for line in text.splitlines()))
+  return PluginCheck(valid,entry if valid else None,'ready' if valid else 'provider/model unavailable; '+'; '.join(plugin_guidance(provider)))

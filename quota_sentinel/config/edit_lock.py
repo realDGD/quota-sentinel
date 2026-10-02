@@ -7,7 +7,9 @@ _guard=threading.Lock()
 _locks={}
 @contextmanager
 def configuration_lock(path,*,timeout=15):
- path=Path(path); path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+ path=Path(path)
+ from quota_sentinel.platform.files import private_directory
+ private_directory(path.parent)
  with _guard: lock=_locks.setdefault(str(path.absolute()),threading.Lock())
  if not lock.acquire(timeout=timeout): raise ConfigurationError('configuration editor is busy')
  try:

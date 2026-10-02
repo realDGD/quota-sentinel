@@ -84,7 +84,7 @@ class ReplyNotifier:
 
 def run_selected_host(config, plan, state_dir, config_path):
     """Lazy imports keep opening-only services independent of the bot SDK."""
-    from task_orchestrator import TaskOrchestrator, ScheduleState, TaskStore
+    from quota_sentinel.helpers.task_orchestrator import TaskOrchestrator, ScheduleState, TaskStore
     from quota_sentinel.runtime.budgets import check_budget
     import sys
     state_dir, config_path = Path(state_dir).resolve(), Path(config_path).resolve()
@@ -99,7 +99,7 @@ def run_selected_host(config, plan, state_dir, config_path):
         )
 
     def listener_factory(scheduler):
-        from feishu_listener import FeishuListener
+        from quota_sentinel.helpers.feishu_listener import FeishuListener
         return FeishuListener(config, state_dir, config_path, scheduler)
 
     return serve(config, plan, scheduler_factory=scheduler_factory,

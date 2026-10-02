@@ -227,10 +227,9 @@ def _kill_group(process: subprocess.Popen, sig: int) -> None:
 
 
 def _open_private(path: Path, *, append: bool = False):
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-    descriptor = os.open(path, flags, 0o600)
-    os.fchmod(descriptor, 0o600)
-    return os.fdopen(descriptor, "ab" if append else "wb")
+    from quota_sentinel.platform.files import private_open
+    return private_open(path, 'ab' if append else 'wb')
+
 
 
 class DirectRunner:
@@ -358,75 +357,19 @@ class DirectRunner:
     def _run_bounded(
         self, command: list, stdin_text: str, timeout: float
     ) -> Tuple[str, int, bool, str]:
+        from quota_sentinel.platform.paths import resolve_launcher
+        from quota_sentinel.platform.process import run_bounded
+        env=dict(os.environ)
+        if self.environment is not None:env.update(self.environment)
+        for name in ('OPENCODE_API_KEY','CLINE_API_KEY','FEISHU_APP_SECRET'):env.pop(name,None)
         try:
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True, text=True,
-                cwd="/private/tmp",
-            )
-        except OSError:
-            return "", 127, False, "curl could not start"
-        output = ""
-        errors = ""
-        try:
-            try:
-                process.stdin.write(stdin_text)
-                process.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-            deadline = time.monotonic() + timeout
-
-            def expire() -> Tuple[str, int, bool, str]:
-                _kill_group(process, signal.SIGTERM)
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-                # The curl process can exit on TERM while a descendant ignores it.
-                _kill_group(process, signal.SIGKILL)
-                if process.poll() is None:
-                    process.wait(timeout=2)
-                return output[:_MAX_RESPONSE_BYTES], 124, True, ""
-
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ, "out")
-                selector.register(process.stderr, selectors.EVENT_READ, "err")
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return expire()
-                    for key, _ in selector.select(min(remaining, 1.0)):
-                        chunk = key.fileobj.read(65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                            continue
-                        if key.data == "out":
-                            output += chunk
-                            if len(output) > _MAX_RESPONSE_BYTES:
-                                _kill_group(process, signal.SIGKILL)
-                                process.wait(timeout=2)
-                                return (output[:_MAX_RESPONSE_BYTES], 1, False,
-                                        "response too large")
-                        else:
-                            errors += chunk[:_MAX_RESPONSE_BYTES]
-            try:
-                rc = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                return expire()
-            # curl's own `--show-error` text is the only explanation for a
-            # transport-level failure, so it travels with the result instead of
-            # blocking on an undrained pipe.
-            return output[:_MAX_RESPONSE_BYTES], rc, False, errors.strip()[:300]
-        finally:
-            if process.poll() is None:
-                _kill_group(process, signal.SIGKILL)
-                process.wait(timeout=2)
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+            prefix=resolve_launcher('curl',explicit=command[0])
+            with tempfile.TemporaryDirectory(prefix='quota-direct.') as cwd:
+                result=run_bounded((*prefix,*command[1:]),cwd=cwd,environment=env,
+                    input_data=stdin_text.encode(),timeout=timeout,kill_grace=2,max_bytes=_MAX_RESPONSE_BYTES)
+        except (OSError,ValueError):return '',127,False,'curl could not start'
+        if result.returncode==125:return result.stdout.decode('utf-8','replace'),1,False,'response too large'
+        return result.stdout.decode('utf-8','replace'),result.returncode,result.timed_out,result.stderr.decode('utf-8','replace').strip()[:300]
 
     def _curl(self, url: str, key: str, body: Optional[dict], spec: DirectProvider) -> _CommandResult:
         with tempfile.TemporaryDirectory(prefix="quota-sentinel-direct.") as work:

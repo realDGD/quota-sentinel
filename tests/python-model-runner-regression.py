@@ -172,7 +172,8 @@ class ModelRunnerTests(unittest.TestCase):
         self.assertEqual(config.auth_file, self.auth)
         self.assertEqual(config.timeout, 12.5)
         self.assertEqual(config.kill_grace, 0.25)
-        self.assertEqual(config.repo_dir, REPO)
+        from quota_sentinel.helpers import resource_path
+        self.assertEqual(config.repo_dir, resource_path("run_with_timeout.py").parent)
 
     def test_prepare_copies_private_auth_and_provider_settings(self) -> None:
         for provider, settings in (("codex", '{"transport":"sse"}\n'),
@@ -246,7 +247,8 @@ class ModelRunnerTests(unittest.TestCase):
                     *common, *(arg for extension in extensions for arg in ("--extension", extension)),
                     "--", "不用思考，只回复我 1",
                 ])
-                self.assertEqual(call["cwd"], "/private/tmp")
+                self.assertIn("quota-pi-turn.", Path(call["cwd"]).name)
+                self.assertFalse(Path(call["cwd"]).exists())
                 self.assertEqual(call["env"]["PI_CODING_AGENT_DIR"], str(self.workspace / (provider + "-agent")))
                 self.assertEqual(call["env"][quota_key], str(result.quota_path))
                 self.assertEqual(call["env"]["PI_OFFLINE"], "1")

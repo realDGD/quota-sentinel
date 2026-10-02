@@ -197,7 +197,7 @@ os.execv(sys.executable, [sys.executable] + args[args.index('python') + 1:])
         """
         seen = {}
 
-        def fake_run(command, timeout, grace=1.0, stdin=None):
+        def fake_run(command, timeout, grace=1.0, stdin=None, **options):
             seen["timeout"] = timeout
             return type("Result", (), {
                 "returncode": 1, "stdout": b"", "stderr": b"", "timed_out": False,

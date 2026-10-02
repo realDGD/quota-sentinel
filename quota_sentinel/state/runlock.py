@@ -111,40 +111,6 @@ class RunLock:
         self.release()
 
 
-def _shlock_available() -> bool:
-    return os.access(SHLOCK_BIN, os.X_OK)
-
-
-def _try_acquire(state_dir: Path) -> bool:
-    """One non-blocking shlock attempt with this process's PID."""
-    directory = Path(state_dir)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-    except OSError as exc:
-        raise RunLockError(
-            f"cannot prepare state dir {directory} for run.lock: {exc}"
-        ) from exc
-    path = directory / RUN_LOCK_FILENAME
-    try:
-        completed = subprocess.run(
-            [SHLOCK_BIN, "-p", str(os.getpid()), "-f", str(path)],
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RunLockError(f"could not run {SHLOCK_BIN}: {exc}") from exc
-    if completed.returncode == 0:
-        try:
-            os.chmod(path, 0o600)
-        except OSError as exc:
-            raise RunLockError(
-                f"acquired run.lock {path} but could not set its mode: {exc}"
-            ) from exc
-        return True
-    return False
-
-
 def acquire_run_lock(
     state_dir: Path,
     *,

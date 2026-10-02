@@ -46,7 +46,8 @@ from quota_sentinel.runtime.quota_probe import QuotaCollector
 from quota_sentinel.scheduler import service
 from quota_sentinel.state.runlock import SHLOCK_BIN
 
-REPO_DIR = Path(__file__).resolve().parents[2]
+from quota_sentinel.helpers import resource_path
+REPO_DIR = resource_path("opencode_usage.py").parent
 OPENCODE_API_KEY_SERVICE = "quota-sentinel.opencode-go-api-key"
 CLINEPASS_API_KEY_SERVICE = "quota-sentinel.clinepass-api-key"
 DRY_RUN_ENV = "FEISHU_DRY_RUN"
