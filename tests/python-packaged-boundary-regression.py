@@ -7,11 +7,13 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from private_file_fixtures import assert_private_path,private_test_directory
 
 class Boundary(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=private_test_directory(self.tmp)
  def test_helpers_without_repo_files(self):
   self.assertIsNotNone(importlib.util.find_spec('quota_sentinel.helpers'),'installed helper resources missing')
   from quota_sentinel.helpers import resource_path
@@ -33,7 +35,14 @@ class Boundary(unittest.TestCase):
   pkg=self.root/'plugin';pkg.mkdir();(pkg/'package.json').write_text(json.dumps({'name':'pi-clinepass-provider','pi':{'extensions':['entry.ts']}}));(pkg/'entry.ts').write_text('fixture')
   auth=self.root/'auth.json';auth.write_text('{}')
   config=ModelRunnerConfig(cli,auth,self.root,self.root/'unused',plugin_entries={'clinepass':pkg/'entry.ts'})
-  check=check_pi_plugin('clinepass',config);self.assertTrue(check.available,check.reason)
+  from quota_sentinel.platform.process import run_bounded
+  temporary=tempfile.TemporaryDirectory();Path(temporary.name).chmod(0o755)
+  def checked_run(*args,**kwargs):
+   assert_private_path(self,kwargs['cwd'],directory=True)
+   return run_bounded(*args,**kwargs)
+  with patch('quota_sentinel.runtime.pi_plugins.tempfile.TemporaryDirectory',return_value=temporary),patch('quota_sentinel.platform.process.run_bounded',side_effect=checked_run):
+   check=check_pi_plugin('clinepass',config)
+  self.assertTrue(check.available,check.reason)
   data=json.loads(record.read_text());self.assertTrue(data['agent']);self.assertNotEqual(data['agent'],str(auth.parent));self.assertFalse(Path(data['agent']).exists())
  def test_cleanup_bounds_recomputed(self):
   from quota_sentinel.config import new_user_defaults
@@ -42,13 +51,41 @@ class Boundary(unittest.TestCase):
   config=new_user_defaults()
   self.assertGreaterEqual(_prepare(config,'opencode','direct'),config.budgets['credentials']['timeout']+CLEANUP_ALLOWANCE_SECONDS)
 
+ def test_model_runner_refuses_crlf_response(self):
+  from quota_sentinel.runtime.models import ModelRunner,ModelRunnerConfig
+  cli=self.root/'crlf-client.py';cli.write_text("import sys\nsys.stdout.buffer.write(b'1\\r\\n')\n")
+  auth=self.root/'auth.json';auth.write_text('{"openai-codex":{"type":"oauth","access":"synthetic-only"}}')
+  runner=ModelRunner(ModelRunnerConfig(cli,auth,self.root,self.root/'unused',timeout=2,kill_grace=0,auth_timeout=1,capture_providers=frozenset()))
+  result=runner.run('codex',self.root/'workspace','initial',1,1)
+  self.assertFalse(result.success)
+  self.assertEqual(result.stdout_path.read_bytes(),b'1\r\n')
+
+ def test_model_runner_creates_private_empty_working_directory(self):
+  from quota_sentinel.runtime.models import ModelRunner,ModelRunnerConfig
+  from quota_sentinel.platform.process import run_bounded
+  cli=self.root/'private-cwd-client.py';cli.write_text("import sys\nsys.stdout.buffer.write(b'1\\n')\n")
+  auth=self.root/'auth.json';auth.write_text('{"openai-codex":{"type":"oauth","access":"synthetic-only"}}')
+  runner=ModelRunner(ModelRunnerConfig(cli,auth,self.root,self.root/'unused',timeout=2,kill_grace=0,auth_timeout=1,capture_providers=frozenset()))
+  runner.prepare('codex',self.root/'workspace')
+  borrowed=self.root/'borrowed-cwd';borrowed.mkdir();borrowed.chmod(0o755)
+  class Temporary:
+   def __enter__(self):return str(borrowed)
+   def __exit__(self,*args):pass
+  def checked_run(*args,**kwargs):
+   assert_private_path(self,kwargs['cwd'],directory=True)
+   self.assertEqual(list(Path(kwargs['cwd']).iterdir()),[])
+   return run_bounded(*args,**kwargs)
+  with patch('quota_sentinel.runtime.models.tempfile.TemporaryDirectory',return_value=Temporary()),patch('quota_sentinel.platform.process.run_bounded',side_effect=checked_run):
+   result=runner.run('codex',self.root/'workspace','initial',1,1)
+  self.assertTrue(result.success,result.error_summary)
+
  def test_each_runner_accepts_portable_python_client(self):
   from quota_sentinel.runtime.models import ModelRunner,ModelRunnerConfig
   from quota_sentinel.runtime.codex_exec import CodexExecRunner,CodexExecConfig
   from quota_sentinel.runtime.agy_exec import AgyExecRunner,AgyExecConfig
   from quota_sentinel.runtime.direct import DirectRunner
   cli=self.root/'selected client.py'
-  cli.write_text('import json,sys\na=sys.argv[1:]\nif "--version" in a:print("1.2.12")\nelif "print-bearer-token" in a:print("synthetic-bearer")\nelif "--config" in a:\n sys.stdin.read();print(json.dumps({"choices":[{"message":{"content":"1"}}],"usage":{"total_tokens":2}}));print("QSHTTPSTATUS:200")\nelif "exec" in a:\n print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"1"}}));print(json.dumps({"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":1}}))\nelif "--output-format" in a:print(json.dumps({"status":"SUCCESS","response":"1","usage":{"input_tokens":564,"output_tokens":1,"total_tokens":565,"thinking_tokens":0}}))\nelse:print("1")\n')
+  cli.write_text('import json,sys\na=sys.argv[1:]\nif "--version" in a:print("1.2.12")\nelif "print-bearer-token" in a:print("synthetic-bearer")\nelif "--config" in a:\n sys.stdin.read();print(json.dumps({"choices":[{"message":{"content":"1"}}],"usage":{"total_tokens":2}}));print("QSHTTPSTATUS:200")\nelif "exec" in a:\n print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"1"}}));print(json.dumps({"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":1}}))\nelif "--output-format" in a:print(json.dumps({"status":"SUCCESS","response":"1","usage":{"input_tokens":564,"output_tokens":1,"total_tokens":565,"thinking_tokens":0}}))\nelse:sys.stdout.buffer.write(b"1\\n")\n')
   auth=self.root/'auth.json';auth.write_text('{"openai-codex":{"type":"oauth","access":"synthetic-only"}}')
   configurations=(
    ('codex',ModelRunner(ModelRunnerConfig(cli,auth,self.root,self.root/'unused',timeout=2,kill_grace=0,auth_timeout=1,capture_providers=frozenset()))),

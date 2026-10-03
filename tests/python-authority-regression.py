@@ -1114,6 +1114,22 @@ class LifecycleLockTests(AuthorityBase):
     def test_l1_missing_manifest_read_names_the_operator_remedy(self):
         """AB1: a read against an uninitialized deployment is loud, and it
         names the ONLY thing that may create the fact."""
+        from quota_sentinel.config import new_user_defaults, save_config
+
+        # Status checks selected clients before reading state. Supply a private
+        # client so this authority test never depends on host installations.
+        client = Path(self._tmp.name) / "codex.py"
+        client.write_text(
+            "from pathlib import Path\n"
+            "Path(__file__).with_suffix('.called').write_text('unexpected call')\n"
+            "raise SystemExit(99)\n"
+        )
+        config = Path(self._tmp.name) / "config.json"
+        save_config(
+            config,
+            replace(new_user_defaults(), clients={"codex": str(client)}),
+            expected_revision=None,
+        )
         self.write_legacy("codex", legacy_state(0))
         self.deinitialize()
         before = self.snapshot()
@@ -1123,7 +1139,7 @@ class LifecycleLockTests(AuthorityBase):
             ("state-dump", ("codex",)),
         ):
             with self.subTest(verb=verb):
-                rc, out, err = self.run_cli(verb, *argv)
+                rc, out, err = self.run_cli("--config", str(config), verb, *argv)
                 self.assertEqual(rc, 4, err)
                 self.assertIn("UNKNOWN", err)
                 self.assertIn(
@@ -1132,6 +1148,7 @@ class LifecycleLockTests(AuthorityBase):
         # A failed read creates nothing: absence is not repaired implicitly.
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(authority_path(self.state_dir).exists())
+        self.assertFalse(client.with_suffix(".called").exists())
 
 
 class LifecyclePrerequisiteTests(AuthorityBase):

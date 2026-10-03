@@ -316,8 +316,8 @@ def write_authority(state_dir: Path, authority: BackendAuthority) -> None:
     """
     directory = Path(state_dir)
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(directory)
     except OSError as exc:
         raise AuthorityError(
             f"cannot prepare state dir {directory}: {exc}"

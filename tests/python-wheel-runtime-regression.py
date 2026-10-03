@@ -25,6 +25,12 @@ class Wheel(unittest.TestCase):
   wheel=next((cls.root/'dist').glob('*.whl'))
   venv.EnvBuilder(with_pip=False).create(cls.root/'venv')
   cls.python=cls.root/'venv'/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
+  # Locked sync caches artifacts without necessarily caching index version
+  # lists. Reuse that lock offline to provision only core dependencies in the
+  # fresh venv, then install the wheel with normal dependency verification.
+  core_environment=dict(cls.environment,UV_PROJECT_ENVIRONMENT=str(cls.root/'venv'))
+  core=subprocess.run([uv,'--no-config','sync','--offline','--frozen','--no-dev','--no-default-groups','--no-install-project'],cwd=ROOT,env=core_environment,capture_output=True,timeout=30)
+  if core.returncode:raise AssertionError(core.stderr.decode())
   installed=subprocess.run([uv,'--no-config','pip','install','--offline','--python',str(cls.python),str(wheel)],env=cls.environment,capture_output=True,timeout=45)
   if installed.returncode:raise AssertionError(installed.stderr.decode())
   cls.foreign=cls.root/'foreign';cls.foreign.mkdir()
@@ -39,6 +45,6 @@ class Wheel(unittest.TestCase):
  def test_manual_daemon_without_optional_imports(self):
   self.run_python('from dataclasses import replace\nfrom quota_sentinel.config import new_user_defaults, FeatureSettings\nfrom quota_sentinel.daemon import serve\nfrom pathlib import Path\nimport sys\nc=replace(new_user_defaults(),features=FeatureSettings(False,True,False,False))\ndef unused(*args):raise AssertionError("unselected component started")\nfrom quota_sentinel.runtime.selection import build_runtime_plan\nassert serve(c,build_runtime_plan(c,"serve"),scheduler_factory=unused,listener_factory=unused)==0\nassert "lark_oapi" not in sys.modules')
  def test_core_imports_without_dependencies(self):
-  self.run_python('from quota_sentinel.platform.credentials import CredentialStore\nfrom quota_sentinel.runtime.selected_factory import create_selected_application\nfrom quota_sentinel.helpers.task_orchestrator import TaskOrchestrator\nimport sys\nassert "secretstorage" not in sys.modules and "dbus" not in sys.modules and "lark_oapi" not in sys.modules')
+  self.run_python('from quota_sentinel.platform.credentials import CredentialStore\nfrom quota_sentinel.runtime.selected_factory import create_selected_application\nfrom quota_sentinel.helpers.task_orchestrator import TaskOrchestrator\nimport sys, importlib.util\nassert "secretstorage" not in sys.modules and "dbus" not in sys.modules and "lark_oapi" not in sys.modules\nassert all(importlib.util.find_spec(n) is None for n in ("secretstorage","dbus","lark_oapi"))')
 
 if __name__=='__main__':unittest.main()

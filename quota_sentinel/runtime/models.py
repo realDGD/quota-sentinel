@@ -378,7 +378,9 @@ class ModelRunner:
         started = time.monotonic()
         from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS
         with tempfile.TemporaryDirectory(prefix='quota-pi-turn.') as cwd:
-            completed=run_bounded(command,cwd=cwd,environment=self._environment(provider,paths),
+            from quota_sentinel.platform.files import private_directory
+            working_directory=private_directory(Path(cwd)/'work')
+            completed=run_bounded(command,cwd=working_directory,environment=self._environment(provider,paths),
                 timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
         with _open_private(paths.stdout_path) as stdout, _open_private(paths.stderr_path,append=True) as stderr:
             stdout.write(completed.stdout);stderr.write(completed.stderr)

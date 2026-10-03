@@ -23,7 +23,7 @@ by this module. Consequences, by design:
 from __future__ import annotations
 
 import os
-import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -47,22 +47,17 @@ def seed_document_if_absent(json_path: Path, payload: bytes) -> bool:
     Returns True when this call seeded the document, False when a
     document already existed (ours was dropped). link(2) makes the
     existence test and the creation one atomic act — no check-then-write
-    window against a concurrent writer. Temp naming uses mkstemp
-    (kernel-unique), so concurrent seeds can never collide on the temp
-    name itself; 0600 is fixed at creation.
+    window against a concurrent writer. A UUID name plus an exclusive native
+    open prevents a seed from replacing another caller's temporary file;
+    private access and an explicit owner are fixed before writing bytes.
     """
-    directory = json_path.parent
-    try:
-        fd, temp_name = tempfile.mkstemp(
-            dir=str(directory), prefix=f"{json_path.name}.tmp.", suffix=".seed"
-        )
-    except OSError as exc:
-        raise StateStoreError(
-            f"failed to create seed temp near {json_path}: {exc}"
-        ) from exc
+    from quota_sentinel.platform.files import private_open
+    temp_name = json_path.with_name(json_path.name + '.tmp.' + uuid.uuid4().hex + '.seed')
     seeded: bool
+    created=False
     try:
-        with os.fdopen(fd, "wb") as handle:
+        with private_open(temp_name, "xb") as handle:
+            created=True
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -75,11 +70,14 @@ def seed_document_if_absent(json_path: Path, payload: bytes) -> bool:
             raise StateStoreError(
                 f"failed to seed state document {json_path}: {exc}"
             ) from exc
+    except OSError as exc:
+        raise StateStoreError(f"failed to create seed temp near {json_path}: {exc}") from exc
     finally:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
+        if created:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
     return seeded
 
 
@@ -102,8 +100,8 @@ def migrate_provider(state_dir: Path, provider: str) -> str:
     payload = serialize_state(legacy_state, provider)  # full preflight
 
     try:
-        Path(state_dir).mkdir(parents=True, exist_ok=True)
-        os.chmod(state_dir, 0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(state_dir)
     except OSError as exc:
         raise StateStoreError(
             f"cannot prepare state dir {state_dir}: {exc}"

@@ -30,6 +30,7 @@ from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.runtime import agy_exec, codex_exec, models, probe_budget
 from quota_sentinel.runtime.models import ModelRunnerConfig
 from quota_sentinel.platform.process import CLEANUP_ALLOWANCE_SECONDS
+from quota_sentinel.platform.locks import initialize_protocol
 from quota_sentinel.state import bootstrap_legacy_authority
 from quota_sentinel.state.migration import DEFAULT_PROVIDERS
 
@@ -105,6 +106,7 @@ class TaskOrchestratorTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state_dir = self.root / "state"
         self.state_dir.mkdir()
+        initialize_protocol(self.state_dir)
         # A real deployment always has an authority manifest. The throwaway
         # one this suite builds is an initialized LEGACY deployment —
         # exactly what the installer leaves on an upgraded host — so the

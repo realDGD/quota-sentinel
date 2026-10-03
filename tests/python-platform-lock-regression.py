@@ -10,6 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from private_file_fixtures import private_test_directory
 ROOT=Path(__file__).resolve().parents[1]
 CHILD='''import json,os,sys,time
 from pathlib import Path
@@ -29,7 +30,7 @@ class Locks(unittest.TestCase):
  def setUp(self):
   self.assertIsNotNone(importlib.util.find_spec('quota_sentinel.platform.locks'),'portable lock protocol missing')
   from quota_sentinel.platform import locks
-  self.locks=locks;self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.directory=Path(self.tmp.name)
+  self.locks=locks;self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.directory=private_test_directory(self.tmp)
   self.protocol=locks.expected_protocol()
  def child(self,mode):
   p=subprocess.Popen([sys.executable,'-c',CHILD,str(self.directory/'run.lock'),self.protocol,mode],cwd=str(ROOT),env=dict(os.environ,PYTHONPATH=str(ROOT)),stdout=subprocess.PIPE,stderr=subprocess.PIPE)

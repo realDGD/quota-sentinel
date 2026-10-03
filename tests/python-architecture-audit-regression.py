@@ -22,8 +22,10 @@ Run: PYTHONPATH=. uv run --frozen --no-sync python tests/python-architecture-aud
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -56,7 +58,7 @@ def scheduler_state_sources() -> list:
     # modules remain in this sweep so they cannot acquire state-writing policy.
     return [
         path for path in python_sources()
-        if "/quota/" not in str(path) and "/runtime/" not in str(path)
+        if path.relative_to(REPO / "quota_sentinel").parts[0] not in ("quota", "runtime")
         and path != REPO / "quota_sentinel/platform/files.py"
     ]
 
@@ -90,7 +92,7 @@ class AuthorityRouting(unittest.TestCase):
         )
         offenders = []
         for path in scheduler_state_sources():
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             if rel in self.STORE_CONSTRUCTION_ALLOWED:
                 continue
             if construction.search(path.read_text(encoding="utf-8")):
@@ -115,7 +117,7 @@ class AuthorityRouting(unittest.TestCase):
         pattern = re.compile(r"""authority\.backend\s*==\s*["']""")
         for path in python_sources():
             text = path.read_text(encoding="utf-8")
-            with self.subTest(module=str(path.relative_to(REPO))):
+            with self.subTest(module=path.relative_to(REPO).as_posix()):
                 self.assertIsNone(pattern.search(text))
 
 
@@ -134,7 +136,7 @@ class AuthoritativeWriter(unittest.TestCase):
     def test_ar4_no_direct_state_writes_outside_the_persistence_package(self):
         offenders = []
         for path in scheduler_state_sources():
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             if rel.startswith(self.PERSISTENCE_PACKAGE):
                 continue
             if self.WRITE_PATTERN.search(path.read_text(encoding="utf-8")):
@@ -155,6 +157,17 @@ class AuthoritativeWriter(unittest.TestCase):
         self.assertNotIn("FileStateStore", service)
         self.assertNotIn("JsonStateStore", service)
 
+    def test_source_scope_preserves_windows_and_posix_boundaries(self):
+        from pathlib import PurePosixPath, PureWindowsPath
+        from unittest.mock import patch
+        for root in (PurePosixPath('/fixture/repo'), PureWindowsPath('C:/fixture/repo')):
+            with self.subTest(root=str(root)):
+                sources = [root / 'quota_sentinel' / name for name in (
+                    'scheduler/service.py', 'state/store.py', 'runtime/models.py',
+                    'quota/models.py', 'platform/files.py', 'platform/locks.py')]
+                with patch(__name__ + '.REPO', root), patch(__name__ + '.python_sources', return_value=sources):
+                    self.assertEqual(scheduler_state_sources(), [sources[0], sources[1], sources[5]])
+
 
 class BridgeRuntime(unittest.TestCase):
     """AR5: the hot-path bridge stays a class-C helper."""
@@ -169,12 +182,18 @@ class BridgeRuntime(unittest.TestCase):
             " ('lark_oapi','requests','httpx','anyio','pydantic','yaml')];"
             "print('third=' + ','.join(sorted(third)))"
         )
-        env = {"PYTHONPATH": str(REPO), "PATH": "/usr/bin:/bin"}
-        result = subprocess.run(
-            ["/usr/bin/python3", "-S", "-c", program],
-            capture_output=True, text=True, timeout=60,
-            cwd="/private/tmp", env=env,
-        )
+        env = {"PYTHONPATH": str(REPO), "PATH": os.defpath}
+        for key in ("SYSTEMROOT", "WINDIR"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        system_python = Path("/usr/bin/python3")
+        interpreter = str(system_python) if os.name != 'nt' and system_python.is_file() else sys.executable
+        with tempfile.TemporaryDirectory(prefix='qs-architecture-foreign-') as foreign:
+            result = subprocess.run(
+                [interpreter, "-S", "-c", program],
+                capture_output=True, text=True, timeout=60,
+                cwd=foreign, env=env,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "third=")
 
@@ -317,7 +336,7 @@ class GitignoreCoverage(unittest.TestCase):
         """An over-broad ignore rule is invisible until someone clones."""
         tracked = set(tracked_files())
         for path in sorted((REPO / "quota_sentinel").rglob("*.py")):
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             with self.subTest(file=rel):
                 self.assertIn(rel, tracked, f"{rel} exists but is untracked")
 
@@ -476,7 +495,7 @@ class AuthorityNeverDefaultsToLegacy(unittest.TestCase):
         offenders = []
         pattern = re.compile(r"(?<![A-Za-z0-9_])bootstrap_authority\s*\(")
         for path in python_sources():
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             if rel in allowed or "/quota/" in rel:
                 continue
             if pattern.search(path.read_text(encoding="utf-8")):
@@ -760,7 +779,7 @@ class ExplicitBootstrapOnly(unittest.TestCase):
         )
         offenders = []
         for path in python_sources():
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             if rel in allowed or "/quota/" in rel:
                 continue
             if pattern.search(path.read_text(encoding="utf-8")):

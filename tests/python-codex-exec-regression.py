@@ -47,6 +47,7 @@ from quota_sentinel.runtime.codex_exec import (
     profile_fingerprint,
 )
 from quota_sentinel.runtime.models import AttemptResult
+from quota_sentinel.platform.locks import initialize_protocol
 
 FAKE_CODEX = '''#!{python}
 import json, os, sys, time
@@ -168,6 +169,7 @@ class CodexExecTests(unittest.TestCase):
         self.workspace = self.root / "work"
         self.state_dir = self.root / "state"
         self.state_dir.mkdir()
+        initialize_protocol(self.state_dir)
         self.record = self.root / "calls.jsonl"
         self.codex = self.root / "codex"
         self.codex.write_text(FAKE_CODEX.format(python=sys.executable))
@@ -483,6 +485,8 @@ class TransportPriorityTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="quota-sentinel-priority-")
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir(mode=0o700)
+        initialize_protocol(self.state)
         bootstrap_legacy_authority(self.state)
         self.env = {
             "FEISHU_DRY_RUN": "1",

@@ -13,7 +13,7 @@ This branch supplies core adapters for macOS, Linux and Windows. A passed fixtur
 | Password store | Synthetic Keychain write/read/update/delete pass | UNVERIFIED Secret Service/KWallet | UNVERIFIED Credential Manager/session |
 | Background lifecycle | Temporary LaunchAgent install/start/stop/remove and child cleanup pass | UNVERIFIED systemd user lifecycle | UNVERIFIED Task Scheduler lifecycle |
 
-The current Mac evidence includes the frozen `321f96c` service implementation: 47/47 regression scripts on the local Mac, Python 3.14.7; stdlib imports also use the system Python gate. The new matrix and final branch audit have their own later verification records. CI files are checked in but have not been pushed or run remotely. Hosted Windows Server results never count as Windows 11 results.
+The local Mac evidence includes 49/49 regression scripts on `6a61383`, Python 3.14.7; stdlib imports also use the system Python gate. GitHub Actions has been enabled and run on Ubuntu 22.04/24.04, macOS 14 and Windows Server 2022 with Python 3.9/3.13. Initial runs found fixture portability and Windows runtime issues, so those runs are not passing support evidence. Synthetic Linux Secret Service gates passed. The latest complete workflow result must be checked before release. Hosted Windows Server results never count as Windows 11 results.
 
 ## Installation and choosing components
 

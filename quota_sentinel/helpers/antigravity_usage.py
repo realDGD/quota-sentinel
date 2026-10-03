@@ -106,8 +106,9 @@ def binary_identity(path):
 def fetch_quota(agy, timeout):
     binary = Path(agy).resolve(strict=True)
     identity, deadline = binary_identity(binary), time.monotonic() + timeout
-    with tempfile.TemporaryDirectory(prefix="pi-antigravity-usage.") as cwd:
-        os.chmod(cwd, 0o700)
+    with tempfile.TemporaryDirectory(prefix="pi-antigravity-usage.") as temporary:
+        from quota_sentinel.platform.files import private_directory
+        cwd=private_directory(Path(temporary)/'work')
         version = run_bounded([str(binary), "--version"], cwd, min(3, timeout), 4096)
         if not version_supported(version):
             raise QuotaError("unsupported_agy_version")

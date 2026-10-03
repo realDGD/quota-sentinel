@@ -173,8 +173,8 @@ def prepare_provider_cutover(state_dir: Path, provider: str) -> CutoverPreparati
     # 4. Replace the stale/absent/corrupt shadow: write-side directory
     #    ownership, then ONE atomic whole-document publish.
     try:
-        Path(state_dir).mkdir(parents=True, exist_ok=True)
-        os.chmod(state_dir, 0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(state_dir)
     except OSError as exc:
         raise StateStoreError(
             f"{provider}: cutover preparation cannot prepare state dir: {exc}"
@@ -269,8 +269,8 @@ def _checkpoint(checkpoint: Checkpoint, name: str) -> None:
 
 def _ensure_state_dir(state_dir: Path, provider: str) -> None:
     try:
-        Path(state_dir).mkdir(parents=True, exist_ok=True)
-        os.chmod(state_dir, 0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(state_dir)
     except OSError as exc:
         raise StateStoreError(
             f"{provider}: cutover cannot prepare state dir: {exc}"

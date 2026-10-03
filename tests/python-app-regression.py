@@ -15,6 +15,7 @@ from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.quota.models import ProviderQuota, QuotaWindow
 from quota_sentinel.runtime import factory as factory_module
 from quota_sentinel.runtime.locks import LockError, acquire_quota_lock
+from quota_sentinel.platform.locks import initialize_protocol
 from quota_sentinel.state import FileStateStore, ProviderState, bootstrap_legacy_authority
 from quota_sentinel.state.runlock import RunLockBusyError
 
@@ -96,6 +97,8 @@ class ApplicationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state_dir = Path(self.temp.name) / "state"
+        self.state_dir.mkdir(mode=0o700)
+        initialize_protocol(self.state_dir)
         bootstrap_legacy_authority(self.state_dir)
         self.runner = FakeRunner(self.state_dir)
         self.collector = FakeCollector(no_readings())
@@ -503,6 +506,8 @@ class BurstEngineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state_dir = Path(self.temp.name) / "state"
+        self.state_dir.mkdir(mode=0o700)
+        initialize_protocol(self.state_dir)
         bootstrap_legacy_authority(self.state_dir)
 
     def build(self, outcomes, *, initial=3, watchdog=2, readings=None):

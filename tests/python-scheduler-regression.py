@@ -28,6 +28,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from quota_sentinel.platform.files import private_directory
+from quota_sentinel.platform.locks import initialize_protocol
+
 from quota_sentinel.scheduler import policy, service
 from quota_sentinel.scheduler.models import (
     NO_OBSERVATION,
@@ -642,9 +645,10 @@ class TransitionPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name) / "state"
-        self.state_dir.mkdir(parents=True)
+        private_directory(self.state_dir)
         # Every deployment has an authority manifest; the runtime requires
         # it, so a throwaway legacy deployment gets one too.
+        initialize_protocol(self.state_dir)
         bootstrap_legacy_authority(self.state_dir)
 
     def tearDown(self) -> None:
@@ -676,7 +680,8 @@ class TransitionPersistenceTests(unittest.TestCase):
 
         # Start over on the JSON backend with the same input state.
         other = Path(self._tmp.name) / "json-state"
-        other.mkdir()
+        private_directory(other)
+        initialize_protocol(other)
         bootstrap_legacy_authority(other)
         self.state_dir = other
         cutover_to_json(other)

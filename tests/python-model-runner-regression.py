@@ -247,7 +247,7 @@ class ModelRunnerTests(unittest.TestCase):
                     *common, *(arg for extension in extensions for arg in ("--extension", extension)),
                     "--", "不用思考，只回复我 1",
                 ])
-                self.assertIn("quota-pi-turn.", Path(call["cwd"]).name)
+                self.assertIn("quota-pi-turn.", Path(call["cwd"]).parent.name)
                 self.assertFalse(Path(call["cwd"]).exists())
                 self.assertEqual(call["env"]["PI_CODING_AGENT_DIR"], str(self.workspace / (provider + "-agent")))
                 self.assertEqual(call["env"][quota_key], str(result.quota_path))

@@ -80,8 +80,9 @@ class JsonStateStore(ProviderStateStore):
 
     # ---- reads (pure) ---------------------------------------------------
     def _read_payload(self, provider: str) -> Optional[bytes]:
+        from quota_sentinel.platform.files import private_open
         try:
-            with open(self.document_path(provider), "rb") as handle:
+            with private_open(self.document_path(provider), "rb") as handle:
                 return handle.read()
         except FileNotFoundError:
             return None
@@ -148,9 +149,9 @@ class JsonStateStore(ProviderStateStore):
             self.on_document_committed(provider)
 
     def _ensure_state_dir(self) -> None:
+        from quota_sentinel.platform.files import private_directory
         try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.state_dir, 0o700)
+            private_directory(self.state_dir)
         except OSError as exc:
             raise StateStoreError(
                 f"cannot prepare state dir {self.state_dir}: {exc}"

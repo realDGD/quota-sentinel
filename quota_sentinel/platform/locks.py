@@ -8,7 +8,7 @@ import platform
 import stat
 import threading
 import time
-from .files import private_open,publish_private
+from .files import private_open,publish_private,private_directory
 from .process import run_bounded
 
 PROTOCOL_FILENAME='lock-protocol.json'
@@ -40,7 +40,7 @@ def state_protocol(directory,*,system=None,allow_empty_init=False):
     except FileNotFoundError:
         if expected=='macos-shlock-v1':return expected
         if allow_empty_init and (not directory.exists() or not any(directory.iterdir())):
-            directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+            private_directory(directory)
             return initialize_protocol(directory,system=system)
         raise LockProtocolError('lock protocol is missing; provision a new native state directory instead of guessing an old protocol')
     except OSError as exc:raise LockProtocolError('lock protocol cannot be read') from exc

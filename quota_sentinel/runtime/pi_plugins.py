@@ -48,7 +48,7 @@ def check_pi_plugin(provider,config):
  from quota_sentinel.platform.process import run_bounded
  with tempfile.TemporaryDirectory(prefix='quota-pi-preflight.') as tmp:
   from quota_sentinel.platform.files import private_directory
-  agent=private_directory(tmp)
+  agent=private_directory(Path(tmp)/'agent')
   if Path(config.auth_file).is_file():
    from quota_sentinel.platform.files import publish_private
    publish_private(agent/'auth.json',Path(config.auth_file).read_bytes())
@@ -56,7 +56,7 @@ def check_pi_plugin(provider,config):
   env['PI_CODING_AGENT_DIR']=str(agent);env['NO_COLOR']='1';env['PI_OFFLINE']='1'
   try:
    command=[*resolve_launcher('pi',explicit=config.pi_bin),'--no-extensions','--extension',str(entry),'--no-skills','--no-context-files','--offline','--list-models',r.pi_provider]
-   result=run_bounded(command,cwd=tmp,environment=env,timeout=config.plugin_timeout,kill_grace=0)
+   result=run_bounded(command,cwd=agent,environment=env,timeout=config.plugin_timeout,kill_grace=0)
   except (OSError,ValueError):return PluginCheck(False,None,'Pi metadata preflight unavailable')
   if result.timed_out:return PluginCheck(False,None,'Pi metadata preflight timed out')
   if result.returncode:return PluginCheck(False,None,'Pi metadata preflight failed')

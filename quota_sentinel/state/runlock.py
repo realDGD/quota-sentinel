@@ -129,8 +129,8 @@ def acquire_run_lock(
     directory=Path(state_dir)
     try:
         protocol=state_protocol(directory,allow_empty_init=True)
-        directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-        os.chmod(directory,0o700)
+        from quota_sentinel.platform.files import private_directory
+        private_directory(directory)
         held=acquire_lock(directory/RUN_LOCK_FILENAME,timeout=timeout,protocol=protocol,poll=poll,on_wait=on_wait)
     except LockBusy as exc:raise RunLockBusyError('run.lock: '+str(exc)) from exc
     except LockUnavailable as exc:raise RunLockUnsupportedError(str(exc)) from exc

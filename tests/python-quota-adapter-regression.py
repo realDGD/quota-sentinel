@@ -43,6 +43,33 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from private_file_fixtures import assert_private_path, private_test_directory
+
+def process_alive(pid):
+    if os.name == 'nt':
+        import ctypes as c
+        from ctypes import wintypes as w
+        kernel=c.WinDLL('kernel32',use_last_error=True)
+        kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];kernel.OpenProcess.restype=w.HANDLE
+        kernel.GetExitCodeProcess.argtypes=[w.HANDLE,c.POINTER(w.DWORD)];kernel.GetExitCodeProcess.restype=w.BOOL
+        kernel.CloseHandle.argtypes=[w.HANDLE]
+        handle=kernel.OpenProcess(0x1000,False,pid)
+        if not handle:return False
+        code=w.DWORD()
+        try:return bool(kernel.GetExitCodeProcess(handle,c.byref(code))) and code.value==259
+        finally:kernel.CloseHandle(handle)
+    try:
+        os.kill(pid,0)
+        info=Path('/proc')/str(pid)/'stat'
+        return not (info.exists() and info.read_text().rsplit(')',1)[1].split()[0]=='Z')
+    except ProcessLookupError:return False
+
+def assert_process_dead(case,pid):
+    deadline=time.monotonic()+2
+    while process_alive(pid) and time.monotonic()<deadline:time.sleep(.02)
+    case.assertFalse(process_alive(pid),f'owned process {pid} survived')
+
+
 import antigravity_usage as antigravity_quota
 import clinepass_usage as clinepass_quota
 import opencode_usage as opencode_quota
@@ -1080,7 +1107,7 @@ class RenormalizeTests(unittest.TestCase):
 class DocumentIOTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.directory = Path(self._tmp.name)
+        self.directory = private_test_directory(self._tmp)
         self.path = self.directory / "codex-quota.json"
         self.quota = normalize_pi_opencode(PI_OPENCODE_FIXTURE)
 
@@ -1113,8 +1140,7 @@ class DocumentIOTests(unittest.TestCase):
 
     def test_written_file_is_not_group_or_world_readable(self):
         write_document(self.path, self.quota)
-        mode = self.path.stat().st_mode & 0o777
-        self.assertEqual(mode & 0o077, 0)
+        assert_private_path(self, self.path)
 
     def test_read_rejects_missing_and_corrupt_files(self):
         with self.assertRaises(QuotaNormalizationError):
@@ -1495,13 +1521,13 @@ def agy_report():
 class AntigravityNativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.directory = Path(self.tmp.name)
+        self.directory = private_test_directory(self.tmp)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def binary(self, body, name="agy"):
-        path = self.directory / name
+        path = self.directory / (name + ".py")
         path.write_text(f"#!{sys.executable}\n" + body)
         path.chmod(0o700)
         return path
@@ -1513,7 +1539,10 @@ class AntigravityNativeHelperTests(unittest.TestCase):
             "else:\n"
             " assert sys.argv[1:]==['-p','/usage','--output-format','json']\n"
             " assert not os.listdir('.')\n"
-            " assert os.stat('.').st_mode & 0o777 == 0o700\n"
+            " import pathlib,unittest\n"
+            f" sys.path[:0]={[str(REPO_ROOT),str(REPO_ROOT/'tests')]!r}\n"
+            " from private_file_fixtures import assert_private_path\n"
+            " assert_private_path(unittest.TestCase(),pathlib.Path.cwd(),directory=True)\n"
             f" print({json.dumps(agy_report())!r})\n"
         )
 
@@ -1664,8 +1693,7 @@ class AntigravityNativeHelperTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 6)
             time.sleep(0.1)
             self.assertTrue(pid_file.exists(), "the child never recorded its pid")
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pid_file.read_text()), 0)
+            assert_process_dead(self,int(pid_file.read_text()))
             self.assertIsNone(external.poll())
         finally:
             external.terminate(); external.wait()
@@ -1711,9 +1739,9 @@ class AntigravityNativeHelperTests(unittest.TestCase):
             out, err = helper.communicate(timeout=3)
             self.assertEqual(helper.returncode, 1)
             self.assertEqual(out, "")
-            self.assertIn("command_cancelled", err)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(marker.read_text()), 0)
+            if os.name=='nt':self.assertEqual(err, "")  # TerminateProcess closes the owning Job.
+            else:self.assertIn("command_cancelled", err)
+            assert_process_dead(self,int(marker.read_text()))
         finally:
             if helper.poll() is None:
                 helper.terminate(); helper.wait(timeout=3)
@@ -1763,13 +1791,13 @@ CP_MONTHLY_EPOCH = 1792746582
 class OpencodeNativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.directory = Path(self.tmp.name)
+        self.directory = private_test_directory(self.tmp)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def script(self, body, name):
-        path = self.directory / name
+        path = self.directory / (name + ".py")
         path.write_text(f"#!{sys.executable}\n" + body)
         path.chmod(0o700)
         return path
@@ -1903,8 +1931,7 @@ class OpencodeNativeHelperTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 6)
             time.sleep(0.1)
             self.assertTrue(pid_file.exists(), "the child never recorded its pid")
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pid_file.read_text()), 0)
+            assert_process_dead(self,int(pid_file.read_text()))
             self.assertIsNone(external.poll())
         finally:
             external.terminate(); external.wait()
@@ -2012,9 +2039,9 @@ class OpencodeNativeHelperTests(unittest.TestCase):
             out, err = helper.communicate(timeout=3)
             self.assertEqual(helper.returncode, 1)
             self.assertEqual(out, "")
-            self.assertIn("command_cancelled", err)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(marker.read_text()), 0)
+            if os.name=='nt':self.assertEqual(err, "")  # TerminateProcess closes the owning Job.
+            else:self.assertIn("command_cancelled", err)
+            assert_process_dead(self,int(marker.read_text()))
         finally:
             if helper.poll() is None:
                 helper.terminate(); helper.wait(timeout=3)
@@ -2036,13 +2063,13 @@ class ClinePassNativeHelperTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.directory = Path(self.tmp.name)
+        self.directory = private_test_directory(self.tmp)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def script(self, body, name):
-        path = self.directory / name
+        path = self.directory / (name + ".py")
         path.write_text(f"#!{sys.executable}\n" + body)
         path.chmod(0o700)
         return path

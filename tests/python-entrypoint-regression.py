@@ -37,6 +37,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from quota_sentinel.state import bootstrap_legacy_authority
+from quota_sentinel.platform.locks import initialize_protocol
 
 PROVIDERS = ("codex", "antigravity", "opencode", "clinepass")
 TEMPLATES = (
@@ -66,8 +67,11 @@ class EntrypointCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="qs-entry-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.foreign_cwd = self.root / "foreign-cwd"
+        self.foreign_cwd.mkdir()
         self.state = self.root / "state"
         self.state.mkdir()
+        initialize_protocol(self.state)
         bootstrap_legacy_authority(self.state)
 
         self.auth = self.root / "auth.json"
@@ -139,7 +143,7 @@ class EntrypointCase(unittest.TestCase):
             "FEISHU_APP_ID": "cli-app-id",
             "FEISHU_APP_SECRET": "cli-app-secret",
             "FEISHU_USER_ID": "cli-user-id",
-            "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", "/private/tmp/qs-uv-cache"),
+            "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(self.root / "uv-cache")),
         })
 
 
@@ -285,7 +289,7 @@ class EntrypointCase(unittest.TestCase):
 
     # ---- E10: launchd's working directory ---------------------------------
     def test_e10_starts_from_a_foreign_working_directory_offline(self):
-        result = self.cli("status", cwd="/private/tmp")
+        result = self.cli("status", cwd=self.foreign_cwd)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "ready")
 
@@ -315,7 +319,7 @@ class EntrypointCase(unittest.TestCase):
         )
         result = subprocess.run(
             ["/usr/bin/python3", "-S", "-c", program],
-            capture_output=True, text=True, timeout=60, cwd="/private/tmp",
+            capture_output=True, text=True, timeout=60, cwd=self.foreign_cwd,
             env=dict(os.environ, PYTHONPATH=f"{REPO}:{stub}"),
         )
         self.assertEqual(result.returncode, 0, result.stderr)

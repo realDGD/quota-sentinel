@@ -13,7 +13,7 @@ touched here:
 * UV5  the project environment really provides lark_oapi (no reliance on
        any globally installed copy);
 * UV6  LaunchAgent-equivalent invocation from a FOREIGN cwd
-       (/private/tmp, exactly launchd's WorkingDirectory):
+       (a temporary directory outside the project):
          uv run --project <repo> --frozen --no-sync python <script>
        works and needs NO network (run under UV_OFFLINE=1) and cannot
        mutate the environment;
@@ -77,6 +77,11 @@ def uv_run(*args: str, cwd: str, offline: bool = True, timeout: int = 120):
 
 
 class UvProjectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="qs-uv-foreign-")
+        self.addCleanup(self.temp.cleanup)
+        self.foreign_cwd = self.temp.name
+
     @classmethod
     def setUpClass(cls) -> None:
         if not UV:
@@ -150,14 +155,14 @@ class UvProjectTests(unittest.TestCase):
     def test_uv6_launchagent_style_startup_foreign_cwd_offline(self) -> None:
         # Production-import proof: import the real listener module (the
         # same import graph the daemon loads: lark_oapi + in-process
-        # task_orchestrator) from launchd's WorkingDirectory, using the
+        # task_orchestrator) from outside the project, using the
         # exact plist flag set (--project --frozen --no-sync) with
         # UV_OFFLINE=1 — no network, no environment mutation at runtime.
         r = uv_run("python", "-c",
                    f"import sys; sys.path.insert(0, {str(REPO)!r}); "
                    "import feishu_listener, lark_oapi, task_orchestrator; "
                    "print('startup-env-ok')",
-                   cwd="/private/tmp")
+                   cwd=self.foreign_cwd)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("startup-env-ok", r.stdout)
 
@@ -168,7 +173,7 @@ class UvProjectTests(unittest.TestCase):
             [UV, "run", "--offline", "--no-project", "--no-config",
              "python", "-B", "-c",
              "import sys; print('py', sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=120, cwd="/private/tmp",
+            capture_output=True, text=True, timeout=120, cwd=self.foreign_cwd,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         # and the helper itself still compiles standalone
@@ -176,7 +181,7 @@ class UvProjectTests(unittest.TestCase):
             [UV, "run", "--offline", "--no-project", "--no-config",
              "python", "-B", "-m", "py_compile",
              str(REPO / "antigravity_usage.py")],
-            capture_output=True, text=True, timeout=120, cwd="/private/tmp",
+            capture_output=True, text=True, timeout=120, cwd=self.foreign_cwd,
         )
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -338,7 +343,7 @@ class UvProjectTests(unittest.TestCase):
         env["PYTHONPATH"] = str(REPO)
         r = subprocess.run(
             [system_python, "-S", "-c", program],
-            capture_output=True, text=True, timeout=60, cwd="/private/tmp", env=env,
+            capture_output=True, text=True, timeout=60, cwd=self.foreign_cwd, env=env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("third=", r.stdout)

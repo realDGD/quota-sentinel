@@ -50,6 +50,11 @@ os._exit(0)
   kernel.GetProcessHandleCount.argtypes=[w.HANDLE,ctypes.POINTER(w.DWORD)]
   def count():
    n=w.DWORD();self.assertTrue(kernel.GetProcessHandleCount(kernel.GetCurrentProcess(),ctypes.byref(n)));return n.value
+  # Import native APIs and initialize the interpreter's Windows I/O before
+  # measuring handles retained by repeated process lifecycle operations.
+  warm=spawn_owned([sys.executable,'-c','pass'],cwd=Path.cwd(),environment=os.environ,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+  try:warm.wait(3)
+  finally:warm.close()
   before=count()
   for i in range(12):
    p=spawn_owned([sys.executable,'-c','import time;time.sleep(.03)'],cwd=Path.cwd(),environment=os.environ,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)

@@ -86,14 +86,19 @@ class RunWithTimeoutTest(unittest.TestCase):
     def test_m5_no_orphan_grandchildren(self):
         pid_file = self.dir / "child.pid"
         script = self.write_script(
-            "parent.sh",
-            f"""\
-            #!/bin/zsh
-            {PY} -c 'import os,time,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)' {pid_file} &
-            sleep 30
+            "parent.py",
+            """\
+            import subprocess, sys, time
+            subprocess.Popen([
+                sys.executable, '-c',
+                'import os,time,pathlib,sys; '
+                'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)',
+                sys.argv[1],
+            ])
+            time.sleep(30)
             """,
         )
-        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", script)
+        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", PY, script, str(pid_file))
         self.assertEqual(res.returncode, 124)
         child_pid = int(pid_file.read_text().strip())
         time.sleep(0.2)
@@ -149,14 +154,14 @@ class RunWithTimeoutTest(unittest.TestCase):
 
     def test_stdout_is_child_owned_even_on_timeout(self):
         script = self.write_script(
-            "chatty.sh",
+            "chatty.py",
             """\
-            #!/bin/zsh
-            print -r -- "SUPERSECRETFLAG-marker"
-            sleep 30
+            import time
+            print("SUPERSECRETFLAG-marker", flush=True)
+            time.sleep(30)
             """,
         )
-        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", script)
+        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", PY, script)
         self.assertEqual(res.returncode, 124)
         # Child stdout reached the caller untouched; the diagnostic (which must
         # not echo the command) went to stderr only.

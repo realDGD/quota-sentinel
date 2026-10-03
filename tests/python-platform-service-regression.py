@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from quota_sentinel.config import new_user_defaults, to_document, FeatureSettings, CredentialReference
 from quota_sentinel.state.new_installation import initialize_new_installation
-from quota_sentinel.platform.files import publish_private
+from quota_sentinel.platform.files import publish_private,private_directory
 from quota_sentinel.platform.process import CommandResult, CLEANUP_ALLOWANCE_SECONDS, spawn_owned
 
 class Services(unittest.TestCase):
@@ -23,10 +23,10 @@ class Services(unittest.TestCase):
   import json
   for system in ('Darwin','Linux','Windows'):
    with self.subTest(system=system):
-    m=self.manager(system);d=self.definition();path=m.manifest_path(d) if system=='Windows' else m.path(d);path.parent.mkdir(parents=True,exist_ok=True)
+    m=self.manager(system);d=self.definition();path=m.manifest_path(d) if system=='Windows' else m.path(d);private_directory(path.parent)
     value=str(10**1000)
     raw=('<plist version="1.0"><dict><key>ExitTimeOut</key><integer>'+value+'</integer></dict></plist>') if system=='Darwin' else json.dumps({'stop_timeout':int(value)}) if system=='Windows' else 'TimeoutStopSec='+value
-    path.write_text(raw);stopping=m.installed_definition(d.name,self.state)
+    publish_private(path,raw.encode());stopping=m.installed_definition(d.name,self.state)
     self.assertEqual(stopping.name,d.name);self.assertEqual(stopping.stop_timeout,300)
  def test_listener_without_queries_can_be_installed(self):
   c=replace(self.c,features=FeatureSettings(False,False,False,True))
@@ -59,7 +59,7 @@ class Services(unittest.TestCase):
   from quota_sentinel.install import service_definition
   self.Manager=ServiceManager;self.Definition=ServiceDefinition;self.Error=ServiceError;self.build=service_definition
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
-  self.root=Path(self.tmp.name)/'space 中文 & % $';self.root.mkdir()
+  self.root=private_directory(Path(self.tmp.name)/'space 中文 & % $')
   self.c=new_user_defaults();self.state=self.root/'state';initialize_new_installation(self.state,self.c)
   self.calls=[]
  def run_fake(self,argv,**kw):
@@ -106,7 +106,7 @@ class Services(unittest.TestCase):
   host.write_text('''import json,os,sys,time
 from pathlib import Path
 from quota_sentinel.config import read_config
-from quota_sentinel.platform.files import publish_private
+from quota_sentinel.platform.files import publish_private,private_directory
 from quota_sentinel.runtime.selection import build_runtime_plan
 config=read_config(Path(sys.argv[1])).settings
 plan=build_runtime_plan(config,'serve')

@@ -36,7 +36,7 @@ class Processes(unittest.TestCase):
   from quota_sentinel.platform import process
   self.process=process;self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.cwd=Path(self.tmp.name)
  def run_cli(self,*args,timeout=1,max_bytes=1048576,input_data=None):
-  return self.process.run_bounded([sys.executable,str(FIXTURE),*args],cwd=self.cwd,environment=os.environ,input_data=input_data,timeout=timeout,kill_grace=.15,max_bytes=max_bytes)
+  return self.process.run_bounded([sys.executable,'-X','utf8',str(FIXTURE),*args],cwd=self.cwd,environment=os.environ,input_data=input_data,timeout=timeout,kill_grace=.15,max_bytes=max_bytes)
  def assert_dead(self,pid):
   deadline=time.monotonic()+2
   while alive(pid) and time.monotonic()<deadline:time.sleep(.02)
@@ -59,7 +59,7 @@ class Processes(unittest.TestCase):
   self.assertTrue(r.timed_out);self.assertLess(time.monotonic()-started,2)
  def test_argv_roundtrip(self):
   values=['目录 spaces','a;b','$HOME','a"b','trailing\\','']
-  r=self.run_cli('argv',*values);self.assertEqual(r.returncode,0)
+  r=self.run_cli('argv',*values);self.assertEqual(r.returncode,0,r.stderr.decode('utf-8',errors='replace'))
   self.assertEqual(json.loads(r.stdout),values)
  def test_unrelated_process_survives(self):
   other=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])

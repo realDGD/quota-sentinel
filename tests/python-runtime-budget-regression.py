@@ -2,6 +2,7 @@ import sys,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from quota_sentinel.config import *
+from quota_sentinel.platform.files import private_directory
 from quota_sentinel.config.migration import capture_legacy_config
 from quota_sentinel.runtime.selection import build_runtime_plan
 from quota_sentinel.runtime.budgets import check_budget,usage_budget
@@ -17,7 +18,7 @@ class BudgetTests(unittest.TestCase):
   from quota_sentinel.runtime.models import ModelRunnerConfig
   from tempfile import TemporaryDirectory
   with TemporaryDirectory() as tmp:
-   path=Path(tmp)/'config.json';save_config(path,self.change(new_user_defaults(),'pi','timeout',1),expected_revision=None)
+   path=private_directory(Path(tmp)/'owned')/'config.json';save_config(path,self.change(new_user_defaults(),'pi','timeout',1),expected_revision=None)
    for raw in ('','invalid','NaN','inf','-1','0','2'):
     with self.subTest(raw=raw):
      env={'QUOTA_SENTINEL_MODEL_TIMEOUT':raw};c=resolve_config(path,path.parent,env).settings
@@ -50,8 +51,8 @@ class BudgetTests(unittest.TestCase):
   self.assertGreater(check_budget(large,build_runtime_plan(large,'check')),check_budget(c,build_runtime_plan(c,'check')))
  def test_saved_runner_parameters_are_used(self):
   from quota_sentinel.runtime.factory import create_application
-  d=to_document(new_user_defaults());d['clients']={'codex':'/usr/bin/true','codex_home':'/tmp/custom-codex'};d['budgets']['codex']['input_ceiling']=77;d['budgets']['codex']['timeout']=17;c=parse_config(d)
-  app=create_application(Path('/tmp/budget-fixture'),software_config=c,runtime_plan=build_runtime_plan(c,'run'),environment={});r=app.model_runner._runner('codex');self.assertEqual(r.config.timeout,17);self.assertEqual(r.config.input_ceiling,77);self.assertEqual(r.config.codex_home,Path('/tmp/custom-codex'))
+  d=to_document(new_user_defaults());d['clients']={'codex':sys.executable,'codex_home':str(Path('custom-codex').absolute())};d['budgets']['codex']['input_ceiling']=77;d['budgets']['codex']['timeout']=17;c=parse_config(d)
+  app=create_application(Path('budget-fixture').absolute(),software_config=c,runtime_plan=build_runtime_plan(c,'run'),environment={});r=app.model_runner._runner('codex');self.assertEqual(r.config.timeout,17);self.assertEqual(r.config.input_ceiling,77);self.assertEqual(r.config.codex_home,Path('custom-codex').absolute())
  def test_explicit_outer_override(self):
   import task_orchestrator as t
   c=new_user_defaults();self.assertEqual(t.check_command_timeout({'QUOTA_SENTINEL_CHECK_TIMEOUT':'123'},software_config=c,runtime_plan=build_runtime_plan(c,'check')),123)

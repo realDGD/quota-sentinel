@@ -102,7 +102,7 @@ def protect_file_handle(handle, descriptor, expected_sid, *, writable):
         if existing:kernel.LocalFree(existing)
 
 
-def protect_directory(path):
+def protect_directory(path, *, exclusive=False):
     """Create or restrict a directory, with a DACL inherited by SQLite sidecars."""
     import ctypes as c
     from ctypes import wintypes as w
@@ -124,8 +124,9 @@ def protect_directory(path):
     try:
         if not convert(sddl,1,c.byref(descriptor),None):raise c.WinError(c.get_last_error())
         attrs=Attributes(c.sizeof(Attributes),descriptor,False)
-        if not kernel.CreateDirectoryW(str(path),c.byref(attrs)) and c.get_last_error()!=183:
-            raise c.WinError(c.get_last_error())
+        if not kernel.CreateDirectoryW(str(path),c.byref(attrs)):
+            error=c.get_last_error()
+            if error!=183 or exclusive:raise c.WinError(error)
         # Open the directory itself rather than following a junction.
         handle=kernel.CreateFileW(str(path),0x00060000,7,None,3,0x02200000,None)
         if handle==c.c_void_p(-1).value:handle=None;raise c.WinError(c.get_last_error())

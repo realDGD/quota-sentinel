@@ -34,6 +34,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from private_file_fixtures import assert_private_path, private_test_directory, deny_child_directory_creation, loosen_directory_access
+from quota_sentinel.platform.files import private_directory
+from quota_sentinel.platform.locks import initialize_protocol
+
 from quota_sentinel.state import (
     FileStateStore,
     ProviderState,
@@ -46,14 +50,14 @@ from quota_sentinel.state import (
 
 def write_slot(state_dir: Path, provider: str, suffix: str, value: str) -> Path:
     path = state_dir / f"{provider}-{suffix}"
-    path.write_text(value + "\n", encoding="utf-8")
+    path.write_bytes((value + "\n").encode("utf-8"))
     return path
 
 
 class LoadTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -128,7 +132,7 @@ class LoadTests(unittest.TestCase):
 class CommitTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -154,7 +158,7 @@ class CommitTests(unittest.TestCase):
         self.assertFalse((self.state_dir / "codex-retry-pending").exists())
         self.assertEqual(old, old_on_disk)
         for path in self.state_dir.iterdir():
-            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+            assert_private_path(self, path)
             self.assertNotIn(".tmp.", path.name)
 
     def test_only_changed_slots_are_written(self) -> None:
@@ -322,8 +326,9 @@ class CommitTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         # The CLI requires an initialized authority manifest.
+        initialize_protocol(self.state_dir)
         bootstrap_legacy_authority(self.state_dir)
 
     def tearDown(self) -> None:
@@ -370,7 +375,7 @@ class PlanBeforePersistenceTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -584,7 +589,7 @@ class CorruptSlotIsolationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -625,18 +630,16 @@ class StateDirOwnershipTests(unittest.TestCase):
         old = store.load("codex")
         store.commit("codex", old, ProviderState(next_due_at=555))
         self.assertTrue(target.is_dir())
-        self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
-        self.assertEqual(
-            oct(os.stat(target / "codex-next-due-at").st_mode & 0o777), "0o600"
-        )
+        assert_private_path(self, target, directory=True)
+        assert_private_path(self, target / "codex-next-due-at")
 
     def test_commit_normalizes_loose_existing_dir(self) -> None:
         target = self.root / "loose"
-        target.mkdir()
-        os.chmod(target, 0o755)
+        private_directory(target)
+        loosen_directory_access(target)
         store = FileStateStore(target)
         store.commit("codex", store.load("codex"), ProviderState(next_due_at=555))
-        self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
+        assert_private_path(self, target, directory=True)
 
     def test_noop_commit_creates_nothing(self) -> None:
         target = self.root / "absent"
@@ -652,16 +655,13 @@ class StateDirOwnershipTests(unittest.TestCase):
         # PermissionError, which must surface as StateStoreError with
         # context, never as a bare OSError.
         parent = self.root / "locked-parent"
-        parent.mkdir()
-        os.chmod(parent, 0o500)
-        try:
+        private_directory(parent)
+        with deny_child_directory_creation(parent):
             store = FileStateStore(parent / "child-state")
             store.load("codex")                      # pure read still works
             with self.assertRaises(StateStoreError):
                 store.commit("codex", store.load("codex"),
                              ProviderState(next_due_at=555))
-        finally:
-            os.chmod(parent, 0o700)
 
 
 class StaleCheckScopeTests(unittest.TestCase):
@@ -669,7 +669,7 @@ class StaleCheckScopeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -728,7 +728,7 @@ class MalformedValueParityTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = FileStateStore(self.state_dir)
 
     def tearDown(self) -> None:
@@ -812,7 +812,8 @@ class ScheduleStateContractSpecTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
+        initialize_protocol(self.state_dir)
         bootstrap_legacy_authority(self.state_dir)
         self.store = FileStateStore(self.state_dir)
         import task_orchestrator
@@ -854,7 +855,7 @@ class ScheduleStateContractSpecTests(unittest.TestCase):
         # number no producer would ever have written.
         write_slot(self.state_dir, "codex", "next-due-at", "5_0")
         for p in ("antigravity", "opencode"):
-            (self.state_dir / f"{p}-next-due-at").write_text("999999999\n")
+            (self.state_dir / f"{p}-next-due-at").write_bytes(b"999999999\n")
         self.assertIsNone(
             self.ScheduleState(self.state_dir).snapshot()["codex"]
         )

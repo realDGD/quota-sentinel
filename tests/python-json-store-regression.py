@@ -22,10 +22,14 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from private_file_fixtures import assert_private_path, private_test_directory, loosen_directory_access
+from quota_sentinel.platform.files import private_directory
 
 from quota_sentinel.state import (
     ACTION_EXISTS,
@@ -223,7 +227,7 @@ class DomainValidationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -319,7 +323,7 @@ class JsonStoreTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = Path(self._tmp.name)
+        self.state_dir = private_test_directory(self._tmp)
         self.store = JsonStateStore(self.state_dir)
         self.path = self.state_dir / "codex-state.json"
 
@@ -384,6 +388,15 @@ class JsonStoreTests(unittest.TestCase):
             stop.set()
             thread.join(timeout=5)
         self.assertEqual(damage, [], "reader saw a non-complete document")
+
+    @unittest.skipIf(os.name == 'nt', 'native reparse rejection is covered by the Windows file boundary gate')
+    def test_load_refuses_document_symlink(self) -> None:
+        target = self.state_dir / 'outside-state.json'
+        _publish_atomic(target, serialize_state(FULL_STATE, 'codex'))
+        self.path.symlink_to(target)
+        with self.assertRaises(StateStoreError):
+            self.store.load('codex')
+        self.assertEqual(target.read_bytes(), serialize_state(FULL_STATE, 'codex'))
 
     def test_business_value_failure_leaves_old_document_untouched(self) -> None:
         # J9 store part: unrepresentable text refuses AFTER the old doc
@@ -483,7 +496,7 @@ class JsonStoreTests(unittest.TestCase):
 
     def test_document_path_and_modes(self) -> None:
         # J12/J16: <provider>-state.json under 0600; dir normalized 0700.
-        os.chmod(self.state_dir, 0o755)
+        loosen_directory_access(self.state_dir)
         self._bootstrap(FULL_STATE)
         self.store.commit(  # triggers ensure-dir through the write path
             "codex", FULL_STATE, ProviderState()
@@ -491,8 +504,8 @@ class JsonStoreTests(unittest.TestCase):
         self.assertEqual(
             self.state_dir / "codex-state.json", self.path
         )
-        self.assertEqual(oct(os.stat(self.path).st_mode & 0o777), "0o600")
-        self.assertEqual(oct(os.stat(self.state_dir).st_mode & 0o777), "0o700")
+        assert_private_path(self, self.path)
+        assert_private_path(self, self.state_dir, directory=True)
 
     def test_invalid_provider_names_rejected(self) -> None:
         for bad in ("../evil", "a b", "", "/tmp/pwn"):
@@ -519,6 +532,25 @@ class MigrationTests(unittest.TestCase):
         current = self.file_store.load(provider)
         self.file_store.commit(provider, current, desired)
         return desired
+
+    def test_seed_collision_does_not_remove_another_callers_temporary_file(self) -> None:
+        import types
+        private_directory(self.state_dir)
+        path = self.state_dir / 'codex-state.json'
+        other = path.with_name(path.name + '.tmp.collision.seed')
+        other.write_bytes(b'other caller')
+        with patch('quota_sentinel.state.migration.uuid.uuid4', return_value=types.SimpleNamespace(hex='collision')):
+            with self.assertRaises(StateStoreError):seed_document_if_absent(path,b'new')
+        self.assertEqual(other.read_bytes(),b'other caller')
+        self.assertFalse(path.exists())
+
+    def test_seed_stream_failure_leaves_no_temporary_file(self) -> None:
+        private_directory(self.state_dir)
+        path=self.state_dir/'codex-state.json'
+        with patch('os.fdopen',side_effect=OSError('synthetic stream allocation failure')),patch('quota_sentinel.platform.files.io.BufferedWriter',side_effect=OSError('synthetic stream allocation failure')):
+            with self.assertRaisesRegex(StateStoreError,'synthetic stream allocation failure'):
+                seed_document_if_absent(path,b'new')
+        self.assertEqual(list(self.state_dir.iterdir()),[])
 
     # M1 + M6: legacy -> JSON, explicit nulls, transient candidate.
     def test_m1_full_migration(self) -> None:
@@ -547,13 +579,8 @@ class MigrationTests(unittest.TestCase):
     def test_m1_fresh_empty_dir_seeds_all_null_document(self) -> None:
         self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
         self.assertEqual(self.json_store.load("codex"), ProviderState())
-        self.assertEqual(
-            oct(os.stat(self.state_dir).st_mode & 0o777), "0o700"
-        )
-        self.assertEqual(
-            oct(os.stat(self.state_dir / "codex-state.json").st_mode & 0o777),
-            "0o600",
-        )
+        assert_private_path(self, self.state_dir, directory=True)
+        assert_private_path(self, self.state_dir / "codex-state.json")
 
     # M2: idempotent — reruns change nothing.
     def test_m2_idempotent(self) -> None:
@@ -633,7 +660,7 @@ class MigrationTests(unittest.TestCase):
                 state = super().load(provider)
                 if provider == "codex" and not raced["done"]:
                     raced["done"] = True
-                    self.state_dir.mkdir(parents=True, exist_ok=True)
+                    private_directory(self.state_dir)
                     _publish_atomic(
                         self.state_dir / "codex-state.json",
                         serialize_state(winner_state, "codex"),
@@ -656,9 +683,9 @@ class MigrationTests(unittest.TestCase):
     # (unset), are NOT repaired, and the raw legacy files stay intact.
     def test_m5_legacy_garbage_not_repaired(self) -> None:
         (self.state_dir.parent.mkdir(exist_ok=True))
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        (self.state_dir / "codex-next-due-at").write_text("garbage\n")
-        (self.state_dir / "codex-last-task-at").write_text("77\n")
+        private_directory(self.state_dir)
+        (self.state_dir / "codex-next-due-at").write_bytes(b"garbage\n")
+        (self.state_dir / "codex-last-task-at").write_bytes(b"77\n")
         self.assertEqual(migrate_provider(self.state_dir, "codex"), ACTION_SEEDED)
         doc = json.loads((self.state_dir / "codex-state.json").read_text())
         self.assertIsNone(doc["next_due_at"])       # garbage → unset, as interpreted
