@@ -360,10 +360,11 @@ def main() -> None:
 
 class FeishuListener:
     """Listener only: the host supplies and owns its scheduler reference."""
-    def __init__(self, config, state_dir, config_path, scheduler):
+    def __init__(self, config, state_dir, config_path, scheduler, *, activation_journal=None):
         self.config = config
         self.state_dir, self.config_path = Path(state_dir), Path(config_path)
         self.scheduler = scheduler
+        self.activation_journal = activation_journal
         self.client = None
         self._sdk_tasks = set()
 
@@ -386,7 +387,10 @@ class FeishuListener:
         command_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='feishu-usage')
         command_environment = dict(os.environ, QUOTA_SENTINEL_CONFIG=str(self.config_path))
         USAGE_COMMAND = (sys.executable, '-m', 'quota_sentinel', '--state-dir',
-                         str(self.state_dir), '--config', str(self.config_path), 'usage')
+                         str(self.state_dir), '--config', str(self.config_path))
+        if self.activation_journal is not None:
+            USAGE_COMMAND += ('--activation-journal', str(self.activation_journal))
+        USAGE_COMMAND += ('usage',)
         USAGE_COMMAND_TIMEOUT_SECONDS = listener_usage_budget(command_environment, config=self.config)
         handler = sdk.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(on_message_receive).build()
         self.client = sdk.ws.Client(app_id=app_id, app_secret=app_secret,

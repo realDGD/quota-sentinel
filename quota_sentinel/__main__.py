@@ -354,7 +354,12 @@ def _application(factory, state_dir, args, command, requested=()):
         return factory.create_application(state_dir)
     plan = build_runtime_plan(effective.settings, command, requested=requested)
     env = dict(os.environ); env['QUOTA_SENTINEL_CONFIG'] = str(path)
-    return factory.create_application(state_dir, environment=env, software_config=effective.settings, runtime_plan=plan)
+    application = factory.create_application(state_dir, environment=env,
+        software_config=effective.settings, runtime_plan=plan)
+    activation_journal = getattr(args, 'activation_journal', None)
+    if activation_journal is not None:
+        application.activation_path = Path(activation_journal)
+    return application
 
 
 def run_config(args):
@@ -459,13 +464,21 @@ def run_usage(state_dir: Path, args: argparse.Namespace) -> int:
 def run_serve(state_dir: Path, args: argparse.Namespace) -> int:
     from quota_sentinel.runtime.selection import build_runtime_plan
     from quota_sentinel.daemon import run_selected_host
-    path, effective = _effective_settings(state_dir, args)
-    if not path.exists():
-        raise ValueError('save and review the configuration before applying a background service')
+    from quota_sentinel.config.edit_lock import configuration_lock
+    from quota_sentinel.state.activation import read_journal
+    path = Path(args.config_path or Path(state_dir) / 'config.json').resolve()
+    # Apply one saved generation, including its pending activation transitions.
+    # Release the editor lock before starting any long-lived component.
+    with configuration_lock(path.parent / 'configuration.lock'):
+        _, effective = _effective_settings(state_dir, args)
+        if not path.exists():
+            raise ValueError('save and review the configuration before applying a background service')
+        activation_snapshot = read_journal(path.with_suffix('.activations.json'))
     plan = build_runtime_plan(effective.settings, 'serve')
     if plan.start_scheduler or plan.start_listener:
         read_authority(state_dir)
-    return run_selected_host(effective.settings, plan, state_dir, path)
+    return run_selected_host(effective.settings, plan, state_dir, path,
+                             activation_snapshot=activation_snapshot)
 
 
 def run_service(args):
@@ -586,6 +599,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quota-sentinel")
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--config", dest="config_path", type=Path, default=os.environ.get("QUOTA_SENTINEL_CONFIG"))
+    parser.add_argument("--activation-journal", type=Path, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
     config = sub.add_parser('config', help='show or validate effective nonsecret settings')
     config.add_argument('config_action', choices=('show', 'validate'))

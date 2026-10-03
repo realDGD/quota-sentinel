@@ -1,18 +1,22 @@
 """Selected current-user services: isolated manager commands, never supplier calls."""
 from dataclasses import replace
 import importlib.util
+import json
 import os
 from pathlib import Path
 import plistlib
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from quota_sentinel.config import new_user_defaults, FeatureSettings, CredentialReference
+from quota_sentinel.config import new_user_defaults, to_document, FeatureSettings, CredentialReference
 from quota_sentinel.state.new_installation import initialize_new_installation
-from quota_sentinel.platform.process import CommandResult
+from quota_sentinel.platform.files import publish_private
+from quota_sentinel.platform.process import CommandResult, CLEANUP_ALLOWANCE_SECONDS, spawn_owned
 
 class Services(unittest.TestCase):
  def test_corrupt_installed_budget_keeps_stop_identity(self):
@@ -95,6 +99,71 @@ class Services(unittest.TestCase):
   m=self.Manager(system='Linux',home=self.root,runner=unavailable)
   with self.assertRaisesRegex(self.Error,'foreground.*serve'):m.install(self.definition())
   self.assertFalse((self.root/'.config/systemd/user/quota-sentinel.fixture.service').exists())
+ def test_linux_start_replaces_active_host_with_saved_profile(self):
+  # This runner models idempotent systemd start; the host/parser are real.
+  # No systemd manager, suppliers, credentials, or bot clients are invoked.
+  host=self.root/'profile-host.py';observed=self.root/'observed.json'
+  host.write_text('''import json,os,sys,time
+from pathlib import Path
+from quota_sentinel.config import read_config
+from quota_sentinel.platform.files import publish_private
+from quota_sentinel.runtime.selection import build_runtime_plan
+config=read_config(Path(sys.argv[1])).settings
+plan=build_runtime_plan(config,'serve')
+publish_private(Path(sys.argv[2]),json.dumps(dict(pid=os.getpid(),listener=plan.start_listener,opening_roster=plan.opening_providers,codex_timeout=config.budgets['codex']['timeout'])).encode())
+time.sleep(60)
+''')
+  active=[None];stop_deadlines=[]
+  def cleanup():
+   if active[0] is not None:
+    active[0].stop(0);active[0].close();active[0]=None
+  self.addCleanup(cleanup)
+  environment={'HOME':str(self.root),'PATH':str(Path(sys.executable).parent),'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'PYTHONDONTWRITEBYTECODE':'1','QUOTA_SENTINEL_KEYCHAIN_DISABLED':'1'}
+  def systemd_fixture(argv,**options):
+   self.assertEqual(tuple(argv[:2]),('systemctl','--user'))
+   action=argv[2]
+   if action in ('start','stop','restart','enable'):
+    self.assertEqual(tuple(argv[3:]),('quota-sentinel.fixture.service',))
+   elif action=='show':self.assertEqual(tuple(argv[3:]),('--property=Version','--value'))
+   else:self.assertEqual(action,'daemon-reload')
+   if action in ('stop','restart'):
+    stop_deadlines.append(options['timeout']);cleanup()
+   if action in ('start','restart') and (active[0] is None or active[0].poll() is not None):
+    active[0]=spawn_owned((sys.executable,str(host),str(self.state/'config.json'),str(observed)),cwd=self.root,environment=environment,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   return CommandResult(b'',b'',0,False)
+  def running_profile():
+   deadline=time.monotonic()+5
+   while time.monotonic()<deadline:
+    if observed.exists():
+     value=json.loads(observed.read_text())
+     if value['pid']==active[0].pid:return value
+    if active[0].poll() is not None:self.fail('profile fixture exited before publishing its saved configuration')
+    time.sleep(.01)
+   self.fail('profile fixture did not publish its saved configuration')
+  m=self.Manager(system='Linux',home=self.root,environment={'HOME':str(self.root)},runner=systemd_fixture)
+  d=self.build(self.c,self.state,self.state/'config.json',environment={'HOME':str(self.root)},name='quota-sentinel.fixture')
+  m.install(d);self.assertIsNone(active[0]);m.start(d);before=running_profile();previous=active[0]
+  self.assertEqual({k:v for k,v in before.items() if k!='pid'},{'listener':False,'opening_roster':['codex'],'codex_timeout':120})
+  providers=dict(self.c.providers);providers['antigravity']=replace(providers['antigravity'],enabled=True,opening_enabled=True)
+  budgets={k:dict(v) for k,v in self.c.budgets.items()};budgets['codex']['timeout']=240
+  saved=replace(self.c,providers=providers,features=replace(self.c.features,feishu_listener=True),budgets=budgets)
+  publish_private(self.state/'config.json',json.dumps(to_document(saved)).encode())
+  changed=self.build(saved,self.state,self.state/'config.json',environment={'HOME':str(self.root)},name='quota-sentinel.fixture')
+  m.install(changed)
+  self.assertIs(active[0],previous);self.assertEqual(running_profile(),before)
+  m.start(changed);after=running_profile()
+  self.assertEqual({k:v for k,v in after.items() if k!='pid'},{'listener':True,'opening_roster':['codex','antigravity'],'codex_timeout':240})
+  self.assertNotEqual(after['pid'],before['pid']);self.assertIsNotNone(previous.poll());self.assertIsNone(active[0].poll())
+  self.assertEqual(stop_deadlines,[d.stop_timeout+CLEANUP_ALLOWANCE_SECONDS,changed.stop_timeout+CLEANUP_ALLOWANCE_SECONDS])
+ def test_linux_start_reports_failed_stop_before_replacement(self):
+  starts=[]
+  def failing_stop(argv,**options):
+   if argv[2] in ('stop','restart'):return CommandResult(b'',b'',124,True)
+   if argv[2]=='start':starts.append(tuple(argv))
+   return CommandResult(b'',b'',0,False)
+  m=self.Manager(system='Linux',home=self.root,environment={'HOME':str(self.root)},runner=failing_stop);d=self.definition();m.install(d)
+  with self.assertRaises(self.Error):m.start(d)
+  self.assertFalse(starts)
  def test_windows_user_identity(self):
   m=self.manager('Windows');d=self.definition();doc=ET.fromstring(m.render(d));ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
   self.assertEqual(doc.find('t:Principals/t:Principal/t:UserId',ns).text,'S-1-5-21-123')

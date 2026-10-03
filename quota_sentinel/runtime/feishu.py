@@ -5,6 +5,7 @@ JSON request bodies or in-process headers, never in a process argument/URL.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -14,6 +15,7 @@ import threading
 import time
 from typing import Any, Mapping, Optional
 from urllib import error, request
+from uuid import uuid4
 
 from quota_sentinel.quota.adapters import PROVIDERS
 from quota_sentinel.runtime import keychain
@@ -61,17 +63,19 @@ def _bound_socket(response: Any, remaining: float) -> None:
             pass
 
 
-def _read_within(response: Any, deadline: float) -> bytes:
+def _read_within(response: Any, deadline: float, *, max_bytes: Optional[int] = None) -> bytes:
     """Read a response under a wall-clock deadline, chunk by chunk."""
     chunks = []
     total = 0
     while True:
+        if max_bytes is not None and total >= max_bytes:
+            return b"".join(chunks)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FeishuTimeout("Feishu response exceeded its total timeout")
         _bound_socket(response, remaining)
         reader = getattr(response, "read1", None) or response.read
-        chunk = reader(65536)
+        chunk = reader(65536 if max_bytes is None else min(65536, max_bytes - total))
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -153,6 +157,7 @@ class UrllibHttp:
         req = request.Request(url, data=body, headers=dict(headers), method="POST")
         deadline = time.monotonic() + budget
         outcome: queue.Queue = queue.Queue(maxsize=1)
+        rejection: queue.Queue = queue.Queue(maxsize=1)
 
         def exchange() -> None:
             try:
@@ -170,15 +175,33 @@ class UrllibHttp:
                 if not isinstance(value, dict):
                     raise FeishuError("Feishu returned a non-object response")
                 outcome.put((True, value))
+            except error.HTTPError as exc:
+                # Publish only detached status metadata before reading: if
+                # the body uses up the budget, a permanent status must still
+                # remain permanent rather than become a retryable timeout.
+                rejection.put(error.HTTPError(exc.url, exc.code, exc.msg, exc.headers, io.BytesIO()))
+                try:
+                    raw = _read_within(exc.fp, deadline, max_bytes=_ERROR_BODY_BYTES)
+                except Exception:
+                    raw = b""
+                finally:
+                    exc.close()
+                outcome.put((False, error.HTTPError(
+                    exc.url, exc.code, exc.msg, exc.headers, io.BytesIO(raw),
+                )))
             except Exception as exc:
-                # HTTPError retains its bounded response stream so the caller
-                # can classify retryable status codes and read code/msg.
                 outcome.put((False, exc))
 
         threading.Thread(target=exchange, name="feishu-http", daemon=True).start()
         try:
             succeeded, value = outcome.get(timeout=max(0.0, deadline - time.monotonic()))
         except queue.Empty as exc:
+            try:
+                rejected = rejection.get_nowait()
+            except queue.Empty:
+                rejected = None
+            if rejected is not None:
+                raise rejected
             raise FeishuTimeout("Feishu request exceeded its total timeout") from exc
         if not succeeded:
             raise value
@@ -393,7 +416,8 @@ class FeishuNotifier:
         if not providers:
             return None
         user_id = self._user()
-        uuid = f"quota-sentinel-{int(now)}"
+        # Generate once per event; FeishuClient retries this same envelope.
+        uuid = str(uuid4())
         if self.disable_chart:
             payload = render_task_text_card(providers, results, readings, user_id, uuid, now=int(now))
         else:
@@ -405,7 +429,7 @@ class FeishuNotifier:
 
     def usage(self, readings, now):
         user_id = self._user()
-        uuid = f"quota-sentinel-{int(now)}"
+        uuid = str(uuid4())
         if self.disable_chart:
             payload = render_usage_text_card(self.roster, readings, user_id, uuid, now=int(now))
         else:
@@ -416,7 +440,7 @@ class FeishuNotifier:
         return self.client.send(payload)
 
     def busy(self, now):
-        return self.client.send(render_busy_card(self._user(), f"quota-sentinel-busy-{int(now)}"))
+        return self.client.send(render_busy_card(self._user(), str(uuid4())))
 
 
 __all__ = ["FeishuClient", "FeishuError", "FeishuNotifier", "KeychainCredentials", "UrllibHttp", "lookup_payload"]

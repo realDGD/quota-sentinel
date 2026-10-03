@@ -116,7 +116,9 @@ class ServiceManager:
    self._mac_stop_name(d.name,d.stop_timeout+CLEANUP_ALLOWANCE_SECONDS)
    self._run(('/bin/launchctl','enable','gui/'+str(self.uid)+'/'+d.name))
    self._run(('/bin/launchctl','bootstrap','gui/'+str(self.uid),str(self.path(d))))
-  elif self.system=='Linux':self._run(('systemctl','--user','start',d.name+'.service'))
+  elif self.system=='Linux':
+   self.stop(d)
+   self._run(('systemctl','--user','start',d.name+'.service'))
   else:
    self.stop(d)
    self._run(('schtasks.exe','/Run','/TN',d.name))

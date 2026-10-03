@@ -6,8 +6,10 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib import error
@@ -178,6 +180,80 @@ class FakeHttp:
 
 
 class TransportTests(unittest.TestCase):
+    def test_total_timeout_covers_slow_http_error_without_retrying_a_permanent_status(self):
+        requests = []
+        disconnected = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                requests.append(self.path)
+                body = b'{"code":400,"msg":"fixture error"}'
+                self.send_response(400)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                except (BrokenPipeError, ConnectionResetError):
+                    disconnected.set()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        try:
+            client = FeishuClient(
+                FakeCredentials(), api_base="http://127.0.0.1:%s" % server.server_address[1],
+                total_timeout=0.15, sleep=lambda _: None,
+            )
+            started = time.monotonic()
+            with self.assertRaises(FeishuError) as caught:
+                client._post("fixture", {}, retries=1)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.65, "HTTP error body exceeded the total request budget")
+            self.assertEqual(requests, ["/fixture"])
+            self.assertIn("HTTP 400", str(caught.exception))
+            self.assertTrue(disconnected.wait(timeout=0.3), "timed out error stream must be closed")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_urllib_error_body_is_bounded_and_detached_from_the_closed_stream(self):
+        stream = io.BytesIO(b"x" * 6000)
+        failure = error.HTTPError("https://example.invalid", 429, "Rejected", {}, stream)
+        with mock.patch.object(feishu_module.request, "urlopen", side_effect=failure):
+            with self.assertRaises(error.HTTPError) as caught:
+                UrllibHttp().post("https://example.invalid", b"{}", {}, 15, 45)
+        try:
+            self.assertTrue(stream.closed, "transport must close the live rejection stream")
+            self.assertEqual(caught.exception.code, 429)
+            self.assertEqual(caught.exception.read(10000), b"x" * 4096)
+        finally:
+            caught.exception.close()
+
+    def test_fake_http_errors_keep_details_status_retries_and_cleanup(self):
+        transient_stream = io.BytesIO(b'{"code": 503, "msg": "try again"}')
+        permanent_stream = io.BytesIO(b'{"code": 230001, "msg": "app not in chat"}')
+        http = FakeHttp([
+            error.HTTPError("https://example.invalid/secret-in-url", 503, "Rejected", {}, transient_stream),
+            error.HTTPError("https://example.invalid/secret-in-url", 403, "Rejected", {}, permanent_stream),
+        ])
+        client = FeishuClient(FakeCredentials(), http=http, sleep=lambda _: None)
+        with self.assertRaisesRegex(FeishuError, "code 230001: app not in chat") as caught:
+            client._post("fixture", {}, token="secret-in-header", retries=2)
+        self.assertEqual(len(http.calls), 2)
+        self.assertTrue(transient_stream.closed)
+        self.assertTrue(permanent_stream.closed)
+        self.assertNotIn("secret-in-url", str(caught.exception))
+        self.assertNotIn("secret-in-header", str(caught.exception))
+
     def test_validate_ready_checks_all_credentials_without_network_or_secret_leak(self):
         class MissingCredentials:
             def __init__(self):
@@ -304,6 +380,100 @@ class TransportTests(unittest.TestCase):
         self.assertIn("Gemini 3.7 Flash · Low", usage_text)
         self.assertIn("DeepSeek V4.1 Flash · OpenCode Go", usage_text)
         self.assertIn("配额正在刷新", client.sent[2]["content"])
+
+
+class NotificationIdentityTests(unittest.TestCase):
+    def test_each_task_usage_and_busy_event_has_an_id_reused_only_for_its_http_retries(self):
+        for disable_chart in (False, True):
+            with self.subTest(disable_chart=disable_chart):
+                responses = []
+                for _ in range(6):
+                    responses.extend([
+                        {"code": 0, "tenant_access_token": "fixture-token"},
+                        TimeoutError("fixture retry"), {"code": 0},
+                    ])
+                http = FakeHttp(responses)
+                notifier = FeishuNotifier(
+                    FeishuClient(FakeCredentials(), http=http, sleep=lambda _: None),
+                    disable_chart=disable_chart,
+                )
+                notifier.task(["codex"], {"codex": "发送成功"}, {"codex": quota()}, NOW)
+                notifier.task(["antigravity"], {"antigravity": "发送成功"}, {"antigravity": quota()}, NOW)
+                notifier.usage({"codex": quota()}, NOW)
+                notifier.usage({"codex": quota()}, NOW)
+                notifier.busy(NOW)
+                notifier.busy(NOW)
+                messages = [call[1] for call in http.calls if "/im/v1/messages" in call[0]]
+                self.assertEqual(len(messages), 12)
+                ids = [message["uuid"] for message in messages]
+                self.assertEqual(ids[::2], ids[1::2], "HTTP retries must reuse their event ID")
+                self.assertTrue(all(isinstance(value, str) and value for value in ids))
+                self.assertEqual(len(set(ids)), 6, "different logical notifications must have different IDs")
+
+    def test_one_check_sends_recovered_debt_and_due_task_with_distinct_ids(self):
+        from dataclasses import replace
+        from quota_sentinel.app import Application
+        from quota_sentinel.config import default_provider, new_user_defaults
+        from quota_sentinel.runtime.models import AttemptResult
+        from quota_sentinel.runtime.selection import build_runtime_plan
+        from quota_sentinel.state.json_store import JsonStateStore
+        from quota_sentinel.state.models import ProviderState
+        from quota_sentinel.state.new_installation import initialize_new_installation
+
+        for disable_chart in (False, True):
+            with self.subTest(disable_chart=disable_chart), tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                "os.environ", {"HOME": temp, "QUOTA_SENTINEL_KEYCHAIN_DISABLED": "1"}, clear=True,
+            ):
+                state = Path(temp) / "state"
+                config = new_user_defaults()
+                providers = dict(config.providers)
+                providers["antigravity"] = default_provider("antigravity", enabled=True)
+                config = replace(config, providers=providers, features=replace(config.features, feishu_push=True))
+                initialize_new_installation(state, config)
+                store = JsonStateStore(state)
+                store.commit("codex", store.load("codex"), ProviderState(
+                    last_attempt_at=1, next_due_at=2, retry_pending=True,
+                ))
+                store.commit("antigravity", store.load("antigravity"), ProviderState(
+                    last_task_at=1, next_due_at=2,
+                ))
+                (state / "runtime-providers.json").write_text(json.dumps({
+                    "schema_version": 1, "enabled": ["codex", "antigravity"], "awaiting_resume": [],
+                }))
+                attempts = []
+
+                class Runner:
+                    def prepare(self, *args):
+                        pass
+
+                    def run(self, provider, workspace, phase, attempt, limit):
+                        attempts.append((provider, phase, attempt))
+                        return AttemptResult(True, 0, False, 0, Path(workspace) / "out",
+                                             Path(workspace) / "err", Path(workspace) / "quota", "")
+
+                class Collector:
+                    def collect(self, *args, **kwargs):
+                        return {}
+
+                    def save_pi_snapshots(self, *args):
+                        pass
+
+                http = FakeHttp([
+                    {"code": 0, "tenant_access_token": "fixture-token"}, {"code": 0},
+                    {"code": 0, "tenant_access_token": "fixture-token"}, {"code": 0},
+                ])
+                notifier = FeishuNotifier(FeishuClient(FakeCredentials(), http=http),
+                                          roster=("codex", "antigravity"), disable_chart=disable_chart)
+                application = Application(state, Runner(), lambda _: Collector(), notifier,
+                                          clock=lambda: 2000.25, sleep=lambda _: None,
+                                          runtime_plan=build_runtime_plan(config, "check"))
+                self.assertEqual(application.check(), ("antigravity",))
+                self.assertEqual(attempts, [("codex", "watchdog-retry", 1), ("antigravity", "initial", 1)])
+                messages = [call[1] for call in http.calls if "/im/v1/messages" in call[0]]
+                self.assertEqual(len(messages), 2)
+                self.assertEqual([message["receive_id"] for message in messages], ["u", "u"])
+                self.assertNotEqual(messages[0]["content"], messages[1]["content"])
+                self.assertNotEqual(messages[0]["uuid"], messages[1]["uuid"])
 
 
 class KeychainBoundTests(unittest.TestCase):

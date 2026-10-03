@@ -37,6 +37,25 @@ class ConfigTests(unittest.TestCase):
     p=Path(t);(p/'runtime-providers.json').write_text(json.dumps({'schema_version':1,'enabled':values,'awaiting_resume':[]}))
     app=Application(p,None,None,None,runtime_plan=build_runtime_plan(new_user_defaults(),'check'))
     with self.assertRaises(ValueError):app._active_transitions()
+ def test_global_disable_journals_only_enabled_opening_providers(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'config.json';c=new_user_defaults();providers=dict(c.providers)
+   providers['antigravity']=replace(providers['antigravity'],enabled=True,opening_enabled=False)
+   providers['opencode']=replace(providers['opencode'],enabled=True,opening_enabled=True)
+   providers['clinepass']=replace(providers['clinepass'],opening_enabled=True)
+   c=replace(c,providers=providers);revision=save_config(p,c,expected_revision=None)
+   disabled=replace(c,features=replace(c.features,automatic_opening=False))
+   save_config(p,disabled,expected_revision=revision)
+   self.assertTrue(p.with_suffix('.activations.json').exists(),'global disable must persist the affected providers before the next check')
+   self.assertEqual(json.loads(p.with_suffix('.activations.json').read_bytes())['pending'],['codex','opencode'])
+ def test_provider_disable_is_journaled_while_automatic_opening_is_disabled(self):
+  for flag in ('enabled','opening_enabled'):
+   with self.subTest(flag=flag),tempfile.TemporaryDirectory() as t:
+    p=Path(t)/'config.json';c=new_user_defaults();c=replace(c,features=replace(c.features,automatic_opening=False))
+    revision=save_config(p,c,expected_revision=None);providers=dict(c.providers)
+    providers['codex']=replace(providers['codex'],**{flag:False})
+    save_config(p,replace(c,providers=providers),expected_revision=revision)
+    self.assertEqual(json.loads(p.with_suffix('.activations.json').read_bytes())['pending'],['codex'])
  def test_fresh_defaults(self):
   c=new_user_defaults(); self.assertEqual([p for p,v in c.providers.items() if v.enabled],['codex']); self.assertEqual(c.providers['codex'].opening_chain,('codex',)); self.assertEqual(c.providers['codex'].quota_chain,('native',)); self.assertFalse(c.features.feishu_push); self.assertFalse(c.features.feishu_listener)
  def test_invalid_chain_and_budget(self):

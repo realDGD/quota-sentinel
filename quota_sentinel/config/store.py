@@ -78,6 +78,8 @@ def save_config(path,config,*,expected_revision):
    old_active={p for p,v in old.providers.items() if v.enabled and v.opening_enabled}
    new_active={p for p,v in c.providers.items() if v.enabled and v.opening_enabled}
    disabled=old_active-new_active
+   if old.features.automatic_opening and not c.features.automatic_opening:
+    disabled|=old_active
    if disabled:
     journal=path.with_suffix('.activations.json')
     from quota_sentinel.state.activation import publish_bytes,read_journal

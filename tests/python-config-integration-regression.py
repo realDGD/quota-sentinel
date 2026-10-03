@@ -74,5 +74,112 @@ if sys.argv[1]=='app-server':
   self.used=None;c=self.config();initialize_new_installation(self.state,c)
   app=self.app(c,'usage');collector=app.quota_collector_factory(self.root/'probe')
   self.assertIsNone(collector.collect()['codex'].quota)
+ def test_global_reenable_waits_for_fresh_quota_without_replaying_debt(self):
+  from quota_sentinel.app import Application,AppConfig
+  from quota_sentinel.scheduler import service
+  from quota_sentinel.runtime.models import AttemptResult
+  from quota_sentinel.runtime.quota_probe import QuotaReading
+  from quota_sentinel.quota.adapters import Tier
+  from quota_sentinel.quota.models import ProviderQuota,QuotaWindow
+  c=new_user_defaults();initialize_new_installation(self.state,c);events=[]
+  fresh=QuotaReading(ProviderQuota('fixture',True,False,1000,QuotaWindow(80,4000),QuotaWindow(90,8000)),Tier.NATIVE,True)
+  readings={'codex':fresh}
+  class Collector:
+   def collect(self,*args,**kwargs):events.append('quota');return readings
+   def save_pi_snapshots(self,*args):pass
+  class Runner:
+   def prepare(self,provider,workspace):events.append('prepare:'+provider)
+   def run(self,provider,workspace,phase,attempt,limit):
+    events.append(phase+':'+provider)
+    return AttemptResult(False,1,False,0,workspace/'out',workspace/'err',workspace/'quota','fixture failure')
+  class Notifier:
+   def validate_ready(self):pass
+   def task(self,*args):events.append('card')
+  app=Application(self.state,Runner(),lambda _:Collector(),Notifier(),clock=lambda:1000,sleep=lambda _:None,config=AppConfig(watchdog_attempts=1,quota_wait=0),runtime_plan=build_runtime_plan(c,'check'))
+  app.check();service.begin_attempt(self.state,'codex',100);debt=service.load_state(self.state,'codex')
+  path=self.state/'config.json';disabled=replace(c,features=replace(c.features,automatic_opening=False))
+  revision=save_config(path,disabled,expected_revision=read_config(path).revision)
+  save_config(path,c,expected_revision=revision)
+  cached=QuotaReading(replace(fresh.quota,fresh=False,cached=True),Tier.CODEXBAR_CACHE,False)
+  expired=QuotaReading(replace(fresh.quota,five_hour=QuotaWindow(80,500)),Tier.NATIVE,True)
+  for label,reading in (('missing',None),('cached',cached),('expired',expired)):
+   readings={} if reading is None else {'codex':reading};events.clear()
+   self.assertEqual(app.check(),())
+   self.assertEqual(events,['quota'],label+' quota must not permit a model attempt during reactivation')
+   self.assertEqual(service.load_state(self.state,'codex'),debt)
+  readings={'codex':fresh};events.clear();self.assertEqual(app.check(),())
+  self.assertEqual(events,['quota']);resumed=service.load_state(self.state,'codex')
+  self.assertFalse(resumed.retry_pending);self.assertEqual(resumed.reset_anchor,4000);self.assertGreater(resumed.next_due_at,1000)
+  self.assertEqual(json.loads(path.with_suffix('.activations.json').read_bytes())['pending'],[])
+ def test_manual_opening_remains_available_when_automatic_opening_is_disabled(self):
+  c=self.config();c=replace(c,features=replace(c.features,automatic_opening=False));initialize_new_installation(self.state,c)
+  self.assertEqual(build_runtime_plan(c,'check').opening_providers,())
+  self.assertEqual(self.app(c,'run').run(),{'codex':'发送成功'})
+  from quota_sentinel.scheduler import service
+  self.assertIsNotNone(service.load_state(self.state,'codex').last_task_at)
+
+ def test_old_host_cannot_consume_unapplied_disable_before_reenable(self):
+  from quota_sentinel import daemon
+  from quota_sentinel.__main__ import _application,build_parser
+  from quota_sentinel.app import Application,AppConfig
+  from quota_sentinel.scheduler import service
+  from quota_sentinel.runtime.models import AttemptResult
+  from quota_sentinel.runtime.quota_probe import QuotaReading
+  from quota_sentinel.quota.adapters import Tier
+  from quota_sentinel.quota.models import ProviderQuota,QuotaWindow
+  for switch in ('automatic_opening','enabled','opening_enabled'):
+   with self.subTest(switch=switch):
+    state=self.root/switch;c=new_user_defaults();initialize_new_installation(state,c)
+    path=state/'config.json';journal=path.with_suffix('.activations.json');events=[]
+    fresh=QuotaReading(ProviderQuota('fixture',True,False,1000,QuotaWindow(80,4000),QuotaWindow(90,8000)),Tier.NATIVE,True)
+    readings={'codex':fresh}
+    class Collector:
+     def collect(self,*args,**kwargs):events.append('quota');return readings
+     def save_pi_snapshots(self,*args):pass
+    class Runner:
+     def prepare(self,provider,workspace):events.append('prepare:'+provider)
+     def run(self,provider,workspace,phase,attempt,limit):
+      events.append(phase+':'+provider)
+      return AttemptResult(False,1,False,0,workspace/'out',workspace/'err',workspace/'quota','fixture failure')
+    class Notifier:
+     def validate_ready(self):pass
+     def task(self,*args):events.append('card')
+    class Factory:
+     def create_application(self,state_dir,**options):
+      return Application(state_dir,Runner(),lambda _:Collector(),Notifier(),clock=lambda:1000,sleep=lambda _:None,
+          config=AppConfig(watchdog_attempts=1,watchdog_retry_gap=0,quota_wait=0),runtime_plan=options['runtime_plan'])
+    def child(command):
+     args=build_parser().parse_args(command[3:])
+     return _application(Factory(),state,args,'check')
+    def old_host(config,plan,*,scheduler_factory,listener_factory):
+     command=scheduler_factory().scheduler_command
+     child(command).check();service.begin_attempt(state,'codex',100)
+     if switch=='automatic_opening':disabled=replace(c,features=replace(c.features,automatic_opening=False))
+     else:
+      providers=dict(c.providers);providers['codex']=replace(providers['codex'],**{switch:False})
+      disabled=replace(c,providers=providers)
+     save_config(path,disabled,expected_revision=read_config(path).revision)
+     events.clear();child(command).check()
+     self.assertEqual(json.loads(journal.read_bytes())['pending'],['codex'],
+         'old applied checks must not acknowledge a saved, unapplied disable')
+     self.assertIn('watchdog-retry:codex',events,'old checks keep their applied profile')
+     self.assertTrue(service.load_state(state,'codex').retry_pending)
+     save_config(path,c,expected_revision=read_config(path).revision)
+     return 0
+    with patch.object(daemon,'serve',side_effect=old_host):
+     self.assertEqual(daemon.run_selected_host(c,build_runtime_plan(c,'serve'),state,path),0)
+    def reapplied_host(config,plan,*,scheduler_factory,listener_factory):
+     nonlocal readings
+     command=scheduler_factory().scheduler_command;debt=service.load_state(state,'codex')
+     readings={};events.clear();child(command).check()
+     self.assertEqual(events,['quota'],'fresh quota must precede a reactivated model retry')
+     self.assertEqual(service.load_state(state,'codex'),debt)
+     self.assertEqual(json.loads(journal.read_bytes())['pending'],['codex'])
+     readings={'codex':fresh};events.clear();child(command).check()
+     self.assertEqual(events,['quota']);self.assertFalse(service.load_state(state,'codex').retry_pending)
+     self.assertEqual(json.loads(journal.read_bytes())['pending'],[])
+     return 0
+    with patch.object(daemon,'serve',side_effect=reapplied_host):
+     self.assertEqual(daemon.run_selected_host(c,build_runtime_plan(c,'serve'),state,path),0)
 
 if __name__=='__main__':unittest.main()
