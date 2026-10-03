@@ -38,6 +38,7 @@ jobs:
         if: always()
         with:
           name: fixtures-${{ matrix.os }}-${{ matrix.python }}
+          include-hidden-files: true
           path: .ci-logs
   linux-secret-service:
     strategy:
@@ -68,6 +69,7 @@ jobs:
         if: always()
         with:
           name: password-service-${{ matrix.os }}-${{ matrix.python }}
+          include-hidden-files: true
           path: .ci-logs
   macos-native:
     runs-on: macos-14
@@ -95,6 +97,7 @@ jobs:
         if: always()
         with:
           name: macos-native-${{ matrix.python }}
+          include-hidden-files: true
           path: .ci-logs
   windows11-native:
     if: github.event_name == 'workflow_dispatch' && inputs.windows11
@@ -118,4 +121,5 @@ jobs:
         if: always()
         with:
           name: windows11-native-${{ matrix.python }}
+          include-hidden-files: true
           path: .ci-logs

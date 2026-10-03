@@ -25,7 +25,7 @@ class Wheel(unittest.TestCase):
   wheel=next((cls.root/'dist').glob('*.whl'))
   venv.EnvBuilder(with_pip=False).create(cls.root/'venv')
   cls.python=cls.root/'venv'/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
-  installed=subprocess.run([uv,'--no-config','pip','install','--offline','--no-deps','--python',str(cls.python),str(wheel)],env=cls.environment,capture_output=True,timeout=45)
+  installed=subprocess.run([uv,'--no-config','pip','install','--offline','--python',str(cls.python),str(wheel)],env=cls.environment,capture_output=True,timeout=45)
   if installed.returncode:raise AssertionError(installed.stderr.decode())
   cls.foreign=cls.root/'foreign';cls.foreign.mkdir()
  def run_python(self,code):
