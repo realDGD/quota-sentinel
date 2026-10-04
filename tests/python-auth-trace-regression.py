@@ -71,17 +71,26 @@ class TraceTests(unittest.TestCase):
 
     def test_owned_launcher_records_pid_even_without_agy_wrapper(self):
         from quota_sentinel.diagnostics.trace import invocation
-        from quota_sentinel.platform.process import run_bounded
+        from quota_sentinel.platform.process import spawn_owned, capture_owned
         env = dict(os.environ, QUOTA_SENTINEL_TRACE_DIR=str(self.root/'diagnostics'),
             QUOTA_SENTINEL_TRACE_TRIGGER='manual:usage')
         with invocation('codexbar-antigravity', environment=env) as span:
-            result = run_bounded([sys.executable,'-c','import os;print(os.getpid())'],
-                cwd=self.root, environment=span.environment, timeout=3, kill_grace=0)
+            process = spawn_owned([sys.executable,'-c','import os;print(os.getpid(),os.getppid())'],
+                cwd=self.root, environment=span.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            launched_pid = process.pid
+            result = capture_owned(process, timeout=3, kill_grace=0, max_bytes=4096)
             span.finish(exit_code=result.returncode)
-        pid = int(result.stdout.strip())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid, parent_pid = map(int, result.stdout.split())
+        # Windows venv python.exe can be a redirector which creates the actual
+        # interpreter as its child. The launch boundary owns the redirector.
+        if os.name == 'nt' and pid != launched_pid:
+            self.assertEqual(parent_pid, launched_pid)
+        else:
+            self.assertEqual(pid, launched_pid)
         records = self.journal().records()
-        self.assertTrue(any(r['event']=='owned_process_started' and r.get('target_pid')==pid for r in records))
-        self.assertTrue(any(r['event']=='owned_process_stopped' and r.get('target_pid')==pid for r in records))
+        self.assertTrue(any(r['event']=='owned_process_started' and r.get('target_pid')==launched_pid for r in records), records)
+        self.assertTrue(any(r['event']=='owned_process_stopped' and r.get('target_pid')==launched_pid for r in records), records)
 
     def test_context_carries_trigger_and_parent_call_without_changing_home(self):
         from quota_sentinel.diagnostics.trace import invocation
