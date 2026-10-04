@@ -87,14 +87,20 @@ class Native(unittest.TestCase):
   # Explicit Windows PowerShell avoids whichever pwsh alias the user selects.
   # This read addresses only the unique synthetic task created below.
   powershell=Path(os.environ['SYSTEMROOT'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
-  script=("$ErrorActionPreference='Stop'; $ownedService=New-Object -ComObject Schedule.Service; "
-          "$ownedService.Connect(); $ownedTask=$ownedService.GetFolder('\\').GetTask('"+name+"'); "
-          "$ownedInstances=$ownedTask.GetInstances(0); "
+  script=("$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('query:startup'); "
+          "$ownedService=New-Object -ComObject Schedule.Service; [Console]::Error.WriteLine('query:created'); "
+          "$ownedService.Connect(); [Console]::Error.WriteLine('query:connected'); "
+          "$ownedTask=$ownedService.GetFolder('\\').GetTask('"+name+"'); [Console]::Error.WriteLine('query:task'); "
+          "$ownedInstances=$ownedTask.GetInstances(0); [Console]::Error.WriteLine('query:instances'); "
           "if ($ownedInstances.Count -gt 1) {throw 'Multiple synthetic task instances'}; "
-          "if ($ownedInstances.Count -eq 1) {[Console]::Write($ownedInstances.Item(1).InstanceGuid)}")
+          "if ($ownedInstances.Count -eq 1) {[Console]::Write($ownedInstances.Item(1).InstanceGuid)}; "
+          "[Console]::Error.WriteLine('query:complete')")
   environment={key:os.environ[key] for key in ('SYSTEMROOT','WINDIR','PATH','TEMP','TMP','COMSPEC') if key in os.environ}
+  started=time.monotonic()
   result=run_bounded((str(powershell),'-NoLogo','-NoProfile','-NonInteractive','-Command',script),cwd=Path.cwd(),environment=environment,timeout=10,kill_grace=0,max_bytes=4096)
-  self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'));self.assertFalse(result.timed_out)
+  diagnostics=('elapsed='+str(round(time.monotonic()-started,3))+' timed_out='+str(result.timed_out)+'\n'+
+               (result.stdout+result.stderr).decode(errors='replace'))
+  self.assertEqual(result.returncode,0,diagnostics);self.assertFalse(result.timed_out,diagnostics)
   return result.stdout.decode('ascii').strip()
  def wait_instance(self,name,*,previous=None,stopped=False):
   deadline=time.monotonic()+20
