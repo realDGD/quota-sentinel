@@ -11,7 +11,8 @@ Contract (kept minimal on purpose):
   grace period for the child. Any remaining group members receive SIGKILL,
   including descendants left behind by a child that exited on SIGTERM.
 - Exit codes: the child's own exit code, 124 on timeout (GNU timeout
-  convention), 127 when the child cannot be spawned, 125 for helper misuse.
+  convention), 127 when the child cannot be spawned, 125 for helper misuse,
+  78 when the optional macOS agy guard detects interactive authentication.
 """
 
 import os
@@ -88,16 +89,42 @@ def kill_group(pgid, sig):
 
 
 def main():
-    timeout, grace, command = parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    separator = argv.index('--') if '--' in argv else len(argv)
+    guarded = '--agy-auth-guard' in argv[:separator]
+    argv = [arg for arg in argv[:separator] if arg != '--agy-auth-guard'] + argv[separator:]
+    separator = argv.index('--') if '--' in argv else len(argv)
+    log_path = None
+    if '--agy-log-file' in argv[:separator]:
+        index = argv.index('--agy-log-file')
+        if not guarded or index + 1 >= separator:
+            fail('--agy-log-file requires the agy guard and a path')
+            return HELPER_ERROR_EXIT
+        log_path = argv[index+1]
+        argv = argv[:index] + argv[index+2:]
+    timeout, grace, command = parse_args(argv)
     if timeout is None or not command:
         return HELPER_ERROR_EXIT
     if not math.isfinite(timeout) or not math.isfinite(grace) or timeout <= 0 or grace < 0:
         fail("--timeout must be > 0 and --kill-grace >= 0")
         return HELPER_ERROR_EXIT
 
+    from contextlib import nullcontext
+    from quota_sentinel.platform.background_auth import AgyAuthGuard
+    try:
+        with AgyAuthGuard(log_path) if guarded else nullcontext() as guard:
+            return execute(command, timeout, grace, guard)
+    except (ValueError, OSError):
+        fail('background_auth_guard_unavailable')
+        return SPAWN_ERROR_EXIT
+
+
+def execute(command, timeout, grace, guard):
     try:
         from quota_sentinel.platform.process import spawn_owned
         from pathlib import Path
+        if guard is not None:
+            command = guard.command(command)
         proc = spawn_owned(command, cwd=Path.cwd(), environment=os.environ)
     except OSError as exc:
         fail(f"could not spawn child: {exc}")
@@ -105,8 +132,31 @@ def main():
 
     try:
         try:
+            if guard is not None and guard.active:
+                from quota_sentinel.platform.background_auth import AUTH_REQUIRED_EXIT
+                deadline = time.monotonic() + timeout
+                while True:
+                    if guard.auth_required():
+                        proc.stop(min(grace, 1))
+                        fail('background authentication required; browser launch blocked')
+                        return AUTH_REQUIRED_EXIT
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired('background agy', timeout)
+                    try:
+                        exit_code = proc.wait(timeout=min(.05, remaining))
+                        if guard.auth_required(force=True):
+                            fail('background authentication required; browser launch blocked')
+                            return AUTH_REQUIRED_EXIT
+                        return exit_code
+                    except subprocess.TimeoutExpired:
+                        pass
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            if guard is not None and guard.active:
+                proc.stop(grace)
+                fail('background agy timed out')
+                return TIMEOUT_EXIT
             operation = 'owned Job terminated' if os.name == 'nt' else 'SIGTERM sent to owned process groups'
             fail(f"timed out after {timeout:g}s; {operation}")
             proc.stop(grace)

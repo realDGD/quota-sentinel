@@ -530,6 +530,18 @@ full measurement, its counter-examples and what still needs live verification
 are in **Probe-only providers**. Antigravity therefore ships the opposite
 priority to codex: **`agy` first, Pi as its one-hop fallback.**
 
+On macOS, background `/usage`, `/agents`, model turns and Antigravity CodexBar
+fallbacks run with an OS sandbox that blocks the browser launch used by CLI
+OAuth. The agy calls also watch their own private, temporary CLI log: silent
+authentication failure or interactive OAuth stops that owned process tree
+promptly (`auth_required`, helper exit 78), without changing HOME or saved
+credentials. A native authentication failure skips another agy authentication
+attempt through CodexBar in the same collection; cached tiers remain available
+and the next collection tries agy again. Model calls retain their configured
+Pi fallback. If the sandbox is unavailable, background Antigravity calls are
+refused. Foreground login remains available for credentials that really need
+renewal; a transient refresh/network failure does not disable agy permanently.
+
 `agy` is an agent, and a stock turn carries its scaffolding. Measured on
 2026-09-27 against agy 1.2.12, model `gemini-3.8-flash-low`, `--effort low`:
 

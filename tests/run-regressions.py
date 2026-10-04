@@ -18,7 +18,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 BUILD_CACHE = None
-MACOS = {'python-installer-regression.py', 'python-runtime-lock-regression.py',
+MACOS = {'python-background-auth-regression.py', 'python-installer-regression.py', 'python-runtime-lock-regression.py',
          'python-authority-regression.py', 'python-state-cutover-regression.py',
          'python-config-regression.py', 'python-config-cli-regression.py',
          'python-config-migration-regression.py', 'python-feature-pruning-regression.py',

@@ -370,6 +370,8 @@ class QuotaCollector:
                 result.stderr,
             )
             reason = reason_match.group(1).decode() if reason_match else "runtime_unavailable"
+            if provider == 'antigravity' and reason == 'auth_required':
+                self._antigravity_auth_required = True
             self.logger("quota %s: native /usage failed (%s)" % (provider, reason))
             return None
         raw = _bytes_json(result.stdout)
@@ -386,6 +388,9 @@ class QuotaCollector:
         return self._native_codex() if provider == "codex" else self._native_helper(provider)
 
     def _codexbar(self, provider: str) -> Optional[ProviderQuota]:
+        if provider == 'antigravity' and getattr(self, '_antigravity_auth_required', False):
+            self.logger('quota antigravity: auth_required; defer repeated CLI authentication until next check')
+            return None
         from quota_sentinel.platform.paths import resolve_launcher
         try:prefix=resolve_launcher('codexbar',explicit=self.codexbar_bin)
         except ValueError:return None
@@ -401,6 +406,13 @@ class QuotaCollector:
         for source in sources:
             command = [*prefix, "usage", "--provider", names.get(provider, provider),
                        "--source", source, "--format", "json", "--json-only", "--no-color"]
+            if provider == 'antigravity':
+                from quota_sentinel.platform.background_auth import no_browser_command
+                try:
+                    command = no_browser_command(command)
+                except ValueError:
+                    self.logger('quota antigravity: background_auth_guard_unavailable')
+                    return None
             result = _run_bounded(command, timeout, self.codexbar_kill_grace, environment=self.environment)
             if result.timed_out:
                 self.logger("quota %s: codexbar-live TIMEOUT after %ss (source %s)" % (provider, timeout, source))
@@ -433,6 +445,7 @@ class QuotaCollector:
         if purpose not in ("display", "schedule"):
             raise ValueError("unknown quota purpose")
         readings: Dict[str, QuotaReading] = {}
+        self._antigravity_auth_required = False
         for provider in self.providers:
             quota = None
             selected = None

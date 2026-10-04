@@ -30,12 +30,21 @@ def run_bounded(command, cwd, timeout, max_bytes):
     from quota_sentinel.platform.paths import resolve_launcher
     try:
         prefix=resolve_launcher('agy',explicit=command[0])
-        result=run_owned((*prefix,*command[1:]),cwd=cwd,environment=os.environ,
-            timeout=timeout,kill_grace=1,max_bytes=max_bytes)
+        guarded = [*prefix, *command[1:]]
+        from contextlib import nullcontext
+        from quota_sentinel.platform.background_auth import AgyAuthGuard, agy_background_command
+        # This caller owns the log even if the wrapper is killed by pipe limits.
+        with AgyAuthGuard() if command[1:] != ['--version'] else nullcontext() as guard:
+            if guard is not None:
+                guarded = agy_background_command(guarded, timeout=timeout, kill_grace=.2, log_path=guard.log)
+            extra = 1 if guard is not None and guard.active else 0
+            result=run_owned(guarded,cwd=cwd,environment=os.environ,
+                timeout=timeout+extra,kill_grace=1,max_bytes=max_bytes)
     except QuotaError:raise
     except (OSError,ValueError):raise QuotaError('command_unavailable') from None
-    if result.timed_out or result.returncode==28:raise QuotaError('command_timeout')
+    if result.timed_out or result.returncode in (28,124):raise QuotaError('command_timeout')
     if result.returncode==125:raise QuotaError('output_too_large')
+    if result.returncode==78:raise QuotaError('auth_required')
     if result.returncode:raise QuotaError('command_failed')
     return result.stdout
 
