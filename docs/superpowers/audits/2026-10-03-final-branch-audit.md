@@ -2,6 +2,8 @@
 
 The approved configuration, Pi metadata and platform plans are implemented on `codex/modular-platforms`. The sole fresh reviewer checked `0a382f2..b1b67c5` and found 15 actual defects (P1 × 1, P2 × 10, P3 × 4). Every finding entered one implementer fix pass; no second reviewer or DSH was used. This record preserves the original findings below, followed by fix evidence and all implementation rulings. The original readiness verdict describes the **reviewed baseline**, before these corrections.
 
+This is the historical implementation audit. The subsequent [native platform release audit](2026-10-04-native-platform-release-audit.md) records additional fixes, actual Windows 11/Linux execution and the frozen release evidence; its platform results supersede the native UNVERIFIED status recorded here.
+
 ## Fix evidence
 
 Every named regression failed on the unfixed implementation before its fix passed. The first complete fix pass passed **49/49** scripts with required current-macOS native gates. Integration then caught and fixed integer overflow in malformed environment counts, app counts and installed stop metadata, with additional observed RED→GREEN cases. Final frozen-revision evidence and sanitized logs are local artifacts under `.zcode/audits/`; run the command below to recreate the report on another host.
@@ -29,7 +31,7 @@ Every named regression failed on the unfixed implementation before its fix passe
 .venv/bin/python tests/run-regressions.py --platform current --require-native --report .zcode/audits/final-macos-report.json --log-dir .zcode/audits/final-suite
 ```
 
-These results cover the current Mac and platform-independent fixtures. Windows 11 and Ubuntu native files/processes/stores/services remain **UNVERIFIED**; Windows API fixtures are not native proof. Supplier smoke is **NOT RUN**. Existing personal configuration and running services were preserved, and no supplier/model request, main integration or remote push was performed. No optional polish findings were deferred.
+At this audit's implementation stage, these results covered the current Mac and platform-independent fixtures. Windows 11 and Ubuntu native files/processes/stores/services were **UNVERIFIED**; Windows API fixtures were not native proof. Supplier smoke was **NOT RUN**. Existing personal configuration and running services were preserved, and no supplier/model request, main integration or remote push was performed at that stage. No optional polish findings were deferred.
 
 Stop/remove read bounded owned installed metadata; absent/corrupt metadata uses a conservative 300-second cleanup timeout. They never infer or repair scheduler authority. Install/start retain strict profile/authority checks. A disabled listener usage command does not acquire its client/credential dependencies.
 

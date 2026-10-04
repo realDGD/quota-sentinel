@@ -4,16 +4,20 @@ This branch supplies core adapters for macOS, Linux and Windows. A passed fixtur
 
 ## Recorded evidence
 
-| Capability | Current macOS | Ubuntu 22.04 / 24.04 | Windows 11 |
-| --- | --- | --- | --- |
-| Core selection, installed wheel, metadata helpers | Local fixtures pass | UNVERIFIED on a native Ubuntu host | UNVERIFIED on Windows 11 |
-| Process timeout, owned children, pipe limits | Native POSIX fixtures pass | UNVERIFIED native cleanup | UNVERIFIED native Job Objects |
-| Lock exclusion and crash recovery | Native shlock and FD fixtures pass | UNVERIFIED native FD recovery | UNVERIFIED native file-range recovery |
-| Private files and task history | Native owner/mode checks pass | UNVERIFIED native publication | UNVERIFIED DACL inheritance/WAL/SHM |
-| Password store | Synthetic Keychain write/read/update/delete pass | UNVERIFIED Secret Service/KWallet | UNVERIFIED Credential Manager/session |
-| Background lifecycle | Temporary LaunchAgent install/start/stop/remove and child cleanup pass | UNVERIFIED systemd user lifecycle | UNVERIFIED Task Scheduler lifecycle |
+| Capability | macOS 27.0.1 | Ubuntu 26.04.1 / GNOME | Fedora 43 Server | Windows 11 build 26200 |
+| --- | --- | --- | --- | --- |
+| Core selection, installed wheel, metadata helpers | PASS | PASS | PASS | PASS |
+| Process timeout, owned children, pipe limits | Native POSIX PASS | Native POSIX PASS | Native POSIX PASS | Native Job Objects PASS |
+| Lock exclusion and crash recovery | Native shlock and FD PASS | Native FD PASS | Native FD PASS | Native file-range PASS |
+| Private files and task history | Native owner/mode PASS | Native publication PASS | Native publication PASS | Native DACL/WAL/SHM PASS |
+| Password store | Synthetic Keychain PASS | Synthetic Secret Service PASS; KWallet UNVERIFIED | Explicit file backend PASS; desktop stores unavailable | Synthetic Credential Manager PASS in interactive user session |
+| Background lifecycle | Temporary LaunchAgent PASS | Temporary systemd user unit PASS | Temporary systemd user unit PASS | Temporary same-user Task Scheduler entry PASS |
 
-The local Mac evidence includes 49/49 regression scripts on `6a61383`, Python 3.14.7; stdlib imports also use the system Python gate. GitHub Actions has been enabled and run on Ubuntu 22.04/24.04, macOS 14 and Windows Server 2022 with Python 3.9/3.13. Initial runs found fixture portability and Windows runtime issues, so those runs are not passing support evidence. Synthetic Linux Secret Service gates passed. The latest complete workflow result must be checked before release. Hosted Windows Server results never count as Windows 11 results.
+The frozen runtime/test tree in commit `668fb320f8a1e78571875283b15eb5b5f05454e7` passed **49/49** scripts on Mac Python 3.14.7 and **26/26** on each actual Windows 11 Python 3.9.25/3.13.15 environment, with all required native gates and no UNVERIFIED result. Windows native runs used the current user's least-privilege InteractiveToken; a plain SSH network logon cannot access that user's Credential Manager and is not counted as verification.
+
+Ubuntu and Fedora full runs used Python 3.9.25/3.13.16: **39/39** applicable scripts per Ubuntu version and **38/38** per Fedora version, plus Fedora's explicit private-file credential roundtrip. These full Linux reports belong to the earlier frozen tree `e0d92902d912e8590b8461d301140c9cf486953e`. Linux production code and native gate scripts are byte-identical in `668fb32`; its changed portable credential/packaged fixtures and owned-process regression also passed on both versions on both Linux hosts (12 script executions). The earlier full reports are not relabeled as new-tree full runs. All native stores and services used isolated synthetic state. See the [release audit](superpowers/audits/2026-10-04-native-platform-release-audit.md) for the evidence scope.
+
+GitHub Actions covers Ubuntu 22.04/24.04, macOS 14 and Windows Server 2022 with Python 3.9/3.13. Those hosted environments are separate from the manual native environments above. Initial failing runs are diagnostic evidence; release requires every applicable check on the latest PR HEAD to pass. Hosted Windows Server results never count as Windows 11 results. Supplier-authenticated opening and live quota smoke remain **NOT RUN**.
 
 ## Installation and choosing components
 
