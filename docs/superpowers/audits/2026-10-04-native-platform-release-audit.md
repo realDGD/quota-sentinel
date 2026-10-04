@@ -32,6 +32,10 @@ Mac and Windows full results bind to tree `172974ca794d6977a0e551813c60c00a35297
 
 Windows native execution used a same-user least-privilege interactive task. Credential Manager is unavailable under a plain SSH network logon; that limitation was diagnosed and not converted into a passing skipped gate. Logged-out background operation remains unsupported. Test tasks and processes were removed after execution. Fedora had no desktop Secret Service/KWallet; its explicitly selected file backend was verified instead, without automatic plaintext fallback. KWallet remains unverified. Supplier-authenticated smoke remains **NOT RUN**.
 
+### Hosted Windows task-reader follow-up
+
+The first published release workflows passed their other applicable jobs but failed the Windows Server task lifecycle reader. The synthetic task had already started its host; diagnostic phase markers showed the PowerShell reader stalled at `New-Object` before returning the COM object. The reader now activates that same native Task Scheduler COM object directly through .NET, with module autoload explicitly disabled. `New-Object` is a [PowerShell Utility module cmdlet](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/new-object); the status reader does not need that module dependency. The ten-second read limit, single-instance check, replacement GUID assertion and stop/remove verification are retained. The updated lifecycle gate passes on actual Windows 11 Python 3.9/3.13. This follow-up changes the Windows fixture and documentation only; production runtime bytes remain those of `668fb32`. Hosted CI must still confirm the fix on the latest HEAD before integration.
+
 ## Publication checks and integration gate
 
 - Staged changes: no secret scanner finding. Complete all-ref history: only a verified synthetic test credential match, no unexpected finding. The previously removed private blob remains unreachable.

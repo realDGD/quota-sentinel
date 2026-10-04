@@ -87,8 +87,12 @@ class Native(unittest.TestCase):
   # Explicit Windows PowerShell avoids whichever pwsh alias the user selects.
   # This read addresses only the unique synthetic task created below.
   powershell=Path(os.environ['SYSTEMROOT'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
-  script=("$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('query:startup'); "
-          "$ownedService=New-Object -ComObject Schedule.Service; [Console]::Error.WriteLine('query:created'); "
+  # The reader needs no PowerShell modules. Creating the COM object directly
+  # avoids New-Object's module autoload in a stripped CI environment.
+  script=("$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; "
+          "[Console]::Error.WriteLine('query:startup'); "
+          "$ownedType=[type]::GetTypeFromProgID('Schedule.Service'); [Console]::Error.WriteLine('query:resolved'); "
+          "$ownedService=[Activator]::CreateInstance($ownedType); [Console]::Error.WriteLine('query:created'); "
           "$ownedService.Connect(); [Console]::Error.WriteLine('query:connected'); "
           "$ownedTask=$ownedService.GetFolder('\\').GetTask('"+name+"'); [Console]::Error.WriteLine('query:task'); "
           "$ownedInstances=$ownedTask.GetInstances(0); [Console]::Error.WriteLine('query:instances'); "
