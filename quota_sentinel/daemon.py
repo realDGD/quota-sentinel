@@ -134,5 +134,7 @@ def run_selected_host(config, plan, state_dir, config_path, *, activation_snapsh
             return FeishuListener(config, state_dir, applied_path, scheduler,
                                   activation_journal=activation_journal)
 
-        return serve(config, plan, scheduler_factory=scheduler_factory,
-                     listener_factory=listener_factory)
+        from quota_sentinel.diagnostics.browser import BrowserObserver
+        with BrowserObserver(state_dir / 'diagnostics'):
+            return serve(config, plan, scheduler_factory=scheduler_factory,
+                         listener_factory=listener_factory)

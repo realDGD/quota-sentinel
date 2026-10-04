@@ -33,13 +33,17 @@ def run_bounded(command, cwd, timeout, max_bytes):
         guarded = [*prefix, *command[1:]]
         from contextlib import nullcontext
         from quota_sentinel.platform.background_auth import AgyAuthGuard, agy_background_command
+        from quota_sentinel.diagnostics.trace import invocation
         # This caller owns the log even if the wrapper is killed by pipe limits.
-        with AgyAuthGuard() if command[1:] != ['--version'] else nullcontext() as guard:
-            if guard is not None:
-                guarded = agy_background_command(guarded, timeout=timeout, kill_grace=.2, log_path=guard.log)
-            extra = 1 if guard is not None and guard.active else 0
-            result=run_owned(guarded,cwd=cwd,environment=os.environ,
-                timeout=timeout+extra,kill_grace=1,max_bytes=max_bytes)
+        kind = 'agy-version' if command[1:] == ['--version'] else 'agy-usage'
+        with invocation(kind, environment=os.environ, requested_executable=str(prefix[0])) as audit:
+            with AgyAuthGuard() if command[1:] != ['--version'] else nullcontext() as guard:
+                if guard is not None:
+                    guarded = agy_background_command(guarded, timeout=timeout, kill_grace=.2, log_path=guard.log)
+                extra = 1 if guard is not None and guard.active else 0
+                result=run_owned(guarded,cwd=cwd,environment=audit.environment,
+                    timeout=timeout+extra,kill_grace=1,max_bytes=max_bytes)
+            audit.finish(exit_code=result.returncode)
     except QuotaError:raise
     except (OSError,ValueError):raise QuotaError('command_unavailable') from None
     if result.timed_out or result.returncode in (28,124):raise QuotaError('command_timeout')

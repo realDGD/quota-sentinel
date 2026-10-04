@@ -48,6 +48,7 @@ class AgyAuthGuard:
         self._tail = b''
         self._next_read = 0
         self.log = None if log_path is None else Path(log_path)
+        self.auth_marker = None
 
     def __enter__(self):
         if self.active:
@@ -87,12 +88,14 @@ class AgyAuthGuard:
                     self._offset = stream.tell()
                     data = self._tail + chunk
                     self._tail = data[-256:]
-                    if any(marker in data for marker in (
-                        b'Print mode: silent auth failed',
-                        b'Print mode: triggering interactive OAuth',
-                        b'Starting OAuth authentication flow',
-                    )):
-                        return True
+                    for marker, name in (
+                        (b'Print mode: silent auth failed', 'silent_auth_failed'),
+                        (b'Print mode: triggering interactive OAuth', 'interactive_oauth'),
+                        (b'Starting OAuth authentication flow', 'oauth_started'),
+                    ):
+                        if marker in data:
+                            self.auth_marker = name
+                            return True
                     if not force or not chunk:
                         return False
         except FileNotFoundError:

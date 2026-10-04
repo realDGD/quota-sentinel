@@ -111,15 +111,28 @@ def main():
 
     from contextlib import nullcontext
     from quota_sentinel.platform.background_auth import AgyAuthGuard
+    from quota_sentinel.diagnostics.trace import Invocation
+    kind = 'agy-usage' if '/usage' in command else 'agy-agents' if '/agents' in command else 'agy-model'
+    audit = Invocation(kind, os.environ, reuse=True) if guarded else None
+    code = SPAWN_ERROR_EXIT
     try:
         with AgyAuthGuard(log_path) if guarded else nullcontext() as guard:
-            return execute(command, timeout, grace, guard)
+            code = execute(command, timeout, grace, guard, audit)
+            return code
     except (ValueError, OSError):
+        if audit is not None:
+            audit.note('guard_unavailable', reason='background_auth_guard_unavailable')
         fail('background_auth_guard_unavailable')
         return SPAWN_ERROR_EXIT
+    finally:
+        if audit is not None:
+            audit.note('wrapper_finished', exit_code=code)
 
 
-def execute(command, timeout, grace, guard):
+def execute(command, timeout, grace, guard, audit=None):
+    from quota_sentinel.diagnostics.trace import process_identity, ancestors
+    if audit is not None:
+        audit.note('wrapper_started', ancestors=ancestors(), requested_executable=str(command[0]))
     try:
         from quota_sentinel.platform.process import spawn_owned
         from pathlib import Path
@@ -130,41 +143,64 @@ def execute(command, timeout, grace, guard):
         fail(f"could not spawn child: {exc}")
         return SPAWN_ERROR_EXIT
 
+    if audit is not None:
+        audit.note('process_started', target_pid=proc.pid, target_identity=process_identity(proc.pid))
+        if guard.active:
+            audit.note('browser_protection_enabled', target_pid=proc.pid, guard='macos-sandbox')
+    code = None
+    started = time.monotonic()
     try:
-        try:
-            if guard is not None and guard.active:
-                from quota_sentinel.platform.background_auth import AUTH_REQUIRED_EXIT
-                deadline = time.monotonic() + timeout
-                while True:
-                    if guard.auth_required():
-                        proc.stop(min(grace, 1))
-                        fail('background authentication required; browser launch blocked')
-                        return AUTH_REQUIRED_EXIT
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise subprocess.TimeoutExpired('background agy', timeout)
-                    try:
-                        exit_code = proc.wait(timeout=min(.05, remaining))
-                        if guard.auth_required(force=True):
-                            fail('background authentication required; browser launch blocked')
-                            return AUTH_REQUIRED_EXIT
-                        return exit_code
-                    except subprocess.TimeoutExpired:
-                        pass
-            return proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if guard is not None and guard.active:
-                proc.stop(grace)
-                fail('background agy timed out')
-                return TIMEOUT_EXIT
-            operation = 'owned Job terminated' if os.name == 'nt' else 'SIGTERM sent to owned process groups'
-            fail(f"timed out after {timeout:g}s; {operation}")
-            proc.stop(grace)
-            if os.name != 'nt':
-                fail(f"SIGKILL cleanup completed after waiting up to {grace:g}s grace")
-            return TIMEOUT_EXIT
+        code = wait_command(proc, timeout, grace, guard, audit)
+        return code
     finally:
         proc.close()
+        if audit is not None:
+            audit.note('process_finished', target_pid=proc.pid, exit_code=code,
+                       elapsed=round(time.monotonic()-started, 3))
+
+
+def wait_command(proc, timeout, grace, guard, audit):
+    from quota_sentinel.diagnostics.trace import process_identity
+    try:
+        if guard is not None and guard.active:
+            from quota_sentinel.platform.background_auth import AUTH_REQUIRED_EXIT
+            deadline = time.monotonic() + timeout
+            while True:
+                if guard.auth_required():
+                    if audit is not None:
+                        audit.note('auth_required', target_pid=proc.pid,
+                            marker=guard.auth_marker, target_identity=process_identity(proc.pid),
+                            action='abort-interactive-auth', guard='macos-sandbox')
+                    proc.stop(min(grace, 1))
+                    fail('background authentication required; browser launch blocked')
+                    return AUTH_REQUIRED_EXIT
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired('background agy', timeout)
+                try:
+                    exit_code = proc.wait(timeout=min(.05, remaining))
+                    if guard.auth_required(force=True):
+                        if audit is not None:
+                            audit.note('auth_required', target_pid=proc.pid,
+                                marker=guard.auth_marker, target_identity=process_identity(proc.pid),
+                                action='abort-interactive-auth', guard='macos-sandbox')
+                        fail('background authentication required; browser launch blocked')
+                        return AUTH_REQUIRED_EXIT
+                    return exit_code
+                except subprocess.TimeoutExpired:
+                    pass
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if guard is not None and guard.active:
+            proc.stop(grace)
+            fail('background agy timed out')
+            return TIMEOUT_EXIT
+        operation = 'owned Job terminated' if os.name == 'nt' else 'SIGTERM sent to owned process groups'
+        fail(f"timed out after {timeout:g}s; {operation}")
+        proc.stop(grace)
+        if os.name != 'nt':
+            fail(f"SIGKILL cleanup completed after waiting up to {grace:g}s grace")
+        return TIMEOUT_EXIT
 
 
 if __name__ == "__main__":

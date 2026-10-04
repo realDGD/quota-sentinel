@@ -162,6 +162,10 @@ class BackgroundAuthTests(unittest.TestCase):
         self.assertEqual(second.tier, Tier.NATIVE)
         self.assertTrue(second.fresh)
         self.assertFalse(marker.exists())
+        from quota_sentinel.diagnostics.trace import TraceJournal
+        events = TraceJournal(self.root/'state'/'diagnostics').records()
+        self.assertTrue(any(event['event']=='quota_fallback_skipped' for event in events))
+        self.assertTrue(any(event['event']=='auth_recovered' for event in events))
 
 
 if __name__ == '__main__':

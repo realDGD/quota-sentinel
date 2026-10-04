@@ -80,6 +80,16 @@ class PosixProcess:
                 continue
             for child in _children(pid):
                 if child not in seen:pending.append(child)
+                evidence=getattr(self,'_trace_children',None)
+                if evidence is not None and child not in self._known:
+                    from quota_sentinel.diagnostics.trace import process_identity
+                    identity=process_identity(child)
+                    if identity['identity_known'] and identity['ppid']==pid:
+                        if len(evidence)<8:
+                            identity['observed_at']=time.time()
+                            evidence[child]=identity
+                        else:
+                            self._trace_children_dropped += 1
                 self._known[child]=_stamp(child)
                 try:
                     group = os.getpgid(child)

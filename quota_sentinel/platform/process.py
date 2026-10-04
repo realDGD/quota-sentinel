@@ -35,9 +35,12 @@ def spawn_owned(argv, *, cwd, environment, stdin=None, stdout=None, stderr=None)
     command = [str(x) for x in argv]
     if os.name=='nt':
         from .windows_process import WindowsProcess
-        return WindowsProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
-    from .posix_process import PosixProcess
-    return PosixProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+        process=WindowsProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+    else:
+        from .posix_process import PosixProcess
+        process=PosixProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+    from quota_sentinel.diagnostics.trace import trace_owned_process
+    return trace_owned_process(process, command, environment)
 
 
 def run_bounded(argv, *, cwd, environment, input_data=None, timeout, kill_grace, max_bytes=1048576, discard_stdout=False):
