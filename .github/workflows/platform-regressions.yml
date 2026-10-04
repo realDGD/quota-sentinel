@@ -1,0 +1,125 @@
+name: Platform regressions
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+    inputs:
+      windows11:
+        description: Run the explicitly configured native Windows 11 runner
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  fixtures:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14, windows-2022]
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - name: Core and selected listener dependencies
+        run: uv sync --locked --extra feishu
+      - name: Bootstrap public pinned build tools (runtime remains offline)
+        run: uv --no-config build --wheel --out-dir .ci-build
+      - name: Portable fixtures, installed wheel and stdlib core
+        run: uv run --frozen --no-sync python tests/run-regressions.py --platform current --report .ci-logs/portable.json --log-dir .ci-logs/portable
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixtures-${{ matrix.os }}-${{ matrix.python }}
+          include-hidden-files: true
+          path: .ci-logs
+  linux-secret-service:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Explicit synthetic D-Bus and password service
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring
+          uv sync --locked --extra secret-service
+          mkdir -p .ci-logs
+          dbus-run-session -- bash -euo pipefail -c '
+            export HOME="$(mktemp -d)"
+            export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+            printf "synthetic-test-only\n" | gnome-keyring-daemon --unlock --components=secrets
+            export QUOTA_SENTINEL_TEST_LINUX_CREDENTIAL_BACKEND=secret-service
+            .venv/bin/python tests/python-credentials-native-linux-regression.py > .ci-logs/native-secret-service.log 2>&1
+          '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: password-service-${{ matrix.os }}-${{ matrix.python }}
+          include-hidden-files: true
+          path: .ci-logs
+  macos-native:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra feishu
+      - run: uv --no-config build --wheel --out-dir .ci-build
+      - name: Ephemeral runner Keychain (synthetic values only)
+        run: |
+          security create-keychain -p synthetic-test-only "$RUNNER_TEMP/quota-test.keychain"
+          security default-keychain -s "$RUNNER_TEMP/quota-test.keychain"
+          security unlock-keychain -p synthetic-test-only "$RUNNER_TEMP/quota-test.keychain"
+      - run: uv run --frozen --no-sync python tests/run-regressions.py --platform current --require-native --report .ci-logs/native.json --log-dir .ci-logs/native
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-native-${{ matrix.python }}
+          include-hidden-files: true
+          path: .ci-logs
+  windows11-native:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows11
+    runs-on: [self-hosted, Windows, quota-sentinel-win11]
+    strategy:
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra feishu
+      - run: uv --no-config build --wheel --out-dir .ci-build
+      - run: uv run --frozen --no-sync python tests/run-regressions.py --platform current --require-native --require-windows11 --report .ci-logs/native.json --log-dir .ci-logs/native
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows11-native-${{ matrix.python }}
+          include-hidden-files: true
+          path: .ci-logs

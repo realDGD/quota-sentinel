@@ -1,0 +1,32 @@
+[project]
+name = "quota-sentinel"
+version = "0.1.0"
+description = "Configurable local AI quota scheduler with optional Feishu notifications"
+requires-python = ">=3.9"
+dependencies = ["tzdata; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+feishu = ["lark-oapi>=1.4.0"]
+secret-service = [
+  "secretstorage>=3.3.3,<3.4; sys_platform == 'linux' and python_version < '3.10'",
+  "secretstorage>=3.4,<4; sys_platform == 'linux' and python_version >= '3.10'",
+]
+kwallet = ["dbus-python>=1.3.2,<2; sys_platform == 'linux'"]
+
+[project.scripts]
+quota-sentinel = "quota_sentinel.__main__:main"
+
+[build-system]
+# Exact-pinned: uv does NOT record build-system requires in uv.lock, so
+# the editable build would otherwise float a fresh hatchling resolve on
+# every sync. Python 3.9 uses the last compatible pinned line; modern Python
+# retains the already validated build backend.
+requires = [
+  "hatchling==1.27.0; python_version < '3.10'",
+  "hatchling==1.32.4; python_version >= '3.10'",
+]
+build-backend = "hatchling.build"
+
+# Package implementations and helper resources; root scripts preserve source entry names.
+[tool.hatch.build.targets.wheel]
+packages = ["quota_sentinel"]

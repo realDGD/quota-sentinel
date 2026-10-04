@@ -7,11 +7,13 @@ Covers the M-series contract:
   M3 timeout -> SIGTERM to the process group -> exits within grace
   M4 TERM-ignoring child -> SIGKILL escalation after grace
   M5 grandchildren in the group are reaped (no orphans)
+  M6 a TERM-exiting parent cannot leave a TERM-ignoring grandchild
  plus helper-hygiene checks: stdout stays 100% child-owned, diagnostics never
  echo the command line, misuse exits 125, unspawnable children exit 127.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,10 +30,8 @@ PY = sys.executable
 class RunWithTimeoutTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def run_helper(self, *args, timeout=60):
         return subprocess.run(
@@ -86,30 +86,82 @@ class RunWithTimeoutTest(unittest.TestCase):
     def test_m5_no_orphan_grandchildren(self):
         pid_file = self.dir / "child.pid"
         script = self.write_script(
-            "parent.sh",
-            f"""\
-            #!/bin/zsh
-            {PY} -c 'import os,time,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)' {pid_file} &
-            sleep 30
+            "parent.py",
+            """\
+            import subprocess, sys, time
+            subprocess.Popen([
+                sys.executable, '-c',
+                'import os,time,pathlib,sys; '
+                'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)',
+                sys.argv[1],
+            ])
+            time.sleep(30)
             """,
         )
-        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", script)
+        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", PY, script, str(pid_file))
         self.assertEqual(res.returncode, 124)
         child_pid = int(pid_file.read_text().strip())
         time.sleep(0.2)
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)  # grandchild must be gone with the group
 
-    def test_stdout_is_child_owned_even_on_timeout(self):
+    def test_m6_term_exiting_parent_leaves_no_term_ignoring_grandchild(self):
+        parent_file = self.dir / "parent.pid"
+        child_file = self.dir / "stubborn-child.pid"
         script = self.write_script(
-            "chatty.sh",
+            "term_exiting_parent.py",
             """\
-            #!/bin/zsh
-            print -r -- "SUPERSECRETFLAG-marker"
-            sleep 30
+            import os, signal, subprocess, sys, time
+            from pathlib import Path
+            Path(sys.argv[1]).write_text(str(os.getpid()))
+            subprocess.Popen(
+                [sys.executable, '-c',
+                 'import os,signal,sys,time; '
+                 'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                 'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)',
+                 sys.argv[2]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            while not Path(sys.argv[2]).exists():
+                time.sleep(0.01)
+            time.sleep(30)
             """,
         )
-        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", script)
+
+        def cleanup_group():
+            if parent_file.exists():
+                try:
+                    os.killpg(int(parent_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(cleanup_group)
+        result = self.run_helper(
+            "--timeout", "1", "--kill-grace", "1", "--", PY, script,
+            str(parent_file), str(child_file), timeout=5,
+        )
+        self.assertEqual(result.returncode, 124)
+        child_pid = int(child_file.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("grandchild survived after its parent exited on SIGTERM")
+
+    def test_stdout_is_child_owned_even_on_timeout(self):
+        script = self.write_script(
+            "chatty.py",
+            """\
+            import time
+            print("SUPERSECRETFLAG-marker", flush=True)
+            time.sleep(30)
+            """,
+        )
+        res = self.run_helper("--timeout", "1", "--kill-grace", "1", "--", PY, script)
         self.assertEqual(res.returncode, 124)
         # Child stdout reached the caller untouched; the diagnostic (which must
         # not echo the command) went to stderr only.

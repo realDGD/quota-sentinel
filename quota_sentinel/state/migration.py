@@ -1,0 +1,118 @@
+"""Bootstrap migration: legacy per-slot files -> v1 JSON documents (Phase 2).
+
+Ownership reality during Phase 2: the shell's per-slot files remain the
+AUTHORITATIVE runtime state; JSON documents are SHADOW snapshots created
+by this module. Consequences, by design:
+
+* seed-if-absent, never overwrite. If ``<provider>-state.json`` exists,
+  it WINS — legacy slot files are ignored even if fresher. Re-seeding or
+  syncing shadow content is a cutover-phase decision, not a bootstrap
+  side effect; a rerun of migrate() is a no-op (idempotent by rule).
+* the publish is atomic at the syscall level (link(2)/EEXIST), mirroring
+  the shell's seed_provider_state_file: a migration racing a JSON writer
+  can only skip, never clobber.
+* legacy interpretation is FileStateStore's job — this module parses no
+  slot files itself. Whatever FileStateStore.load() reads (including
+  unset-on-garbage degradation) is what gets serialized; corrupt legacy
+  content is never "repaired" here or on disk.
+* legacy slot files are left fully untouched: no move, no delete, no
+  truncate. Rollback is therefore automatic (just stop reading JSON).
+* directory creation/chmod happens HERE (bootstrap write path), never
+  inside any load().
+"""
+from __future__ import annotations
+
+import os
+import uuid
+from pathlib import Path
+from typing import Dict, Optional, Sequence, Tuple
+
+from .json_store import JsonStateStore
+from .schema import serialize_state
+from .store import FileStateStore, StateStoreError
+
+# The provider roster the retired shell also declared, extended with ClinePass
+# (which the shell never knew). The parity regression asserts this roster
+# against the real shell array plus the providers the port added; it must stay
+# equal to `quota.adapters.PROVIDERS`.
+DEFAULT_PROVIDERS: Tuple[str, ...] = ("codex", "antigravity", "opencode", "clinepass")
+
+ACTION_SEEDED = "seeded"
+ACTION_EXISTS = "json-exists"
+
+
+def seed_document_if_absent(json_path: Path, payload: bytes) -> bool:
+    """Publish FINAL bytes only when no document exists.
+
+    Returns True when this call seeded the document, False when a
+    document already existed (ours was dropped). link(2) makes the
+    existence test and the creation one atomic act — no check-then-write
+    window against a concurrent writer. A UUID name plus an exclusive native
+    open prevents a seed from replacing another caller's temporary file;
+    private access and an explicit owner are fixed before writing bytes.
+    """
+    from quota_sentinel.platform.files import private_open
+    temp_name = json_path.with_name(json_path.name + '.tmp.' + uuid.uuid4().hex + '.seed')
+    seeded: bool
+    created=False
+    try:
+        with private_open(temp_name, "xb") as handle:
+            created=True
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_name, json_path)
+            seeded = True
+        except FileExistsError:
+            seeded = False
+        except OSError as exc:
+            raise StateStoreError(
+                f"failed to seed state document {json_path}: {exc}"
+            ) from exc
+    except OSError as exc:
+        raise StateStoreError(f"failed to create seed temp near {json_path}: {exc}") from exc
+    finally:
+        if created:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+    return seeded
+
+
+def migrate_provider(state_dir: Path, provider: str) -> str:
+    """Materialize <provider>-state.json from current legacy slot state.
+
+    Returns ACTION_SEEDED or ACTION_EXISTS. Raises StateStoreError when
+    the interpreted legacy state cannot be serialized into a valid v1
+    document (pathological content FileStateStore could read but the
+    document schema refuses) — loudly, creating nothing.
+    """
+    json_store = JsonStateStore(state_dir)
+    json_path = json_store.document_path(provider)
+
+    if json_path.exists():
+        return ACTION_EXISTS
+
+    # Pure reads only up to this point (load never creates/repairs).
+    legacy_state = FileStateStore(state_dir).load(provider)
+    payload = serialize_state(legacy_state, provider)  # full preflight
+
+    try:
+        from quota_sentinel.platform.files import private_directory
+        private_directory(state_dir)
+    except OSError as exc:
+        raise StateStoreError(
+            f"cannot prepare state dir {state_dir}: {exc}"
+        ) from exc
+
+    return ACTION_SEEDED if seed_document_if_absent(json_path, payload) else ACTION_EXISTS
+
+
+def migrate_all(
+    state_dir: Path, providers: Optional[Sequence[str]] = None
+) -> Dict[str, str]:
+    roster: Sequence[str] = providers if providers else DEFAULT_PROVIDERS
+    return {provider: migrate_provider(Path(state_dir), provider)
+            for provider in roster}

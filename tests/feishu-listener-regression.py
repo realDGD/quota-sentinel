@@ -1,8 +1,7 @@
-# /// script
-# dependencies = [
-#   "lark-oapi>=1.4.0",
-# ]
-# ///
+# Runs in the PROJECT uv environment (needs lark-oapi, provided by
+# pyproject.toml): `uv run --frozen --no-sync python
+# tests/feishu-listener-regression.py`. No PEP 723 block — the project
+# lock is the single dependency source of truth.
 
 import json
 import os
@@ -110,14 +109,17 @@ class TestFeishuListener(unittest.TestCase):
 
         mock_handler.assert_not_called()
 
-    @patch("feishu_listener.subprocess.Popen")
+    @patch("quota_sentinel.platform.process.capture_owned")
+    @patch("quota_sentinel.platform.process.spawn_owned")
     def test_usage_is_recorded_by_orchestrator_without_changing_command(
-        self, mock_popen
+        self, mock_popen, mock_capture
     ):
         process = mock_popen.return_value
         process.communicate.return_value = ("", "")
         process.returncode = 0
         process.poll.return_value = 0
+        from quota_sentinel.platform.process import CommandResult
+        mock_capture.return_value=CommandResult(b'',b'',0,False)
         orchestrator = MagicMock()
         orchestrator.run_external_task.side_effect = (
             lambda _task_name, _trigger, action: action()
@@ -130,13 +132,37 @@ class TestFeishuListener(unittest.TestCase):
         task_name, trigger, _action = orchestrator.run_external_task.call_args.args
         self.assertEqual(task_name, "usage")
         self.assertEqual(trigger, "feishu:msg-history")
-        mock_popen.assert_called_once_with(
-            ["/bin/zsh", feishu_listener.SCRIPT_PATH, "usage"],
-            stdout=feishu_listener.subprocess.PIPE,
-            stderr=feishu_listener.subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        self.assertEqual(mock_popen.call_count,1)
+        self.assertEqual(mock_popen.call_args.args[0],list(feishu_listener.USAGE_COMMAND))
+        self.assertEqual(mock_popen.call_args.kwargs['stdout'],feishu_listener.subprocess.PIPE)
+        self.assertEqual(mock_popen.call_args.kwargs['stderr'],feishu_listener.subprocess.PIPE)
+        self.assertIs(mock_capture.call_args.args[0],process)
+
+    def test_a_wedged_keychain_read_cannot_hold_daemon_startup(self):
+        """`security` is an external process like any other: it is bounded.
+
+        Without the bound the listener blocks in `read_keychain` before it can
+        serve anything, and a timeout has to be reported exactly like a failed
+        read (an empty credential), not raised into the daemon's start-up.
+        """
+        import tempfile
+        import time as _time
+
+        with tempfile.TemporaryDirectory(prefix="qs-listener-keychain-") as tmp:
+            security = Path(tmp) / "security"
+            security.write_text(
+                "#!%s\nimport time\nwhile True:\n    time.sleep(1)\n" % sys.executable
+            )
+            security.chmod(0o755)
+            started = _time.monotonic()
+            value = feishu_listener.read_keychain(
+                "quota-sentinel.feishu-app-id",
+                security_bin=str(security),
+                timeout=1,
+            )
+            elapsed = _time.monotonic() - started
+        self.assertEqual(value, "")
+        self.assertLess(elapsed, 5.0)
 
 
 if __name__ == "__main__":

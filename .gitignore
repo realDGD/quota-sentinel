@@ -13,17 +13,33 @@ logs/
 node_modules/
 dist/
 build/
+# This SDK's built-looking files are authored regression fixtures.
+!tests/fixtures/pi-live/fake-sdk/dist/
+!tests/fixtures/pi-live/fake-sdk/dist/**
+
+# Local CI reports and wheel output
+/.ci-logs/
+/.ci-build/
 
 # AI coding-agent session artifacts
 .zcode/
 .claude/
 .cursor/
+.superpowers/
 
 # Environment and secret files
 .env
 .env.*
 .venv/
 venv/
+# Optional files/directories for local credentials, never product fixtures.
+/auth.json
+/credentials.json
+/secrets.json
+/credentials/
+/keys/
+/*.key
+/*.pem
 
 # Editors / IDEs
 .idea/
@@ -36,12 +52,40 @@ venv/
 *.sqlite
 *.sqlite3
 *.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
 *.snapshot
+# Support an explicitly chosen repository-local state directory.
+/state/
+/.quota-sentinel/
+# Also protect runtime files if the repository root is used as state-dir.
+/config.json
+/config.activations.json
+/runtime-providers.json
+/backend-authority.json
+/lock-protocol.json
+/*-state.json
+/*-exec-profile.json
+/codexbar-*-last-success.json
+/pi-*-quota.json
+/*.slot
+/migration-evidence/
+/run.lock
+/quota.lock
+/configuration.lock
 
 # Rendered LaunchAgents — contain this machine's absolute paths.
 # The *.plist.template sources are committed; render with
 # ./install-launchagents.sh
 *.plist
+# Generated service definitions/manifests for Linux and Windows.
+/*.service
+/*.service.xml
+/*.launch.json
 
 # Pre-publication audit notes (local reference only)
 PRE-PUBLISH-AUDIT.md

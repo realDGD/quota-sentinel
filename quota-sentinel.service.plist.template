@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>quota-sentinel.service</string>
+  <key>ProgramArguments</key><array>
+    <string>__PYTHON_BIN__</string><string>-m</string><string>quota_sentinel</string>
+    <string>--state-dir</string><string>__STATE_DIR__</string>
+    <string>--config</string><string>__CONFIG_PATH__</string><string>serve</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>WorkingDirectory</key><string>/private/tmp</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>__LOG_DIR__/service.out.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/service.err.log</string>
+</dict></plist>
