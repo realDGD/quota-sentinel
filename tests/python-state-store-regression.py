@@ -30,12 +30,13 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from private_file_fixtures import assert_private_path, private_test_directory, deny_child_directory_creation, loosen_directory_access
-from quota_sentinel.platform.files import private_directory
+from quota_sentinel.platform.files import private_directory, private_open
 from quota_sentinel.platform.locks import initialize_protocol
 
 from quota_sentinel.state import (
@@ -163,23 +164,51 @@ class CommitTests(unittest.TestCase):
 
     def test_only_changed_slots_are_written(self) -> None:
         base = ProviderState(last_task_at=100, next_due_at=500, retry_pending=True)
-        write_slot(self.state_dir, "codex", "last-task-at", "100")
-        write_slot(self.state_dir, "codex", "next-due-at", "500")
-        write_slot(self.state_dir, "codex", "retry-pending", "1")
-        before = {
-            path.name: os.stat(path).st_mtime_ns
-            for path in self.state_dir.iterdir()
+        fixtures = {
+            "codex-last-task-at": b"100\n",
+            "codex-next-due-at": b"500\n",
+            "codex-retry-pending": b"1\n",
         }
+        for name, payload in fixtures.items():
+            with private_open(self.state_dir / name, "xb") as handle:
+                handle.write(payload)
         new = ProviderState(
             last_task_at=100, next_due_at=501, retry_pending=True
         )
-        self.store.commit("codex", base, new)
-        after = {
-            path.name: os.stat(path).st_mtime_ns
-            for path in self.state_dir.iterdir()
-        }
-        changed = {name for name in after if after[name] != before[name]}
-        self.assertEqual(changed, {"codex-next-due-at"})
+        with ExitStack() as stack:
+            # POSIX retains old objects across replacement. Windows snapshots
+            # then closes them because an open target can prevent replacement;
+            # the new temporary file is created while the old target exists,
+            # so their file identities must still be distinct.
+            handles = {
+                name: stack.enter_context(private_open(self.state_dir / name, "rb"))
+                for name in fixtures
+            }
+            before = {
+                name: (info.st_dev, info.st_ino)
+                for name, handle in handles.items()
+                for info in (os.fstat(handle.fileno()),)
+            }
+            if os.name == "nt":
+                for name, handle in handles.items():
+                    self.assertEqual(handle.read(), fixtures[name])
+                stack.close()
+            self.store.commit("codex", base, new)
+            after = {
+                path.name: (info.st_dev, info.st_ino)
+                for path in self.state_dir.iterdir()
+                for info in (path.stat(),)
+            }
+            self.assertEqual(set(after), set(before))
+            changed = {name for name in after if after[name] != before[name]}
+            self.assertEqual(changed, {"codex-next-due-at"})
+            if os.name != "nt":
+                for name, handle in handles.items():
+                    self.assertEqual(handle.read(), fixtures[name])
+            self.assertEqual((self.state_dir / "codex-next-due-at").read_bytes(), b"501\n")
+            self.assertEqual((self.state_dir / "codex-last-task-at").read_bytes(), b"100\n")
+            self.assertEqual((self.state_dir / "codex-retry-pending").read_bytes(), b"1\n")
+            self.assertEqual(self.store.load("codex"), new)
 
     def test_pending_true_to_false_writes_zero_not_delete(self) -> None:
         old = ProviderState(retry_pending=True)

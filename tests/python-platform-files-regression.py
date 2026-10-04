@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,6 +25,23 @@ class Files(unittest.TestCase):
    assert_private_path(self,p)
    self.files.publish_private(p,b'next')
    assert_private_path(self,p)
+ @unittest.skipIf(os.name=='nt','POSIX FIFO rejection')
+ def test_fifo_is_rejected_without_waiting_for_another_process(self):
+  repo=Path(__file__).resolve().parents[1]
+  for mode in ('rb','wb','ab'):
+   with self.subTest(mode=mode),tempfile.TemporaryDirectory() as tmp:
+    path=Path(tmp)/'invalid-state';os.mkfifo(path,0o600)
+    code=('import sys\nsys.path.insert(0,'+repr(str(repo))+')\n'
+          'from quota_sentinel.platform.files import private_open\n'
+          'try:\n handle=private_open('+repr(str(path))+','+repr(mode)+')\n'
+          'except OSError:\n print("rejected")\n'
+          'else:\n handle.close();raise SystemExit("FIFO was accepted")\n')
+    try:result=subprocess.run([sys.executable,'-c',code],capture_output=True,timeout=5)
+    except subprocess.TimeoutExpired:self.fail('opening an invalid FIFO waited for a peer')
+    self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+    self.assertEqual(result.stdout,b'rejected\n')
+    self.assertTrue(stat.S_ISFIFO(path.stat().st_mode))
+    self.assertEqual(list(Path(tmp).iterdir()),[path])
  def test_private_directory(self):
   with tempfile.TemporaryDirectory() as tmp:
    p=Path(tmp)/"owned"/"history"
@@ -103,6 +121,36 @@ class Files(unittest.TestCase):
    with patch.object(self.files.uuid,'uuid4',return_value=types.SimpleNamespace(hex='collision')):
     with self.assertRaises(FileExistsError):self.files.publish_private(p,b'new')
    self.assertEqual(p.read_bytes(),b'prior');self.assertEqual(other.read_bytes(),b'other caller')
+ def test_windows_replace_retries_short_sharing_interruptions(self):
+  for error_code in (5,32):
+   with self.subTest(error_code=error_code),tempfile.TemporaryDirectory() as tmp:
+    p=Path(tmp)/'state';p.write_bytes(b'prior');temporary=p.with_name('temporary');temporary.write_bytes(b'next');attempts=[]
+    real_replace=os.replace;error=PermissionError('synthetic sharing interruption');error.winerror=error_code
+    def interrupted_replace(source,target):
+     attempts.append((source,target));self.assertEqual(p.read_bytes(),b'prior')
+     if len(attempts)<3:raise error
+     real_replace(source,target)
+    with patch.object(os,'name','nt'),patch.object(os,'replace',side_effect=interrupted_replace),patch('time.monotonic',return_value=10),patch('time.sleep') as sleep:
+     self.files._replace_private(str(temporary),str(p))
+    self.assertEqual(len(attempts),3);self.assertEqual(sleep.call_count,2)
+    self.assertTrue(all(pair==(str(temporary),str(p)) for pair in attempts));self.assertEqual(p.read_bytes(),b'next')
+ def test_windows_replace_deadline_preserves_original_error_and_bytes(self):
+  for error_code in (5,32):
+   with self.subTest(error_code=error_code),tempfile.TemporaryDirectory() as tmp:
+    p=Path(tmp)/'state';p.write_bytes(b'prior');temporary=p.with_name('temporary');temporary.write_bytes(b'next')
+    error=PermissionError('synthetic persistent sharing error');error.winerror=error_code
+    with patch.object(os,'name','nt'),patch.object(os,'replace',side_effect=error) as replace,patch('time.monotonic',side_effect=[10,10.24,10.25]),patch('time.sleep') as sleep:
+     with self.assertRaises(PermissionError) as caught:self.files._replace_private(str(temporary),str(p))
+    self.assertIs(caught.exception,error);self.assertEqual(replace.call_count,1)
+    self.assertEqual(sleep.call_count,1);self.assertLessEqual(sleep.call_args.args[0],.01)
+    self.assertEqual(p.read_bytes(),b'prior');self.assertEqual(temporary.read_bytes(),b'next')
+ def test_replace_other_errors_and_posix_fail_immediately(self):
+  for platform,error_code in (('nt',33),('nt',None),('posix',5),('posix',32)):
+   with self.subTest(platform=platform,error_code=error_code):
+    error=PermissionError('synthetic permanent error');error.winerror=error_code
+    with patch.object(os,'name',platform),patch.object(os,'replace',side_effect=error) as replace,patch('time.sleep') as sleep:
+     with self.assertRaises(PermissionError) as caught:self.files._replace_private('temporary','state')
+    self.assertIs(caught.exception,error);self.assertEqual(replace.call_count,1);sleep.assert_not_called()
  def test_reader_observes_complete_file(self):
   with tempfile.TemporaryDirectory() as tmp:
    p=Path(tmp)/'state';first=b'a'*65536;second=b'b'*32768

@@ -17,4 +17,6 @@ def render(d,user_id,manifest):
  for tag,value in [('MultipleInstancesPolicy','IgnoreNew'),('DisallowStartIfOnBatteries','false'),('StopIfGoingOnBatteries','false'),('AllowHardTerminate','true'),('StartWhenAvailable','true'),('Enabled','true'),('ExecutionTimeLimit','PT0S')]:add(settings,tag,value)
  restart=add(settings,'RestartOnFailure');add(restart,'Interval','PT1M');add(restart,'Count',3)
  actions=add(root,'Actions',Context='User');execute=add(actions,'Exec');add(execute,'Command',d.argv[0]);add(execute,'Arguments',subprocess.list2cmdline(('-m','quota_sentinel.platform.service_host',str(manifest))));add(execute,'WorkingDirectory',d.cwd)
- return ET.tostring(root,encoding='utf-8',xml_declaration=True)
+ # schtasks imports a Unicode XML file; its UTF-8-without-BOM path may be
+ # decoded as ANSI before the declaration and fail to switch encodings.
+ return ET.tostring(root,encoding='utf-16',xml_declaration=True)

@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from private_file_fixtures import assert_private_path, private_test_directory, loosen_directory_access
-from quota_sentinel.platform.files import private_directory
+from quota_sentinel.platform.files import private_directory, private_open
 
 from quota_sentinel.state import (
     ACTION_EXISTS,
@@ -442,12 +442,12 @@ class JsonStoreTests(unittest.TestCase):
     def test_corrupt_document_is_loud_never_defaulted(self) -> None:
         # §33: whole-document corruption must fail loudly, both on load
         # and (therefore) on commit. NO silent all-unset reading.
-        self.path.write_bytes(b'{"schema_version": 1, "truncat')
+        with private_open(self.path,'wb') as handle:
+            handle.write(b'{"schema_version": 1, "truncat')
         with self.assertRaises(DocumentCorruptError):
             self.store.load("codex")
-        self.path.write_bytes(
-            json.dumps({"schema_version": 1}).encode("utf-8")
-        )
+        with private_open(self.path,'wb') as handle:
+            handle.write(json.dumps({"schema_version": 1}).encode("utf-8"))
         with self.assertRaises(SchemaError):
             self.store.load("codex")
         with self.assertRaises(StateStoreError):

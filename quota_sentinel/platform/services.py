@@ -86,9 +86,26 @@ class ServiceManager:
   try:result=self._run(('systemctl','--user','show','--property=Version','--value'),check=False)
   except (OSError,ValueError):result=None
   if result is None or result.returncode:raise ServiceError('systemd user manager unavailable; use foreground quota-sentinel serve')
+ def _linux_unit_directory(self,path):
+  # systemd/user is shared with other applications. Keep its existing modes;
+  # only our unit file is private. Refuse unsafe writable/foreign directories.
+  import stat
+  fd=None
+  try:
+   path.mkdir(parents=True,mode=0o700,exist_ok=True)
+   fd=os.open(str(path),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+   info=os.fstat(fd)
+   if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)&0o022:
+    raise ServiceError('unsafe systemd user unit directory')
+  except OSError:
+   raise ServiceError('unsafe systemd user unit directory') from None
+  finally:
+   if fd is not None:os.close(fd)
  def install(self,d):
   if self.system=='Linux':self._linux_available()
-  destination=self.path(d);private_directory(destination.parent)
+  destination=self.path(d)
+  if self.system=='Linux' and os.name!='nt':self._linux_unit_directory(destination.parent)
+  else:private_directory(destination.parent)
   if self.system=='Darwin':
    private_directory(d.cwd/'logs')
    for name in ('service.out.log','service.err.log'):

@@ -1142,6 +1142,14 @@ class DocumentIOTests(unittest.TestCase):
         write_document(self.path, self.quota)
         assert_private_path(self, self.path)
 
+    def test_write_uses_private_atomic_publish_boundary(self):
+        with mock.patch('quota_sentinel.platform.files.publish_private') as publish:
+            write_document(self.path, self.quota)
+        publish.assert_called_once_with(
+            self.path,
+            (json.dumps(self.quota.as_document(),ensure_ascii=False)+'\n').encode('utf-8'),
+        )
+
     def test_read_rejects_missing_and_corrupt_files(self):
         with self.assertRaises(QuotaNormalizationError):
             read_document(self.path)

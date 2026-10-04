@@ -32,6 +32,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -187,6 +188,45 @@ class EntrypointCase(unittest.TestCase):
                 any(l.startswith(f"next {provider} run: ") for l in lines),
                 f"no next-run line for {provider}: {lines}",
             )
+
+    def readiness_without_tools(self, system, missing, *, environment=None):
+        """Exercise the real gate with only native executable access hidden."""
+        from quota_sentinel.runtime.factory import readiness_problems
+        real_access = os.access
+
+        def access(path, mode):
+            if mode == os.X_OK and os.fspath(path) in {"/usr/bin/security", "/usr/bin/shlock"}:
+                return os.fspath(path) not in missing
+            return real_access(path, mode)
+
+        with mock.patch("platform.system", return_value=system), \
+                mock.patch("os.access", side_effect=access):
+            return readiness_problems(
+                self.state, environment=self.env if environment is None else environment,
+            )
+
+    def test_e2b_native_readiness_uses_no_macos_tools_on_linux_or_windows(self):
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system):
+                problems = self.readiness_without_tools(
+                    system, {"/usr/bin/security", "/usr/bin/shlock"},
+                )
+                self.assertEqual(problems, [])
+
+    def test_e2c_macos_readiness_still_requires_its_coordination_tool(self):
+        problems = self.readiness_without_tools("Darwin", {"/usr/bin/shlock"})
+        self.assertTrue(any("shlock is not executable" in item for item in problems), problems)
+
+    def test_e2d_macos_readiness_requires_enabled_system_credential_tool(self):
+        environment = dict(self.env, QUOTA_SENTINEL_KEYCHAIN_DISABLED="0")
+        problems = self.readiness_without_tools(
+            "Darwin", {"/usr/bin/security"}, environment=environment,
+        )
+        self.assertTrue(any("security is not executable" in item for item in problems), problems)
+
+    def test_e2e_disabled_system_credentials_require_no_security_tool(self):
+        problems = self.readiness_without_tools("Darwin", {"/usr/bin/security"})
+        self.assertEqual(problems, [])
 
     # ---- E3: refuse loudly, without leaking ------------------------------
     def test_e3_missing_credential_fails_without_echoing_the_secret(self):

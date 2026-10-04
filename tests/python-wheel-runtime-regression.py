@@ -18,12 +18,15 @@ class Wheel(unittest.TestCase):
   if not uv:raise RuntimeError('uv is required to verify the installed wheel')
   cls.environment={k:v for k,v in os.environ.items() if not k.startswith(('UV_','PIP_')) and k!='PYTHONPATH'}
   cls.environment['QUOTA_SENTINEL_KEYCHAIN_DISABLED']='1'
+  cls.environment['UV_PYTHON']=sys.executable
   cache=os.environ.get('QUOTA_SENTINEL_TEST_UV_CACHE')
   if cache:cls.environment['UV_CACHE_DIR']=cache
   built=subprocess.run([uv,'--no-config','build','--offline','--wheel','--out-dir',str(cls.root/'dist')],cwd=ROOT,env=cls.environment,capture_output=True,timeout=90)
   if built.returncode:raise AssertionError(built.stderr.decode())
   wheel=next((cls.root/'dist').glob('*.whl'))
-  venv.EnvBuilder(with_pip=False).create(cls.root/'venv')
+  # Match normal POSIX venv creation. Copying a relocated standalone 3.9
+  # executable can lose its standard-library root before wheel installation.
+  venv.EnvBuilder(with_pip=False,symlinks=os.name!='nt').create(cls.root/'venv')
   cls.python=cls.root/'venv'/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
   # Locked sync caches artifacts without necessarily caching index version
   # lists. Reuse that lock offline to provision only core dependencies in the

@@ -169,6 +169,25 @@ class AppliedProfileTests(unittest.TestCase):
     self.assertEqual(daemon.run_selected_host(self.config,
         build_runtime_plan(self.config, 'serve'), self.state, self.path), 0)
 
+ def test_applied_profile_creates_private_child_under_temp_container(self):
+  from unittest.mock import patch
+  from quota_sentinel import daemon
+  from quota_sentinel.platform.files import private_directory as real_directory
+  protected=[]
+  def protect(path,**options):
+   path=Path(path)
+   # Elevated Windows tokens can give the stdlib-created container an
+   # Administrators owner; private_directory must keep refusing that owner.
+   if path.name.startswith('quota-sentinel-applied-'):
+    raise OSError('synthetic elevated-token owner must not be adopted')
+   result=real_directory(path,**options);protected.append(path);return result
+  with patch('quota_sentinel.platform.files.private_directory',side_effect=protect),patch.object(daemon,'serve',return_value=0):
+   self.assertEqual(daemon.run_selected_host(self.config,
+       build_runtime_plan(self.config,'serve'),self.state,self.path,
+       activation_snapshot=(set(),None)),0)
+  self.assertTrue(protected)
+  self.assertFalse(protected[0].exists(),'applied profile child must be removed after the host exits')
+
  def test_host_children_keep_applied_profile_until_next_host(self):
   import os
   from unittest.mock import patch

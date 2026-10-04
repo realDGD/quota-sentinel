@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 
 
 def start_contained(api):
@@ -54,6 +55,9 @@ class _WindowsAPI:
         self.kernel.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE];self.kernel.AssignProcessToJobObject.restype=w.BOOL
         self.kernel.ResumeThread.argtypes=[w.HANDLE];self.kernel.ResumeThread.restype=w.DWORD
         self.kernel.TerminateJobObject.argtypes=[w.HANDLE,w.UINT];self.kernel.TerminateJobObject.restype=w.BOOL
+        self.kernel.QueryInformationJobObject.argtypes=[w.HANDLE,c.c_int,c.c_void_p,w.DWORD,c.c_void_p];self.kernel.QueryInformationJobObject.restype=w.BOOL
+        self.kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];self.kernel.OpenProcess.restype=w.HANDLE
+        self.kernel.IsProcessInJob.argtypes=[w.HANDLE,w.HANDLE,c.POINTER(w.BOOL)];self.kernel.IsProcessInJob.restype=w.BOOL
 
     def create_job(self):
         job=self.kernel.CreateJobObjectW(None,None)
@@ -80,6 +84,42 @@ class _WindowsAPI:
         if self.kernel.ResumeThread(thread)==0xFFFFFFFF:raise self.c.WinError(self.c.get_last_error())
     def terminate(self,process):self.win.TerminateProcess(process,125)
     def close(self,handle):self.win.CloseHandle(handle)
+
+    def job_process_handles(self,job,*,deadline):
+        # Job accounting reaches ActiveProcesses=0 before process objects are
+        # signaled. Hold synchronization handles before asynchronous terminate.
+        c,w=self.c,self.w;capacity=64;handles=[]
+        def check_deadline():
+            if time.monotonic()>=deadline:raise subprocess.TimeoutExpired('owned job cleanup',1)
+        try:
+            while True:
+                check_deadline()
+                class ProcessIds(c.Structure):
+                    _fields_=[('assigned',w.DWORD),('listed',w.DWORD),('ids',c.c_size_t*capacity)]
+                ids=ProcessIds()
+                if self.kernel.QueryInformationJobObject(job,3,c.byref(ids),c.sizeof(ids),None):break
+                error=c.get_last_error()
+                if error!=234:raise c.WinError(error)
+                capacity=max(capacity*2,ids.assigned)
+                if capacity>65536:raise OSError('owned job process list exceeds cleanup limit')
+            check_deadline()
+            for pid in ids.ids[:ids.listed]:
+                check_deadline()
+                handle=self.kernel.OpenProcess(0x100000|0x1000,False,pid)
+                if not handle:
+                    error=c.get_last_error()
+                    if error==87:continue  # exited between the list and open
+                    raise c.WinError(error)
+                try:
+                    owned=w.BOOL()
+                    if not self.kernel.IsProcessInJob(handle,job,c.byref(owned)):raise c.WinError(c.get_last_error())
+                    if owned.value:handles.append(handle);handle=None
+                finally:
+                    if handle:self.close(handle)
+            return handles
+        except BaseException:
+            for handle in handles:self.close(handle)
+            raise
 
 
 class WindowsProcess:
@@ -148,11 +188,21 @@ class WindowsProcess:
         if self._closed:return
         # Console-free CLIs have no universal graceful signal. Terminating
         # the Job is the deterministic Windows tree-cleanup operation.
-        if self._job:
-            if not self._api.kernel.TerminateJobObject(self._job,124):
-                raise self._api.c.WinError(self._api.c.get_last_error())
-        try:self.wait(1)
-        except subprocess.TimeoutExpired:pass
+        handles=[];deadline=time.monotonic()+1
+        try:
+            if self._job:
+                try:handles=self._api.job_process_handles(self._job,deadline=deadline)
+                finally:
+                    if not self._api.kernel.TerminateJobObject(self._job,124):
+                        raise self._api.c.WinError(self._api.c.get_last_error())
+            self.wait(max(0,deadline-time.monotonic()))
+            for handle in handles:
+                remaining=max(0,int((deadline-time.monotonic())*1000))
+                result=self._win.WaitForSingleObject(handle,remaining)
+                if result==self._win.WAIT_TIMEOUT:raise subprocess.TimeoutExpired(self._command,1)
+                if result!=0:raise self._api.c.WinError(self._api.c.get_last_error())
+        finally:
+            for handle in handles:self._api.close(handle)
 
     def close(self):
         if self._closed:return

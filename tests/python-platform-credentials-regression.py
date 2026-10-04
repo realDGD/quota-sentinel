@@ -12,6 +12,7 @@ from contextlib import redirect_stderr,redirect_stdout
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from quota_sentinel.config import CredentialReference,new_user_defaults
+from private_file_fixtures import minimal_process_environment
 
 class Credentials(unittest.TestCase):
  def setUp(self):
@@ -26,7 +27,7 @@ class Credentials(unittest.TestCase):
  def test_file_owner_permissions(self):
   from quota_sentinel.platform.files import publish_private
   p=self.root/'private key';publish_private(p,b'fixture-secret')
-  store=self.credentials.CredentialStore(environment={})
+  store=self.credentials.CredentialStore(environment=minimal_process_environment())
   self.assertEqual(store.read(CredentialReference('file',str(p)),timeout=2),'fixture-secret')
   if os.name!='nt':
    p.chmod(0o644)
@@ -35,7 +36,7 @@ class Credentials(unittest.TestCase):
    p.unlink();p.symlink_to(self.root/'missing')
    with self.assertRaises(self.credentials.CredentialUnavailable):store.read(CredentialReference('file',str(p)),timeout=2)
  def test_explicit_file_roundtrip(self):
-  p=self.root/'explicit-credentials';store=self.credentials.CredentialStore(environment={});ref=CredentialReference('file',str(p))
+  p=self.root/'explicit-credentials';store=self.credentials.CredentialStore(environment=minimal_process_environment());ref=CredentialReference('file',str(p))
   store.write(ref,'synthetic-only',timeout=2);self.assertEqual(store.read(ref,timeout=2),'synthetic-only')
  def test_secret_never_in_logs_or_argv(self):
   from quota_sentinel.platform.process import CommandResult

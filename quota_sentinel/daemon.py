@@ -104,7 +104,7 @@ def run_selected_host(config, plan, state_dir, config_path, *, activation_snapsh
     # profile cannot hot-switch a child while retaining the owner's old budget.
     # A child acknowledges only the activation generation captured at apply.
     with tempfile.TemporaryDirectory(prefix="quota-sentinel-applied-") as temporary:
-        directory = private_directory(Path(temporary))
+        directory = private_directory(Path(temporary) / "applied")
         initialize_protocol(directory)
         applied_path = directory / "config.json"
         publish_private(applied_path, json.dumps(

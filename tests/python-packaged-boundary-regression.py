@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from private_file_fixtures import assert_private_path,private_test_directory
+from private_file_fixtures import assert_private_path,private_test_directory,minimal_process_environment
 
 class Boundary(unittest.TestCase):
  def setUp(self):
@@ -24,7 +24,7 @@ class Boundary(unittest.TestCase):
   from quota_sentinel.runtime.quota_probe import QuotaCollector
   cli=self.root/'official codex.py';home=self.root/'native home';home.mkdir();record=self.root/'home.txt'
   cli.write_text('import json,os,sys\nfrom pathlib import Path\nPath('+repr(str(record))+').write_text(os.environ.get("CODEX_HOME",""))\nfor line in sys.stdin:\n q=json.loads(line)\n r={"rateLimits":{"primary":{"usedPercent":5,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":1800600000}}}\n print(json.dumps({"id":q["id"],"result":r if q["method"]=="account/rateLimits/read" else {}}),flush=True)\n')
-  collector=QuotaCollector(self.root/'state',self.root/'work',providers=('codex',),tier_chains={'codex':('native',)},codex_bin=cli,environment={'CODEX_HOME':str(home)})
+  collector=QuotaCollector(self.root/'state',self.root/'work',providers=('codex',),tier_chains={'codex':('native',)},codex_bin=cli,environment=minimal_process_environment(CODEX_HOME=str(home)))
   reading=collector.collect()['codex'];self.assertIsNotNone(reading.quota,reading.error)
   self.assertEqual(record.read_text(),str(home));self.assertFalse((home/'auth.json').exists())
  def test_pi_plugin_preflight_uses_private_agent_directory(self):

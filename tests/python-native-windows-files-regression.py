@@ -4,16 +4,48 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 if os.name!='nt':
  print('UNVERIFIED: native Windows file permissions require Windows');raise SystemExit(77)
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from quota_sentinel.platform.files import private_directory, private_open
+from quota_sentinel.platform.files import private_directory, private_open, publish_private
 from quota_sentinel.platform.windows_files import verify_private_handle
 from private_file_fixtures import assert_private_path,assert_inherited_private_child
 
 class NativeFiles(unittest.TestCase):
+ def test_replace_waits_for_short_reader_and_publishes_complete_bytes(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   parent=private_directory(Path(tmp)/'owned');path=parent/'state';prior=b'a'*65536;next_bytes=b'b'*32768
+   publish_private(path,prior);real_replace=os.replace;errors=[];timers=[]
+   with path.open('rb') as reader:
+    def temporarily_blocked_replace(source,target):
+     try:return real_replace(source,target)
+     except PermissionError as error:
+      errors.append(error.winerror)
+      if len(errors)==1:
+       self.assertEqual(reader.read(),prior);reader.seek(0)
+       timer=threading.Timer(.025,reader.close);timers.append(timer);timer.start()
+      raise
+    try:
+     with patch('os.replace',side_effect=temporarily_blocked_replace):publish_private(path,next_bytes)
+    finally:
+     for timer in timers:timer.cancel();timer.join(1)
+   self.assertTrue(errors);self.assertTrue(all(code in (5,32) for code in errors))
+   self.assertEqual(path.read_bytes(),next_bytes);self.assertEqual(list(parent.iterdir()),[path]);assert_private_path(self,path)
+ def test_replace_deadline_keeps_prior_bytes_and_cleans_temporary(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   parent=private_directory(Path(tmp)/'owned');path=parent/'state';prior=b'a'*65536
+   publish_private(path,prior)
+   with path.open('rb') as reader:
+    started=time.monotonic()
+    with self.assertRaises(PermissionError) as caught:publish_private(path,b'b'*32768)
+    elapsed=time.monotonic()-started
+    self.assertIn(caught.exception.winerror,(5,32));self.assertGreaterEqual(elapsed,.20);self.assertLess(elapsed,2)
+    self.assertEqual(reader.read(),prior);self.assertEqual(path.read_bytes(),prior)
+   self.assertEqual(list(parent.iterdir()),[path]);assert_private_path(self,path)
  def test_exclusive_stream_failure_removes_created_file(self):
   for close_first in (False,True):
    with self.subTest(close_first=close_first),tempfile.TemporaryDirectory() as tmp:

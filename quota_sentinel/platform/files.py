@@ -3,6 +3,7 @@ import io
 import os
 from pathlib import Path
 import stat
+import time
 import uuid
 
 
@@ -43,7 +44,9 @@ def private_open(path, mode):
              'xb': os.O_WRONLY | os.O_CREAT | os.O_EXCL,
              'ab': os.O_WRONLY | os.O_CREAT | os.O_APPEND,
              'r+b': os.O_RDWR}[mode]
-    flags |= getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    # Reject nonregular objects after open without waiting for a FIFO peer.
+    flags |= (getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+              | getattr(os, 'O_NONBLOCK', 0))
     fd = os.open(str(path), flags, 0o600)
     info = None
     try:
@@ -140,6 +143,27 @@ def _windows_open(path, mode):
         kernel.LocalFree(descriptor)
 
 
+def _replace_private(temporary, path):
+    """Allow a short Windows sharing interruption; preserve atomic replacement."""
+    if os.name != 'nt':
+        os.replace(temporary, path)
+        return
+    deadline = time.monotonic() + 0.25
+    while True:
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) not in (5, 32):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.01, remaining))
+            if time.monotonic() >= deadline:
+                raise
+
+
 def publish_private(path, payload):
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp.' + uuid.uuid4().hex)
@@ -150,7 +174,7 @@ def publish_private(path, payload):
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
+        _replace_private(str(temporary), str(path))
         # Windows does not provide POSIX directory fsync. File bytes are flushed;
         # rename visibility is atomic, directory durability is OS/filesystem dependent.
         if os.name != 'nt':

@@ -11,6 +11,7 @@ if sys.platform!='linux' or os.environ.get('QUOTA_SENTINEL_TEST_LINUX_SERVICES')
 import pwd
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from quota_sentinel.platform.services import ServiceDefinition,ServiceManager,ServiceError,service_environment
+from quota_sentinel.platform.process import run_bounded
 home=Path(pwd.getpwuid(os.getuid()).pw_dir)
 environment=service_environment(os.environ);environment['HOME']=str(home);environment['XDG_CONFIG_HOME']=str(home/'.config')
 manager=ServiceManager(home=home,environment=environment)
@@ -18,9 +19,18 @@ try:manager._linux_available()
 except ServiceError:print('UNVERIFIED: systemd user manager unavailable');raise SystemExit(77)
 
 class Native(unittest.TestCase):
+ def test_working_directory_is_literal_in_native_systemd(self):
+  with tempfile.TemporaryDirectory(prefix='qs-native-unit-parser-') as tmp:
+   directory=Path(tmp)/'space 中文 & % $ " \\ trailing ';directory.mkdir(mode=0o700)
+   definition=ServiceDefinition('quota-sentinel.synthetic-'+uuid.uuid4().hex,(sys.executable,'-c','pass'),directory,{},15)
+   unit=Path(tmp)/(definition.name+'.service');unit.write_bytes(manager.render(definition))
+   result=run_bounded(('systemd-analyze','--user','verify',str(unit)),cwd=directory,environment=environment,timeout=15,kill_grace=0,max_bytes=65536)
+   self.assertFalse(result.timed_out)
+   self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
  def test_service_lifecycle_and_child_cleanup(self):
   with tempfile.TemporaryDirectory(prefix='qs-native-user-service-') as tmp:
-   root=Path(tmp);ready=root/'ready';script=root/'host.py'
+   root=Path(tmp)/'space 中文 & % $ " \\ trailing ';root.mkdir(mode=0o700)
+   ready=root/'ready';script=root/'host.py'
    script.write_text('''import os,signal,time,subprocess,sys
 from pathlib import Path
 from quota_sentinel.platform.process import spawn_owned

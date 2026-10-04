@@ -42,9 +42,7 @@ from __future__ import annotations
 import calendar
 import json
 import math
-import os
 import re
-import tempfile
 import time
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
@@ -935,37 +933,10 @@ def read_document(path) -> ProviderQuota:
 def write_document(path, quota: ProviderQuota) -> None:
     """Atomically write `quota` to `path`.
 
-    A temp file in the same directory is written, flushed and fsynced, then
-    `os.replace`d over the target, so a reader never observes a partial
-    document. The temp file is created 0600 (as the shell's quota files are)
-    and the mode survives the rename.
+    Publish complete UTF-8 bytes with a canonical LF through the private
+    file boundary, including explicit Windows owner/DACL and POSIX 0600.
     """
     document = quota.as_document()
     text = json.dumps(document, ensure_ascii=False) + "\n"
-    target = os.fspath(path)
-    directory = os.path.dirname(os.path.abspath(target)) or "."
-    descriptor, temporary = tempfile.mkstemp(
-        dir=directory, prefix=os.path.basename(target) + ".", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-    try:
-        directory_descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(directory_descriptor)
+    from quota_sentinel.platform.files import publish_private
+    publish_private(path, text.encode('utf-8'))

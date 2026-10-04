@@ -5,6 +5,13 @@ from pathlib import Path
 import stat
 
 
+def minimal_process_environment(**selected):
+    """Keep the Windows loader coordinate without inheriting ambient tokens."""
+    environment={'SYSTEMROOT':os.environ['SYSTEMROOT']} if os.name=='nt' else {}
+    environment.update(selected)
+    return environment
+
+
 def private_test_directory(temporary, name='owned'):
     from quota_sentinel.platform.files import private_directory
     return private_directory(Path(temporary.name) / name)
@@ -116,6 +123,58 @@ def loosen_directory_access(path):
 
 
 @contextmanager
+def _without_windows_backup_restore_privileges():
+    """Temporarily enforce ordinary DACL checks in this test process only.
+
+    SSH/elevated test tokens can have both bypass privileges enabled. Save
+    exactly the entries changed by Windows; absent or disabled privileges
+    stay untouched, and unrelated privileges are never requested.
+    """
+    import ctypes as c
+    from ctypes import wintypes as w
+    api=c.WinDLL('advapi32',use_last_error=True);kernel=c.WinDLL('kernel32',use_last_error=True)
+    class LUID(c.Structure):
+        _fields_=[('LowPart',c.c_uint32),('HighPart',c.c_int32)]
+    class Entry(c.Structure):
+        _fields_=[('Luid',LUID),('Attributes',c.c_uint32)]
+    class Privileges(c.Structure):
+        _fields_=[('PrivilegeCount',c.c_uint32),('Privileges',Entry*2)]
+    kernel.GetCurrentProcess.restype=w.HANDLE
+    kernel.CloseHandle.argtypes=[w.HANDLE]
+    api.OpenProcessToken.argtypes=[w.HANDLE,w.DWORD,c.POINTER(w.HANDLE)]
+    api.OpenProcessToken.restype=w.BOOL
+    api.LookupPrivilegeValueW.argtypes=[w.LPCWSTR,w.LPCWSTR,c.POINTER(LUID)]
+    api.LookupPrivilegeValueW.restype=w.BOOL
+    api.AdjustTokenPrivileges.argtypes=[w.HANDLE,w.BOOL,c.POINTER(Privileges),w.DWORD,c.POINTER(Privileges),c.POINTER(w.DWORD)]
+    api.AdjustTokenPrivileges.restype=w.BOOL
+    token=w.HANDLE()
+    if not api.OpenProcessToken(kernel.GetCurrentProcess(),0x28,c.byref(token)):raise c.WinError(c.get_last_error())
+    previous=Privileges();adjusted=False
+    try:
+        requested=Privileges();requested.PrivilegeCount=2
+        for entry,name in zip(requested.Privileges,('SeBackupPrivilege','SeRestorePrivilege')):
+            if not api.LookupPrivilegeValueW(None,name,c.byref(entry.Luid)):raise c.WinError(c.get_last_error())
+            entry.Attributes=0
+        returned=w.DWORD();c.set_last_error(0)
+        if not api.AdjustTokenPrivileges(token,False,c.byref(requested),c.sizeof(previous),c.byref(previous),c.byref(returned)):
+            raise c.WinError(c.get_last_error())
+        adjusted=True
+        error=c.get_last_error()
+        # ERROR_NOT_ALL_ASSIGNED means a requested privilege was absent; the
+        # returned previous state still records every entry actually changed.
+        if error not in (0,1300):raise c.WinError(error)
+        yield
+    finally:
+        try:
+            if adjusted and previous.PrivilegeCount:
+                c.set_last_error(0)
+                if not api.AdjustTokenPrivileges(token,False,c.byref(previous),0,None,None):raise c.WinError(c.get_last_error())
+                error=c.get_last_error()
+                if error:raise c.WinError(error)
+        finally:kernel.CloseHandle(token)
+
+
+@contextmanager
 def deny_child_directory_creation(path):
     """Make mkdir fail at the actual native permissions boundary."""
     path=Path(path)
@@ -147,7 +206,8 @@ def deny_child_directory_creation(path):
         if not api.GetSecurityDescriptorDacl(descriptor,c.byref(present),c.byref(dacl),c.byref(defaulted)):raise c.WinError(c.get_last_error())
         error=api.SetNamedSecurityInfoW(str(path),1,0x80000004,None,None,dacl,None)
         if error:raise c.WinError(error)
-        try:yield
+        try:
+            with _without_windows_backup_restore_privileges():yield
         finally:
             error=api.SetNamedSecurityInfoW(str(path),1,0x80000004,None,None,original_dacl,None)
             if error:raise c.WinError(error)

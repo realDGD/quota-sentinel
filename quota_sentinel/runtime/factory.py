@@ -431,9 +431,15 @@ def readiness_problems(
 
     executables = {
         "curl": quota_probe_options(env)["curl_bin"],
-        "security": Path(keychain.SECURITY_BIN),
-        "shlock": Path(SHLOCK_BIN),
     }
+    # The native coordinator selects shlock only on macOS. Linux's fd lock
+    # and Windows' range lock use their OS APIs; neither executes this tool.
+    from quota_sentinel.platform.locks import expected_protocol
+    if expected_protocol() == "macos-shlock-v1":
+        executables["shlock"] = Path(SHLOCK_BIN)
+        # The explicit system-credential opt-out makes this route unreachable.
+        if not keychain.disabled(env):
+            executables["security"] = Path(keychain.SECURITY_BIN)
     if pi_needed:
         executables["pi"] = config.pi_bin
     if codex_needed:
