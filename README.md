@@ -925,3 +925,7 @@ This path imports the installed Pi SDK authentication module, resolves only the 
 Select Node, the Pi package location (`clients.pi_sdk`) and Pi auth location (`clients.pi_auth`) when automatic package discovery cannot resolve the selected installation. Antigravity additionally needs `pi install npm:pi-antigravity` and its selected plugin entry. Compatible local Pi 0.99.2 and pi-antigravity 0.9.0 were checked using fake credentials and intercepted metadata responses; this does not verify a real account or supplier schema. Missing/unsupported SDKs/plugins and unknown quota groups return unavailable, then continue only to the next configured tier.
 
 Only Pi-owned supported credentials may refresh through guarded owner-auth requests. Foreign credentials are read-only and cannot be copied to official Codex/agy authentication stores.
+
+## Links
+
+-   [Linux.do 论坛](https://linux.do/)
