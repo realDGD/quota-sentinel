@@ -62,7 +62,7 @@ class Processes(unittest.TestCase):
   r=self.run_cli('argv',*values);self.assertEqual(r.returncode,0,r.stderr.decode('utf-8',errors='replace'))
   self.assertEqual(json.loads(r.stdout),values)
  def test_continuous_pipe_keeps_line_bounds_without_a_lifetime_byte_cap(self):
-  script="import sys\nfor n in range(2500):\n print('x'*2048,flush=True);sys.stdin.buffer.read(1)\n"
+  script="import sys\nfor n in range(2500):\n sys.stdout.buffer.write(b'x'*2048+b'\\n');sys.stdout.buffer.flush();sys.stdin.buffer.read(1)\n"
   p=self.process.spawn_owned([sys.executable,'-u','-c',script],cwd=self.cwd,environment=os.environ,
    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
   self.addCleanup(p.close)
