@@ -19,7 +19,7 @@ from .trace import Invocation, TraceJournal, process_identity, TRACE_DIR, TRACE_
 
 PREDICATE = '(subsystem CONTAINS "LaunchServices" OR subsystem CONTAINS "sandbox" OR process == "sandboxd")'
 COMMAND = ('/usr/bin/log', 'stream', '--style', 'ndjson', '--level', 'debug',
-           '--timeout', '5m', '--predicate', PREDICATE)
+           '--predicate', PREDICATE)
 
 
 def browser_event(raw):
@@ -71,7 +71,7 @@ def event_identity(pid, timestamp):
 
 
 class BrowserObserver:
-    """The selected service owns this thread and its finite streaming child."""
+    """Service-owned continuous observation with bounded reads and cleanup."""
     def __init__(self, directory, *, command=None, system=None):
         self.journal = TraceJournal(directory)
         self.command = tuple(COMMAND if command is None else command)
@@ -106,10 +106,13 @@ class BrowserObserver:
     def _run(self):
         from quota_sentinel.platform.process import spawn_owned, BoundedPipes
         self._status(False)
+        retry_delay = 1
         while not self.stop_event.is_set():
             process = None
             pipes = None
-            incomplete = False
+            gap_reason = None
+            observed_exit = None
+            started_at = time.monotonic()
             try:
                 self.journal.cleanup()
                 process = spawn_owned(self.command, cwd=self.journal.directory,
@@ -119,21 +122,18 @@ class BrowserObserver:
                 self.audit.note('observer_started', target_pid=process.pid,
                     observer='unified-log', coverage='best-effort')
                 self._status(True, observer_pid=process.pid)
-                pipes = BoundedPipes(process, max_bytes=4*1024*1024)
+                # Bound each line and the 64-entry queue, rather than the
+                # lifetime traffic of a healthy, long-lived log stream.
+                pipes = BoundedPipes(process, max_bytes=None, max_line_bytes=65536)
                 next_cleanup = time.monotonic()+60
-                deadline = time.monotonic()+310
-                while not self.stop_event.is_set() and time.monotonic() < deadline:
+                while not self.stop_event.is_set():
                     if time.monotonic() >= next_cleanup:
                         self.journal.cleanup()
-                        self._status(True, observer_pid=process.pid, coverage='incomplete' if incomplete else 'best-effort')
+                        self._status(True, observer_pid=process.pid)
                         next_cleanup = time.monotonic()+60
                     try:
                         line = pipes.readline(deadline=time.monotonic()+.5)
                     except subprocess.TimeoutExpired:
-                        continue
-                    if len(line) > 65536:
-                        incomplete = True
-                        self.audit.note('observer_gap', reason='system-line-too-large')
                         continue
                     try: raw = json.loads(line)
                     except ValueError: continue
@@ -141,24 +141,38 @@ class BrowserObserver:
                     if event is not None:
                         self.audit.note('system_browser_event', observer='unified-log', **event)
             except EOFError:
-                pass  # A finite five-minute stream completed; reconnect below.
+                gap_reason = 'system-stream-ended'
+                if process is not None:
+                    # EOF can precede process reaping. Observe the child's own
+                    # exit before cleanup sends any termination signal.
+                    try:
+                        observed_exit = process.wait(timeout=.2)
+                    except subprocess.TimeoutExpired:
+                        observed_exit = process.poll()
+                    if observed_exit is not None:
+                        gap_reason = 'system-stream-exited'
             except (OSError, ValueError, RuntimeError):
-                incomplete = True
-                self.audit.note('observer_gap', reason='system-stream-unavailable', coverage='incomplete')
+                gap_reason = 'system-stream-unavailable'
             finally:
+                if process is not None and observed_exit is None:
+                    observed_exit = process.poll()
+                incomplete = gap_reason is not None and not self.stop_event.is_set()
+                if incomplete:
+                    self.audit.note('observer_gap', reason=gap_reason,
+                        exit_code=observed_exit, coverage='incomplete')
                 if pipes is not None:
                     pipes.close()
                 elif process is not None:
                     process.close()
                 with self._guard:
                     self._process = None
-                if process is not None and process.poll() not in (None, 0) and not self.stop_event.is_set():
-                    incomplete = True
-                    self.audit.note('observer_gap', reason='system-stream-exited', exit_code=process.poll(), coverage='incomplete')
                 self._status(False, coverage='incomplete' if incomplete else 'best-effort')
                 self.audit.note('observer_stopped', observer='unified-log',
                     exit_code=None if process is None else process.poll())
-            self.stop_event.wait(1 if process is not None and process.poll()==0 else 30)
+            if time.monotonic()-started_at >= 60:
+                retry_delay = 1
+            self.stop_event.wait(retry_delay)
+            retry_delay = min(30, retry_delay*2)
 
     def stop(self):
         self.stop_event.set()

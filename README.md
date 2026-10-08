@@ -559,6 +559,9 @@ complete system execution audit. Endpoint Security's `eslogger` requires
 administrator access and is not installed or enabled by the service. Observer
 gaps and stale status are exposed, so absence of an event is not proof that no
 other program opened Chrome.
+The stream runs continuously with bounded line/queue memory and a one-minute
+status heartbeat. Unexpected exits are recorded before cleanup and reconnect
+with a 1–30 second backoff; normal service shutdown does not report a gap.
 
 The journal keeps **14 UTC calendar dates**, rotates at **2 MiB**, and removes
 oldest chunks above **50 MiB** total JSONL data. It cleans on each write and

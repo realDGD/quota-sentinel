@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -217,6 +219,51 @@ class TraceTests(unittest.TestCase):
         self.assertTrue(any(r['event']=='system_browser_event' and r.get('caller_pid')==4321 for r in records))
         self.assertFalse(observer.thread.is_alive())
         self.assertNotIn('fixture-secret', json.dumps(records))
+        self.assertFalse(any(r['event']=='observer_gap' for r in records))
+
+    def test_healthy_observer_survives_the_former_session_deadline(self):
+        from quota_sentinel.diagnostics import browser
+        # Advance only the observer's clock; the real child and pipe remain
+        # live. A healthy stream must not be killed merely because time passed.
+        offset = [0]
+        clock = SimpleNamespace(time=time.time, monotonic=lambda:time.monotonic()+offset[0])
+        command = [sys.executable, '-u', '-c',
+            "import time\nwhile True:\n print('{}',flush=True);time.sleep(.02)\n"]
+        observer = browser.BrowserObserver(self.root/'diagnostics', command=command, system='darwin')
+        with mock.patch.object(browser, 'time', clock), observer:
+            deadline = time.monotonic()+3
+            while time.monotonic()<deadline and observer._process is None:
+                time.sleep(.02)
+            process = observer._process
+            self.assertIsNotNone(process)
+            offset[0] = 360
+            time.sleep(.2)
+            self.assertIsNone(process.poll(), 'healthy stream was terminated at the old session deadline')
+        records = observer.journal.records()
+        self.assertEqual(sum(r['event']=='observer_started' for r in records), 1)
+        self.assertFalse(any(r['event']=='observer_gap' for r in records), records)
+        self.assertFalse(observer.thread.is_alive())
+
+    def test_observer_reconnects_after_a_real_failure_and_preserves_its_exit(self):
+        from quota_sentinel.diagnostics.browser import BrowserObserver
+        marker = self.root/'stream-started'
+        event = json.dumps({'eventMessage':'openURL Google Chrome caller_pid=4321'})
+        script = ("import sys,time\nfrom pathlib import Path\np=Path(sys.argv[1])\n"
+                  "if not p.exists():\n p.touch();sys.exit(77)\n"
+                  "print(sys.argv[2],flush=True)\ntime.sleep(120)\n")
+        observer = BrowserObserver(self.root/'diagnostics',
+            command=[sys.executable,'-u','-c',script,str(marker),event], system='darwin')
+        with observer:
+            deadline = time.monotonic()+4
+            while time.monotonic()<deadline and not any(r['event']=='system_browser_event' for r in observer.journal.records()):
+                time.sleep(.02)
+            records = observer.journal.records()
+            self.assertTrue(any(r['event']=='system_browser_event' for r in records), 'stream did not reconnect promptly')
+        records = observer.journal.records()
+        gaps = [r for r in records if r['event']=='observer_gap']
+        self.assertEqual(len(gaps), 1, gaps)
+        self.assertEqual(gaps[0]['exit_code'], 77)
+        self.assertFalse(observer.thread.is_alive())
 
     def test_system_event_does_not_confuse_log_emitter_with_caller(self):
         from quota_sentinel.diagnostics.browser import browser_event
