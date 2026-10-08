@@ -386,11 +386,12 @@ class SubprocessRunner:
         process.stop(5)
     def run(self,args,timeout):
         from quota_sentinel.platform.process import spawn_owned
+        from quota_sentinel.diagnostics.trace import trace_environment
         started=time.monotonic();timed_out=False
         with self._lock:
             if self._cancelled:return CommandResult(130,False,0.0)
             generation=self._generation
-        process=spawn_owned(args,cwd=Path.cwd(),environment=os.environ,
+        process=spawn_owned(args,cwd=Path.cwd(),environment=trace_environment(os.environ),
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         with self._lock:
             cancelled=self._cancelled or generation!=self._generation
@@ -698,7 +699,12 @@ class TaskOrchestrator:
             "orchestrator check start trigger=%s scheduled_for=%s", trigger, scheduled_for
         )
         try:
-            result = self.runner.run(self.scheduler_command, self.check_timeout)
+            from quota_sentinel.diagnostics.trace import trigger_context, invocation, trace_environment
+            with trigger_context('scheduler:'+trigger):
+                env = trace_environment(os.environ, state_dir=getattr(self.schedule_state, 'state_dir', None))
+                with invocation('scheduler-check', environment=env, task_run_id=run_id) as audit:
+                    result = self.runner.run(self.scheduler_command, self.check_timeout)
+                    audit.finish(exit_code=result.exit_code)
             status = "succeeded" if result.exit_code == 0 else "failed"
             self.store.finish_run(
                 run_id,
@@ -803,7 +809,13 @@ class TaskOrchestrator:
         run_id = self.store.begin_run(task_name, trigger, None, started_at)
         started_mono = time.monotonic()
         try:
-            value = action()
+            from quota_sentinel.diagnostics.trace import trigger_context, invocation, trace_environment
+            source = 'feishu:usage' if trigger.startswith('feishu:') else 'manual:external'
+            with trigger_context(source):
+                env = trace_environment(os.environ, state_dir=getattr(self.schedule_state, 'state_dir', None))
+                with invocation('external-task', environment=env, task_run_id=run_id) as audit:
+                    value = action()
+                    audit.finish(exit_code=0)
         except BaseException as exc:
             self.store.finish_run(
                 run_id,

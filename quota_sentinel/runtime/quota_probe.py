@@ -174,6 +174,8 @@ class QuotaCollector:
         self.pi_live_client = pi_live_client
         self.tier_chains = {p: tuple(Tier(t) for t in tier_chains[p]) for p in self.providers} if tier_chains is not None else None
         self.state_dir = Path(state_dir)
+        from quota_sentinel.diagnostics.trace import trace_environment
+        self.environment = trace_environment(self.environment, state_dir=self.state_dir)
         self.workspace = Path(workspace)
         self.codex_bin = Path(codex_bin)
         self.agy_bin = Path(agy_bin)
@@ -363,13 +365,22 @@ class QuotaCollector:
             # collector already understands, and it keeps one provider's command
             # from being built out of another provider's helper.
             return None
-        result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin, environment=self.environment)
+        from quota_sentinel.diagnostics.trace import invocation
+        from contextlib import nullcontext
+        with invocation('quota-native', environment=self.environment,
+                        requested_executable=str(self.agy_bin)) if provider == 'antigravity' else nullcontext() as audit:
+            result = _run_bounded(command, timeout + _NATIVE_HELPER_SLACK_SECONDS, 1, stdin,
+                environment=audit.environment if audit is not None else self.environment)
+            if audit is not None:
+                audit.finish(exit_code=result.returncode)
         if result.returncode != 0 or not result.stdout:
             reason_match = re.search(
                 rb"(?:antigravity_usage|opencode_usage|clinepass_usage): ([a-z_0-9]+)",
                 result.stderr,
             )
             reason = reason_match.group(1).decode() if reason_match else "runtime_unavailable"
+            if provider == 'antigravity' and reason == 'auth_required':
+                self._antigravity_auth_required = True
             self.logger("quota %s: native /usage failed (%s)" % (provider, reason))
             return None
         raw = _bytes_json(result.stdout)
@@ -378,6 +389,8 @@ class QuotaCollector:
         raw.setdefault("cached", False)
         try:
             quota = parse_document(raw)
+            if provider == 'antigravity' and quota.fresh and not quota.cached:
+                audit.note('quota_validated', fresh=True)
             return quota if quota.fresh and not quota.cached else None
         except QuotaNormalizationError:
             return None
@@ -386,6 +399,12 @@ class QuotaCollector:
         return self._native_codex() if provider == "codex" else self._native_helper(provider)
 
     def _codexbar(self, provider: str) -> Optional[ProviderQuota]:
+        if provider == 'antigravity' and getattr(self, '_antigravity_auth_required', False):
+            from quota_sentinel.diagnostics.trace import Invocation
+            Invocation('codexbar-antigravity', self.environment).note('quota_fallback_skipped',
+                reason='auth_required', action='defer-until-next-collection')
+            self.logger('quota antigravity: auth_required; defer repeated CLI authentication until next check')
+            return None
         from quota_sentinel.platform.paths import resolve_launcher
         try:prefix=resolve_launcher('codexbar',explicit=self.codexbar_bin)
         except ValueError:return None
@@ -401,7 +420,21 @@ class QuotaCollector:
         for source in sources:
             command = [*prefix, "usage", "--provider", names.get(provider, provider),
                        "--source", source, "--format", "json", "--json-only", "--no-color"]
-            result = _run_bounded(command, timeout, self.codexbar_kill_grace, environment=self.environment)
+            if provider == 'antigravity':
+                from quota_sentinel.platform.background_auth import no_browser_command
+                try:
+                    command = no_browser_command(command)
+                except ValueError:
+                    self.logger('quota antigravity: background_auth_guard_unavailable')
+                    return None
+            from quota_sentinel.diagnostics.trace import invocation
+            from contextlib import nullcontext
+            with invocation('codexbar-antigravity', environment=self.environment,
+                requested_executable=str(prefix[0])) if provider == 'antigravity' else nullcontext() as audit:
+                result = _run_bounded(command, timeout, self.codexbar_kill_grace,
+                    environment=audit.environment if audit is not None else self.environment)
+                if audit is not None:
+                    audit.finish(exit_code=result.returncode)
             if result.timed_out:
                 self.logger("quota %s: codexbar-live TIMEOUT after %ss (source %s)" % (provider, timeout, source))
             if result.returncode != 0:
@@ -433,6 +466,7 @@ class QuotaCollector:
         if purpose not in ("display", "schedule"):
             raise ValueError("unknown quota purpose")
         readings: Dict[str, QuotaReading] = {}
+        self._antigravity_auth_required = False
         for provider in self.providers:
             quota = None
             selected = None

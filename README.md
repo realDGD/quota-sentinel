@@ -530,6 +530,55 @@ full measurement, its counter-examples and what still needs live verification
 are in **Probe-only providers**. Antigravity therefore ships the opposite
 priority to codex: **`agy` first, Pi as its one-hop fallback.**
 
+On macOS, background `/usage`, `/agents`, model turns and Antigravity CodexBar
+fallbacks run with an OS sandbox that blocks the browser launch used by CLI
+OAuth. The agy calls also watch their own private, temporary CLI log: silent
+authentication failure or interactive OAuth stops that owned process tree
+promptly (`auth_required`, helper exit 78), without changing HOME or saved
+credentials. A native authentication failure skips another agy authentication
+attempt through CodexBar in the same collection; cached tiers remain available
+and the next collection tries agy again. Model calls retain their configured
+Pi fallback. If the sandbox is unavailable, background Antigravity calls are
+refused. Foreground login remains available for credentials that really need
+renewal; a transient refresh/network failure does not disable agy permanently.
+
+Private process/authentication evidence is retained in `<state-dir>/diagnostics`.
+Each request carries a root/call/parent ID and a trigger (`manual`, `scheduler`
+or `feishu`). Records include the launched PID, parent PID, native start identity
+where available, executable path, auth marker, exit code and elapsed time.
+Successful fresh native quota or model results can link back to the preceding
+authentication failure. POSIX descendants are sampled (up to eight identities
+per owned command); very short-lived descendants may be missed. Direct launches
+are recorded at the spawning boundary. Raw argv, OAuth URLs, credentials and
+raw CLI/system logs are excluded. Temporary CLI logs are deleted after the call.
+
+On macOS, `serve` also owns a best-effort LaunchServices/sandbox log observer.
+Explicit system caller PIDs are labeled separately from the log emitter;
+redacted or missing caller evidence stays `unattributed`. This feed is not a
+complete system execution audit. Endpoint Security's `eslogger` requires
+administrator access and is not installed or enabled by the service. Observer
+gaps and stale status are exposed, so absence of an event is not proof that no
+other program opened Chrome.
+The stream runs continuously with bounded line/queue memory and a one-minute
+status heartbeat. Unexpected exits are recorded before cleanup and reconnect
+with a 1–30 second backoff; normal service shutdown does not report a gap.
+
+The journal keeps **14 UTC calendar dates**, rotates at **2 MiB**, and removes
+oldest chunks above **50 MiB** total JSONL data. It cleans on each write and
+every minute while the macOS observer is running. POSIX directory/file modes
+are 0700/0600; Windows uses the existing private-file DACLs. Trace storage errors
+report incomplete coverage without failing quota work. Inspect it with:
+
+```console
+quota-sentinel trace status
+quota-sentinel trace show --limit 100
+quota-sentinel trace show --call-id <root-or-call-id>
+quota-sentinel trace cleanup
+```
+
+Use `--state-dir /path/to/state` before `trace` for another installation.
+`cleanup` applies retention; it does not erase the current diagnostic history.
+
 `agy` is an agent, and a stock turn carries its scaffolding. Measured on
 2026-09-27 against agy 1.2.12, model `gemini-3.8-flash-low`, `--effort low`:
 

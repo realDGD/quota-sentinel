@@ -321,7 +321,12 @@ def _run_runtime(state_dir: Path, action, verb: str) -> int:
     started = time.monotonic()
     cli_log.info("command: %s (pid %d)", verb, os.getpid())
     try:
-        action(factory)
+        from quota_sentinel.diagnostics.trace import invocation, trace_environment, TRACE_TRIGGER
+        env = trace_environment(os.environ, state_dir=state_dir,
+            trigger=os.environ.get(TRACE_TRIGGER, 'manual:'+verb))
+        with invocation('command', environment=env) as audit:
+            action(factory)
+            audit.finish(exit_code=0)
     except (factory.NotReadyError, FeishuError) as exc:
         print(f"quota_sentinel: {exc}", file=sys.stderr)
         return 1
@@ -748,6 +753,8 @@ def build_parser() -> argparse.ArgumentParser:
     services.set_defaults(handler=run_service)
     scheduler_cli.register(sub)
     quota_cli.register(sub)
+    from quota_sentinel.diagnostics import cli as trace_cli
+    trace_cli.register(sub)
     return parser
 
 

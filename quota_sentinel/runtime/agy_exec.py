@@ -423,7 +423,8 @@ class AgyExecRunner:
             env.update(self.config.environment)
         for key in API_KEY_VARS:
             env.pop(key, None)
-        return env
+        from quota_sentinel.diagnostics.trace import trace_environment
+        return trace_environment(env, state_dir=self.config.state_dir)
 
     def _cwd(self, paths: PreparedPaths) -> Path:
         return Path(paths.agent_dir) / "cwd"
@@ -434,6 +435,7 @@ class AgyExecRunner:
         *,
         timeout: Optional[float] = None,
         kill_grace: Optional[float] = None,
+        log_path: Optional[Path] = None,
     ) -> List[str]:
         """One CLI invocation, wrapped by ``run_with_timeout.py``.
 
@@ -448,9 +450,10 @@ class AgyExecRunner:
         helper = resource_path("run_with_timeout.py")
         deadline = self.config.timeout if timeout is None else timeout
         grace = self.config.kill_grace if kill_grace is None else kill_grace
+        log_option = [] if log_path is None else ['--agy-log-file', str(log_path)]
         return [
             sys.executable, str(helper), "--timeout", str(deadline),
-            "--kill-grace", str(grace), "--", *inner,
+            "--kill-grace", str(grace), "--agy-auth-guard", *log_option, "--", *inner,
         ]
 
     def _run_cli(self, inner: List[str], paths: PreparedPaths):
@@ -468,13 +471,23 @@ class AgyExecRunner:
         marker written by any earlier turn would still be in the tail and would
         make a later, unrelated failure look like the free handshake.
         """
-        command = self._helper_command(inner)
         started = time.monotonic()
         stderr_offset = _file_size(paths.stderr_path)
-        from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS
+        from quota_sentinel.platform.process import run_bounded,CLEANUP_ALLOWANCE_SECONDS,CommandResult
         from quota_sentinel.platform.files import private_open
-        completed=run_bounded(command,cwd=self._cwd(paths),environment=self._environment(),
-            timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
+        from quota_sentinel.platform.background_auth import AgyAuthGuard
+        from quota_sentinel.diagnostics.trace import invocation
+        with invocation('agy-model', environment=self._environment(), requested_executable=str(inner[0])) as audit:
+            try:
+                with AgyAuthGuard() as guard:
+                    command = self._helper_command(inner, log_path=guard.log)
+                    completed=run_bounded(command,cwd=self._cwd(paths),environment=audit.environment,
+                        timeout=self.config.timeout+self.config.kill_grace+CLEANUP_ALLOWANCE_SECONDS,kill_grace=0)
+            except (OSError, ValueError):
+                # Guard setup failures use the same configured fallback as CLI failures.
+                audit.note('guard_unavailable', reason='background_auth_guard_unavailable')
+                completed = CommandResult(b'', b'background agy command unavailable\n', 127, False)
+            audit.finish(exit_code=completed.returncode)
         with private_open(paths.stdout_path,'wb') as stdout,private_open(paths.stderr_path,'ab') as stderr:
             stdout.write(completed.stdout);stderr.write(completed.stderr)
         return completed.returncode,time.monotonic()-started,stderr_offset
@@ -482,9 +495,12 @@ class AgyExecRunner:
     def agy_version(self) -> Optional[str]:
         from quota_sentinel.platform.process import run_bounded
         from quota_sentinel.platform.paths import resolve_launcher
+        from quota_sentinel.diagnostics.trace import invocation
         try:
-            result=run_bounded((*resolve_launcher('agy',explicit=self.config.agy_bin),'--version'),
-                cwd=Path.cwd(),environment=self._environment(),timeout=20,kill_grace=0,max_bytes=4096)
+            with invocation('agy-version', environment=self._environment(), requested_executable=str(self.config.agy_bin)) as audit:
+                result=run_bounded((*resolve_launcher('agy',explicit=self.config.agy_bin),'--version'),
+                    cwd=Path.cwd(),environment=audit.environment,timeout=20,kill_grace=0,max_bytes=4096)
+                audit.finish(exit_code=result.returncode)
         except (OSError,ValueError):return None
         text=result.stdout.decode('utf-8','replace').strip().splitlines()
         return text[0][:64] if not result.returncode and text else None
@@ -532,10 +548,10 @@ class AgyExecRunner:
         deadline = max(_GUARD_MIN_DEADLINE_SECONDS, total - grace)
         return deadline, grace, deadline + grace + _GUARD_REAP_MARGIN_SECONDS
 
-    def _guard_command(self, inner: List[str]) -> List[str]:
+    def _guard_command(self, inner: List[str], *, log_path=None) -> List[str]:
         """The guard's wrapper command, carrying the SHORTER inner deadline."""
         deadline, grace, _parent = self._guard_deadlines()
-        return self._helper_command(inner, timeout=deadline, kill_grace=grace)
+        return self._helper_command(inner, timeout=deadline, kill_grace=grace, log_path=log_path)
 
     def _guard_timeout(self) -> float:
         """The parent's last-resort deadline for the guard."""
@@ -561,10 +577,15 @@ class AgyExecRunner:
         """
         from quota_sentinel.platform.paths import resolve_launcher
         from quota_sentinel.platform.process import run_bounded
+        from quota_sentinel.diagnostics.trace import invocation
         try:
             inner=[*resolve_launcher('agy',explicit=self.config.agy_bin),'-p','/agents','--output-format','json']
-            result=run_bounded(self._guard_command(inner),cwd=self._cwd(paths),environment=self._environment(),
-                timeout=self._guard_timeout(),kill_grace=0)
+            from quota_sentinel.platform.background_auth import AgyAuthGuard
+            with invocation('agy-agents', environment=self._environment(), requested_executable=str(inner[0])) as audit:
+                with AgyAuthGuard() as guard:
+                    result=run_bounded(self._guard_command(inner, log_path=guard.log),cwd=self._cwd(paths),environment=audit.environment,
+                        timeout=self._guard_timeout(),kill_grace=0)
+                audit.finish(exit_code=result.returncode)
         except (OSError,ValueError):return None
         if result.returncode:return None
         raw=result.stdout.decode('utf-8','replace')
@@ -698,6 +719,8 @@ class AgyExecRunner:
     ) -> Optional[AttemptResult]:
         if self.fallback is None:
             return None
+        from quota_sentinel.diagnostics.trace import Invocation
+        Invocation('agy-opening', self._environment(), reuse=True).note('model_fallback_selected', action='pi')
         self.logger(
             "model %s transport=agy -> fallback=pi reason=%s" % (AGY_PROVIDER, reason)
         )
@@ -719,6 +742,14 @@ class AgyExecRunner:
         )
 
     def run(self, provider: str, workspace: Path, phase: str, attempt: int, limit: int) -> AttemptResult:
+        from quota_sentinel.diagnostics.trace import invocation
+        with invocation('agy-opening', environment=self._environment(), phase=phase,
+                        attempt=attempt, limit=limit) as audit:
+            result = self._run(provider, workspace, phase, attempt, limit, audit)
+            audit.finish(exit_code=result.exit_code)
+            return result
+
+    def _run(self, provider: str, workspace: Path, phase: str, attempt: int, limit: int, audit) -> AttemptResult:
         if provider != AGY_PROVIDER:
             raise ValueError(f"agy transport does not serve {provider!r}")
         workspace = Path(os.path.abspath(workspace))
@@ -771,6 +802,7 @@ class AgyExecRunner:
         regression = self._cost_regressions(result)
 
         if not functional and not regression:
+            audit.note('model_validated', fresh=True)
             self._write_smoke(version, result.usage)
             self._log_attempt(phase, attempt, limit, result, "success")
             # One greppable line per ignition: what it cost, which profile
@@ -824,6 +856,7 @@ class AgyExecRunner:
         # record stays untouched because a regressed profile is not a verified
         # one — the next attempt re-tests instead of trusting it.
         self._log_attempt(phase, attempt, limit, result, "cost-regression")
+        audit.note('model_validated', fresh=True)
         self.logger(
             "model %s transport=agy cost regression (%s); expected input<%s output<%s "
             "— the delivery is accepted and the profile needs attention"

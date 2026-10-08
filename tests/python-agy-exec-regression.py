@@ -431,6 +431,13 @@ class AgyExecTests(unittest.TestCase):
     def test_command_is_the_measured_profile(self):
         runner = self.runner()
         runner.run("antigravity", self.workspace, "initial", 1, 3)
+        from quota_sentinel.diagnostics.trace import TraceJournal
+        records = TraceJournal(self.state_dir/'diagnostics').records()
+        starts = [r for r in records if r['event']=='call_started']
+        self.assertEqual({r['kind'] for r in starts}, {'agy-opening', 'agy-agents', 'agy-version', 'agy-model'})
+        self.assertEqual(len({r['root_id'] for r in starts}), 1)
+        self.assertTrue(any(r['event']=='model_validated' for r in records))
+        self.assertTrue(any(r['event']=='process_started' and r['target_identity']['identity_known'] for r in records))
         turn = self.calls("turn")[0]
         argv = turn["argv"]
         self.assertEqual(argv[:2], ["--agent", AGENT_NAME])

@@ -35,9 +35,12 @@ def spawn_owned(argv, *, cwd, environment, stdin=None, stdout=None, stderr=None)
     command = [str(x) for x in argv]
     if os.name=='nt':
         from .windows_process import WindowsProcess
-        return WindowsProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
-    from .posix_process import PosixProcess
-    return PosixProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+        process=WindowsProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+    else:
+        from .posix_process import PosixProcess
+        process=PosixProcess(command,cwd=cwd,environment=environment,stdin=stdin,stdout=stdout,stderr=stderr)
+    from quota_sentinel.diagnostics.trace import trace_owned_process
+    return trace_owned_process(process, command, environment)
 
 
 def run_bounded(argv, *, cwd, environment, input_data=None, timeout, kill_grace, max_bytes=1048576, discard_stdout=False):
@@ -102,9 +105,14 @@ def capture_owned(process,*,timeout,kill_grace,max_bytes=1048576,input_data=None
 
 class BoundedPipes:
     """Finite line reads/writes, including native Windows anonymous pipes."""
-    def __init__(self,process,*,max_bytes=1048576):
+    def __init__(self,process,*,max_bytes=1048576,max_line_bytes=None):
         import queue
-        self.process=process;self.max_bytes=max_bytes;self.lines=queue.Queue(maxsize=64)
+        if (max_bytes is not None and (type(max_bytes) is not int or max_bytes<1)
+            or max_line_bytes is not None and (type(max_line_bytes) is not int or max_line_bytes<1)
+            or max_bytes is None and max_line_bytes is None):
+            raise ValueError('invalid pipe output budget')
+        self.process=process;self.max_bytes=max_bytes;self.max_line_bytes=max_line_bytes
+        self.lines=queue.Queue(maxsize=64)
         self.failed=threading.Event();self.ended=threading.Event();self.threads=[]
         thread=threading.Thread(target=self._read,daemon=True);thread.start();self.threads.append(thread)
     def _read(self):
@@ -114,12 +122,16 @@ class BoundedPipes:
                 data=self.process.stdout.read(65536)
                 if not data:break
                 total+=len(data)
-                if total>self.max_bytes:self.failed.set();break
+                if self.max_bytes is not None and total>self.max_bytes:self.failed.set();break
                 pending.extend(data)
                 while b'\n' in pending:
                     line,_,rest=pending.partition(b'\n');pending=bytearray(rest)
+                    if self.max_line_bytes is not None and len(line)>self.max_line_bytes:
+                        self.failed.set();return
                     try:self.lines.put_nowait(bytes(line))
                     except Exception:self.failed.set();return
+                if self.max_line_bytes is not None and len(pending)>self.max_line_bytes:
+                    self.failed.set();break
         except (OSError,ValueError):pass
         finally:self.ended.set()
     def write(self,data,*,deadline):
@@ -143,7 +155,9 @@ class BoundedPipes:
             if self.failed.is_set():raise ValueError('pipe output limit exceeded')
             try:return self.lines.get(timeout=min(.05,max(.001,deadline-time.monotonic())))
             except queue.Empty:
-                if self.ended.is_set():raise EOFError()
+                if self.ended.is_set():
+                    if self.failed.is_set():raise ValueError('pipe output limit exceeded')
+                    raise EOFError()
         raise subprocess.TimeoutExpired('pipe read',0)
     def close(self):
         self.process.close()

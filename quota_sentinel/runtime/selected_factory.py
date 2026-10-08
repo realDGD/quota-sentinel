@@ -44,7 +44,8 @@ def create_selected_application(state_dir,settings,plan,*,environment,clock,slee
  from .codex_exec import CodexExecConfig,CodexExecRunner
  from .agy_exec import AgyExecConfig,AgyExecRunner
  from .direct import DirectRunner
- env=runtime_environment(settings,environment);options=quota_probe_options(env)
+ from quota_sentinel.diagnostics.trace import trace_environment
+ env=trace_environment(runtime_environment(settings,environment),state_dir=state_dir);options=quota_probe_options(env)
  def selected_key(provider, env_key):
   reference=settings.credentials.get(provider)
   if reference is None:return env.get(env_key,'')

@@ -170,12 +170,22 @@ def handle_usage_command(sender_id: str, message_id: str) -> None:
     elapsed = lambda: f"{time.monotonic() - started:.1f}s"
 
     def execute_usage() -> None:
+        from quota_sentinel.diagnostics.trace import invocation, trace_environment
+        environment = trace_environment(os.environ if command_environment is None else command_environment,
+                                        trigger='feishu:usage')
+        with invocation('feishu-dispatch', environment=environment) as audit:
+            execute_owned_usage()
+            audit.finish(exit_code=0)
+
+    def execute_owned_usage() -> None:
         nonlocal process
         with command_lock:
             if commands_closing:
                 return
             from quota_sentinel.platform.process import spawn_owned
+            from quota_sentinel.diagnostics.trace import trace_environment
             environment=dict(os.environ if command_environment is None else command_environment)
+            environment=trace_environment(environment, trigger='feishu:usage')
             if command_environment is not None:environment['QUOTA_SENTINEL_REPLY_USER']=sender_id
             process=spawn_owned(list(USAGE_COMMAND),cwd=Path.cwd(),environment=environment,
                 stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -386,6 +396,8 @@ class FeishuListener:
         commands_closing = False
         command_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='feishu-usage')
         command_environment = dict(os.environ, QUOTA_SENTINEL_CONFIG=str(self.config_path))
+        from quota_sentinel.diagnostics.trace import TRACE_DIR
+        command_environment[TRACE_DIR] = str(self.state_dir / 'diagnostics')
         USAGE_COMMAND = (sys.executable, '-m', 'quota_sentinel', '--state-dir',
                          str(self.state_dir), '--config', str(self.config_path))
         if self.activation_journal is not None:
