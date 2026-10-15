@@ -61,6 +61,30 @@ class Processes(unittest.TestCase):
   values=['目录 spaces','a;b','$HOME','a"b','trailing\\','']
   r=self.run_cli('argv',*values);self.assertEqual(r.returncode,0,r.stderr.decode('utf-8',errors='replace'))
   self.assertEqual(json.loads(r.stdout),values)
+ def test_continuous_pipe_keeps_line_bounds_without_a_lifetime_byte_cap(self):
+  script="import sys\nfor n in range(2500):\n sys.stdout.buffer.write(b'x'*2048+b'\\n');sys.stdout.buffer.flush();sys.stdin.buffer.read(1)\n"
+  p=self.process.spawn_owned([sys.executable,'-u','-c',script],cwd=self.cwd,environment=os.environ,
+   stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+  self.addCleanup(p.close)
+  with self.process.BoundedPipes(p,max_bytes=None,max_line_bytes=4096) as pipes:
+   for _ in range(2500):
+    self.assertEqual(pipes.readline(deadline=time.monotonic()+3),b'x'*2048)
+    pipes.write(b'\n',deadline=time.monotonic()+3)
+   self.assertEqual(p.wait(timeout=3),0)
+ def test_continuous_pipe_rejects_oversized_unterminated_lines(self):
+  script="import sys,time;sys.stdout.write('x'*8192);sys.stdout.flush();time.sleep(120)"
+  p=self.process.spawn_owned([sys.executable,'-u','-c',script],cwd=self.cwd,environment=os.environ,
+   stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+  self.addCleanup(p.close)
+  with self.process.BoundedPipes(p,max_bytes=None,max_line_bytes=1024) as pipes:
+   with self.assertRaisesRegex(ValueError,'pipe output limit exceeded'):
+    pipes.readline(deadline=time.monotonic()+3)
+ def test_finite_pipe_retains_its_total_byte_limit(self):
+  p=self.process.spawn_owned([sys.executable,'-u','-c',"print('x'*8192)"],cwd=self.cwd,environment=os.environ,
+   stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+  with self.process.BoundedPipes(p,max_bytes=1024) as pipes:
+   with self.assertRaisesRegex(ValueError,'pipe output limit exceeded'):
+    pipes.readline(deadline=time.monotonic()+3)
  def test_unrelated_process_survives(self):
   other=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
   self.addCleanup(lambda:other.kill() if other.poll() is None else None)

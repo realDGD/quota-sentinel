@@ -283,9 +283,11 @@ class ApplicationTests(unittest.TestCase):
         app.workspace_parent = Path(self.temp.name)
         with mock.patch.object(factory_module, "readiness_problems", return_value=[]) as check:
             app.run(("codex",))
-        check.assert_called_once_with(
-            self.state_dir, environment={}, providers=("codex",)
-        )
+        check.assert_called_once()
+        self.assertEqual(check.call_args.args, (self.state_dir,))
+        self.assertEqual(check.call_args.kwargs['providers'], ('codex',))
+        environment = check.call_args.kwargs['environment']
+        self.assertEqual({k:v for k,v in environment.items() if not k.startswith('QUOTA_SENTINEL_TRACE_')}, {})
 
     def test_preparation_failure_does_not_create_unattempted_debt(self):
         def prepare(provider, workspace):

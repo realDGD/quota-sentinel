@@ -230,7 +230,8 @@ def create_application(
     config: Optional[AppConfig] = None,
     software_config=None, runtime_plan=None,
 ) -> Application:
-    env = _env(environment)
+    from quota_sentinel.diagnostics.trace import trace_environment
+    env = trace_environment(_env(environment), state_dir=state_dir)
     state_dir = Path(state_dir)
     if runtime_plan is not None:
         from .selected_factory import create_selected_application
